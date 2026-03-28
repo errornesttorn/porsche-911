@@ -750,7 +750,7 @@ func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 	}
 	pos, heading := sampleSplineAtDistance(spline, 0)
 	rC := collisionRadius(candidate)
-	offC := candidate.Length / 4
+	offC := circleOffset(candidate)
 	cFront := vecAdd(pos, vecScale(heading, offC))
 	cBack := vecSub(pos, vecScale(heading, offC))
 
@@ -766,7 +766,7 @@ func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 		rO := collisionRadius(other)
 		thresh := rC + rO
 		threshSq := thresh * thresh
-		offO := other.Length / 4
+		offO := circleOffset(other)
 		oFront := vecAdd(oPos, vecScale(oHeading, offO))
 		oBack := vecSub(oPos, vecScale(oHeading, offO))
 
@@ -1027,8 +1027,8 @@ func predictCollision(aSamples, bSamples []TrajectorySample, carA, carB Car) (Co
 	rB := collisionRadius(carB)
 	circleDist := rA + rB
 	circleDistSq := circleDist * circleDist
-	offA := carA.Length / 4
-	offB := carB.Length / 4
+	offA := circleOffset(carA)
+	offB := circleOffset(carB)
 
 	for i := 0; i < count; i++ {
 		pA, hA := aSamples[i].Position, aSamples[i].Heading
@@ -2333,15 +2333,21 @@ func colorForDestination(destinationSplineID int) rl.Color {
 	return palette[destinationSplineID%len(palette)]
 }
 
-// collisionRadius returns the radius of each of the two circles used to
-// approximate a car's hitbox (one at L/4 ahead of centre, one at L/4 behind).
-// Each circle must cover the corners of its half-rectangle (L/2 × W), so:
+// collisionRadius returns the radius of each of the two hitbox circles.
+// The circles are sized so they protrude exactly 0.5 m beyond the car's sides:
 //
-//	r = sqrt((L/4)² + (W/2)²)
+//	r = W/2 + 0.5
 func collisionRadius(car Car) float32 {
-	q := car.Length / 4
-	h := car.Width / 2
-	return float32(math.Sqrt(float64(q*q + h*h)))
+	return car.Width/2 + 0.5
+}
+
+// circleOffset returns how far each hitbox circle centre is placed from the
+// car's centre along its heading. Combined with collisionRadius this makes the
+// circles protrude exactly 1.0 m beyond the car's front and back:
+//
+//	offset = L/2 + 1.0 − r
+func circleOffset(car Car) float32 {
+	return car.Length/2 + 1.0 - collisionRadius(car)
 }
 
 func headingAngleDegrees(a, b rl.Vector2) float32 {
