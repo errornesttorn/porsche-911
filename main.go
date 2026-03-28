@@ -103,6 +103,17 @@ const (
 	accelEscapeTestMediumSecs float32 = 0.5
 )
 
+const (
+	// Following distance: suppress acceleration when already behind a same-direction car.
+	// Desired gap = followMinGapM + speed * followTimeHeadwaySecs.
+	followTimeHeadwaySecs float32 = 1.5  // seconds of headway at current speed
+	followMinGapM         float32 = 2.0  // minimum gap regardless of speed (m)
+	followLookaheadM      float32 = 60.0 // max distance to look for a leader (m)
+	// Minimum heading alignment: dot product of unit headings must exceed this
+	// (cos 40° ≈ 0.766) to be considered same-direction.
+	followHeadingCos float32 = 0.766
+)
+
 type Spline struct {
 	ID       int
 	Priority bool
@@ -380,7 +391,8 @@ func main() {
 		vehicleCounts := buildVehicleCounts(cars)
 		routes = updateRouteVisuals(routes, splines, vehicleCounts)
 		brakingDecisions, debugBlameLinks := computeBrakingDecisions(cars, splines, vehicleCounts)
-		cars = updateCars(cars, routes, splines, vehicleCounts, brakingDecisions, dt)
+		followCaps := computeFollowingSpeedCaps(cars, splines)
+		cars = updateCars(cars, routes, splines, vehicleCounts, brakingDecisions, followCaps, dt)
 		routes, cars = updateRouteSpawning(routes, cars, splines, dt)
 
 		if routePanel.Open {
@@ -1113,7 +1125,80 @@ func blameLeftCar(collision CollisionPrediction, carA, carB Car) (bool, bool) {
 	return true, false
 }
 
-func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[int]int, brakingDecisions []bool, dt float32) []Car {
+// computeFollowingSpeedCaps returns, for each car, the maximum speed it should
+// target due to a leading car ahead on the same path. The cap equals the
+// leader's current speed. Returns math.MaxFloat32 (no cap) when no leader is
+// found within followLookaheadM or the car is already braking.
+func computeFollowingSpeedCaps(cars []Car, splines []Spline) []float32 {
+	caps := make([]float32, len(cars))
+	for i := range caps {
+		caps[i] = math.MaxFloat32
+	}
+
+	splineIndexByID := buildSplineIndexByID(splines)
+
+	// Pre-compute world positions and headings for all cars.
+	type carPose struct {
+		pos     rl.Vector2
+		heading rl.Vector2
+	}
+	poses := make([]carPose, len(cars))
+	for i, car := range cars {
+		splineIdx, ok := splineIndexByID[car.CurrentSplineID]
+		if !ok {
+			continue
+		}
+		p, h := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+		poses[i] = carPose{p, h}
+	}
+
+	for i, car := range cars {
+		hI := poses[i].heading
+		pI := poses[i].pos
+		desiredGap := followMinGapM + car.Speed*followTimeHeadwaySecs
+
+		bestDist := float32(math.MaxFloat32)
+		bestSpeed := float32(math.MaxFloat32)
+
+		for j, other := range cars {
+			if i == j {
+				continue
+			}
+			// Must be going in roughly the same direction.
+			hJ := poses[j].heading
+			dot := hI.X*hJ.X + hI.Y*hJ.Y
+			if dot < followHeadingCos {
+				continue
+			}
+			// Other car must be ahead (positive projection along our heading).
+			diff := rl.Vector2{X: poses[j].pos.X - pI.X, Y: poses[j].pos.Y - pI.Y}
+			proj := diff.X*hI.X + diff.Y*hI.Y
+			if proj <= 0 {
+				continue
+			}
+			// Within lookahead range.
+			euclidean := float32(math.Sqrt(float64(diff.X*diff.X + diff.Y*diff.Y)))
+			if euclidean > followLookaheadM {
+				continue
+			}
+			// Gap = euclidean distance minus half-lengths of both cars.
+			gap := euclidean - car.Length/2 - other.Length/2
+			if gap > desiredGap {
+				continue
+			}
+			// Pick the closest leader.
+			if euclidean < bestDist {
+				bestDist = euclidean
+				bestSpeed = other.Speed
+			}
+		}
+		caps[i] = bestSpeed
+		_ = bestDist
+	}
+	return caps
+}
+
+func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[int]int, brakingDecisions []bool, followCaps []float32, dt float32) []Car {
 	if len(cars) == 0 {
 		return cars
 	}
@@ -1133,6 +1218,11 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 		shouldBrake := i < len(brakingDecisions) && brakingDecisions[i]
 		car.Braking = shouldBrake
 
+		followCap := float32(math.MaxFloat32)
+		if i < len(followCaps) {
+			followCap = followCaps[i]
+		}
+
 		for {
 			currentSpline, ok := findSplineByID(splines, car.CurrentSplineID)
 			if !ok {
@@ -1142,6 +1232,9 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 			targetSpeed := car.MaxSpeed * currentSpline.SpeedFactor
 			if car.Braking {
 				targetSpeed = 0
+			} else if followCap < targetSpeed {
+				// Following distance: don't accelerate beyond leader's speed.
+				targetSpeed = followCap
 			}
 
 			if car.Speed < targetSpeed {
