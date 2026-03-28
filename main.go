@@ -381,7 +381,7 @@ func main() {
 		routes = updateRouteVisuals(routes, splines, vehicleCounts)
 		brakingDecisions, debugBlameLinks := computeBrakingDecisions(cars, splines, vehicleCounts)
 		cars = updateCars(cars, routes, splines, vehicleCounts, brakingDecisions, dt)
-		routes, cars = updateRouteSpawning(routes, cars, dt)
+		routes, cars = updateRouteSpawning(routes, cars, splines, dt)
 
 		if routePanel.Open {
 			var applied bool
@@ -710,7 +710,7 @@ func updateRouteVisuals(routes []Route, splines []Spline, vehicleCounts map[int]
 	return routes
 }
 
-func updateRouteSpawning(routes []Route, cars []Car, dt float32) ([]Route, []Car) {
+func updateRouteSpawning(routes []Route, cars []Car, splines []Spline, dt float32) ([]Route, []Car) {
 	for i := range routes {
 		if !routes[i].Valid || routes[i].SpawnPerMinute <= 0 {
 			continue
@@ -719,11 +719,53 @@ func updateRouteSpawning(routes []Route, cars []Car, dt float32) ([]Route, []Car
 		if routes[i].NextSpawnIn > 0 {
 			continue
 		}
-		car := spawnCar(routes[i])
-		cars = append(cars, car)
-		routes[i].NextSpawnIn = randomizedSpawnDelay(routes[i].SpawnPerMinute)
+		candidate := spawnCar(routes[i])
+		if !spawnBlocked(candidate, cars, splines) {
+			cars = append(cars, candidate)
+			routes[i].NextSpawnIn = randomizedSpawnDelay(routes[i].SpawnPerMinute)
+		}
+		// If blocked, NextSpawnIn stays ≤ 0 so we retry next frame.
 	}
 	return routes, cars
+}
+
+// spawnBlocked returns true if placing candidate at its spawn point would
+// immediately overlap with any existing car using the two-circle hitbox.
+func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
+	spline, ok := findSplineByID(splines, candidate.CurrentSplineID)
+	if !ok {
+		return false
+	}
+	pos, heading := sampleSplineAtDistance(spline, 0)
+	rC := collisionRadius(candidate)
+	offC := candidate.Length / 4
+	cFront := vecAdd(pos, vecScale(heading, offC))
+	cBack := vecSub(pos, vecScale(heading, offC))
+
+	for _, other := range cars {
+		if other.CurrentSplineID != candidate.CurrentSplineID {
+			continue // only cars on the same spline can overlap with a fresh spawn
+		}
+		otherSpline, ok := findSplineByID(splines, other.CurrentSplineID)
+		if !ok {
+			continue
+		}
+		oPos, oHeading := sampleSplineAtDistance(otherSpline, other.DistanceOnSpline)
+		rO := collisionRadius(other)
+		thresh := rC + rO
+		threshSq := thresh * thresh
+		offO := other.Length / 4
+		oFront := vecAdd(oPos, vecScale(oHeading, offO))
+		oBack := vecSub(oPos, vecScale(oHeading, offO))
+
+		if distSq(cFront, oFront) <= threshSq ||
+			distSq(cFront, oBack) <= threshSq ||
+			distSq(cBack, oFront) <= threshSq ||
+			distSq(cBack, oBack) <= threshSq {
+			return true
+		}
+	}
+	return false
 }
 
 func spawnCar(route Route) Car {
