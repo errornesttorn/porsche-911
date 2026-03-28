@@ -74,7 +74,7 @@ const (
 	initialHeight int32 = 900
 
 	minZoom float32 = 0.05
-	maxZoom float32 = 12.0
+	maxZoom float32 = 50.0
 
 	curveSamples = 64
 	hoverSamples = 48
@@ -86,6 +86,10 @@ const (
 	snapPixels   float32 = 14.0
 
 	spawnSliderMaxPerMinute float32 = 60.0
+
+	// Scale: 1 world unit = metersPerUnit metres.
+	// All car dimensions, speeds, and accelerations are stored in SI units (m, m/s, m/s²).
+	metersPerUnit float32 = 1.0
 
 	predictionHorizonSeconds float32 = 4.0
 	predictionStepSeconds    float32 = 0.15
@@ -419,7 +423,7 @@ func main() {
 			if !route.Valid {
 				continue
 			}
-			drawRoute(route, splines, pixelsToWorld(camera.Zoom, 2.0))
+			drawRoute(route, splines, pixelsToWorld(camera.Zoom, 2.0), camera.Zoom)
 		}
 
 		for i, spline := range splines {
@@ -459,12 +463,18 @@ func main() {
 			drawRoutePicking(routeStartSplineID, routePanel, hoveredStart, hoveredEnd, splines, vehicleCounts, camera.Zoom)
 		}
 
-		drawCars(cars, splines)
+		drawCars(cars, splines, camera.Zoom)
 		if debugMode {
 			drawDebugBlameLinks(debugBlameLinks, cars, splines, camera.Zoom)
 		}
 		rl.EndMode2D()
 
+		drawScaleBar(camera.Zoom)
+		if mode == ModeEdit {
+			if preview, hasPreview := buildPreview(stage, draft, mouseWorld, hoveredStart, splines); hasPreview {
+				drawDraftInfo(stage, draft, mouseWorld, preview, camera)
+			}
+		}
 		drawHud(mode, stage, draft, hoveredSpline, routeStartSplineID, debugMode, camera.Zoom, len(splines), len(routes), len(cars))
 		if routePanel.Open {
 			drawRoutePanel(routePanel, routes)
@@ -717,16 +727,20 @@ func updateRouteSpawning(routes []Route, cars []Car, dt float32) ([]Route, []Car
 }
 
 func spawnCar(route Route) Car {
+	// All values in SI units: metres, m/s, m/s².
+	// Typical passenger car: 4.0-4.8 m long, 1.8-2.0 m wide.
+	// Speed range: ~50-130 km/h = 13.9-36.1 m/s.
+	// Acceleration: 2.5-4.5 m/s² (comfortable urban driving).
 	return Car{
 		RouteID:             route.ID,
 		CurrentSplineID:     route.StartSplineID,
 		DestinationSplineID: route.EndSplineID,
 		DistanceOnSpline:    0,
-		Speed:               randRange(0, 10),
-		MaxSpeed:            randRange(70, 135),
-		Accel:               randRange(24, 48),
-		Length:              randRange(16, 22),
-		Width:               randRange(9, 11),
+		Speed:               randRange(0, 2),           // m/s — starts nearly stationary
+		MaxSpeed:            randRange(13.9, 36.1),     // m/s — 50–130 km/h
+		Accel:               randRange(2.5, 4.5),       // m/s²
+		Length:              randRange(4.0, 4.8) / metersPerUnit, // world units
+		Width:               randRange(1.8, 2.0) / metersPerUnit, // world units
 		Color:               route.Color,
 		Braking:             false,
 	}
@@ -918,11 +932,28 @@ func predictCollision(aSamples, bSamples []TrajectorySample, carA, carB Car) (Co
 		return CollisionPrediction{}, false
 	}
 
-	collisionDistance := collisionRadius(carA) + collisionRadius(carB)
-	collisionDistanceSq := collisionDistance * collisionDistance
+	// Two-circle approximation: one circle at L/4 ahead of centre, one at L/4 behind.
+	// Radius for each circle: sqrt((L/4)² + (W/2)²) — covers the half-rectangle corners.
+	rA := collisionRadius(carA)
+	rB := collisionRadius(carB)
+	circleDist := rA + rB
+	circleDistSq := circleDist * circleDist
+	offA := carA.Length / 4
+	offB := carB.Length / 4
 
 	for i := 0; i < count; i++ {
-		if distSq(aSamples[i].Position, bSamples[i].Position) > collisionDistanceSq {
+		pA, hA := aSamples[i].Position, aSamples[i].Heading
+		pB, hB := bSamples[i].Position, bSamples[i].Heading
+
+		aFront := vecAdd(pA, vecScale(hA, offA))
+		aBack := vecSub(pA, vecScale(hA, offA))
+		bFront := vecAdd(pB, vecScale(hB, offB))
+		bBack := vecSub(pB, vecScale(hB, offB))
+
+		if distSq(aFront, bFront) > circleDistSq &&
+			distSq(aFront, bBack) > circleDistSq &&
+			distSq(aBack, bFront) > circleDistSq &&
+			distSq(aBack, bBack) > circleDistSq {
 			continue
 		}
 		prevIndex := i - 1
@@ -931,12 +962,12 @@ func predictCollision(aSamples, bSamples []TrajectorySample, carA, carB Car) (Co
 		}
 		return CollisionPrediction{
 			Time:      aSamples[i].Time,
-			PosA:      aSamples[i].Position,
-			PosB:      bSamples[i].Position,
+			PosA:      pA,
+			PosB:      pB,
 			PrevPosA:  aSamples[prevIndex].Position,
 			PrevPosB:  bSamples[prevIndex].Position,
-			HeadingA:  aSamples[i].Heading,
-			HeadingB:  bSamples[i].Heading,
+			HeadingA:  hA,
+			HeadingB:  hB,
 			PriorityA: aSamples[i].Priority,
 			PriorityB: bSamples[i].Priority,
 		}, true
@@ -1094,7 +1125,7 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 	return alive
 }
 
-func drawCars(cars []Car, splines []Spline) {
+func drawCars(cars []Car, splines []Spline, zoom float32) {
 	if len(cars) == 0 {
 		return
 	}
@@ -1110,7 +1141,7 @@ func drawCars(cars []Car, splines []Spline) {
 		origin := rl.NewVector2(car.Length/2, car.Width/2)
 		rl.DrawRectanglePro(rect, origin, angle, car.Color)
 		if car.Braking {
-			rl.DrawCircleV(pos, maxf(car.Width*0.22, 2), rl.NewColor(220, 50, 50, 255))
+			rl.DrawCircleV(pos, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), rl.NewColor(220, 50, 50, 255))
 		}
 	}
 }
@@ -1142,7 +1173,7 @@ func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, z
 	}
 }
 
-func drawRoute(route Route, splines []Spline, thickness float32) {
+func drawRoute(route Route, splines []Spline, thickness float32, zoom float32) {
 	indexByID := buildSplineIndexByID(splines)
 	color := rl.NewColor(route.Color.R, route.Color.G, route.Color.B, 90)
 	for _, pathID := range route.PathIDs {
@@ -1152,11 +1183,13 @@ func drawRoute(route Route, splines []Spline, thickness float32) {
 		}
 		drawSpline(splines[idx], thickness, color)
 	}
+	spawnR := pixelsToWorld(zoom, 10)
+	destR := pixelsToWorld(zoom, 10)
 	if start, ok := findSplineByID(splines, route.StartSplineID); ok {
-		drawEndpoint(start.P0, 5, route.Color)
+		drawEndpoint(start.P0, spawnR, route.Color)
 	}
 	if end, ok := findSplineByID(splines, route.EndSplineID); ok {
-		drawEndpoint(end.P3, 6, color)
+		drawEndpoint(end.P3, destR, color)
 	}
 }
 
@@ -1173,7 +1206,7 @@ func drawRoutePicking(routeStartSplineID int, routePanel RoutePanel, hoveredStar
 			drawEndpoint(hoveredEnd.Point, handleRadius*1.5, rl.NewColor(35, 85, 175, 255))
 			if pathIDs, _, ok := findShortestPathWeighted(splines, routeStartSplineID, hoveredEnd.SplineID, vehicleCounts); ok {
 				previewRoute := Route{PathIDs: pathIDs, Color: colorForDestination(hoveredEnd.SplineID), Valid: true}
-				drawRoute(previewRoute, splines, pixelsToWorld(zoom, 4))
+				drawRoute(previewRoute, splines, pixelsToWorld(zoom, 4), zoom)
 			}
 		}
 	}
@@ -1282,7 +1315,7 @@ func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, route
 	rl.DrawText("E: edit | R: route | P: priority | D: debug | Ctrl+S: save as | Ctrl+O: open | Tab: cycle modes", 24, 54, 18, muted)
 	rl.DrawText("Priority splines are painted purple. Debug draws blame lines from braking cars to feared collision cars.", 24, 78, 18, muted)
 	rl.DrawText(fmt.Sprintf("Mode: %s   Status: %s", modeText, statusText), 24, 108, 18, text)
-	rl.DrawText(fmt.Sprintf("Splines: %d   Routes: %d   Cars: %d   Hovered spline: %s   Debug: %s   Zoom: %.2fx", splineCount, routeCount, carCount, hoverText, debugText, zoom), 24, 132, 18, text)
+	rl.DrawText(fmt.Sprintf("Splines: %d   Routes: %d   Cars: %d   Hovered: %s   Debug: %s   Zoom: %.2fx   Scale: 1 unit = 1 m", splineCount, routeCount, carCount, hoverText, debugText, zoom), 24, 132, 18, text)
 }
 
 func stageLabel(stage Stage, draft Draft) string {
@@ -1400,6 +1433,96 @@ func drawDraft(stage Stage, draft Draft, mouse rl.Vector2, zoom float32) {
 	}
 }
 
+// segmentAngleDeg returns the clockwise angle from East for the vector from→to,
+// normalised to [0, 360). Screen Y is down, so this matches screen intuition.
+func segmentAngleDeg(from, to rl.Vector2) float32 {
+	dx := to.X - from.X
+	dy := to.Y - from.Y
+	a := float32(math.Atan2(float64(dy), float64(dx)) * 180 / math.Pi)
+	if a < 0 {
+		a += 360
+	}
+	return a
+}
+
+// drawSegmentLabel draws a length + angle label at the midpoint of a segment,
+// offset perpendicular to the segment so it doesn't overlap the line.
+func drawSegmentLabel(from, to rl.Vector2, camera rl.Camera2D) {
+	mx := (from.X + to.X) / 2
+	my := (from.Y + to.Y) / 2
+	mid := rl.GetWorldToScreen2D(rl.NewVector2(mx, my), camera)
+
+	dx := to.X - from.X
+	dy := to.Y - from.Y
+	length := float32(math.Sqrt(float64(dx*dx+dy*dy))) * metersPerUnit
+	angle := segmentAngleDeg(from, to)
+
+	// Perpendicular offset in screen space (rotate segment dir 90° left).
+	segScreenFrom := rl.GetWorldToScreen2D(from, camera)
+	segScreenTo := rl.GetWorldToScreen2D(to, camera)
+	sdx := segScreenTo.X - segScreenFrom.X
+	sdy := segScreenTo.Y - segScreenFrom.Y
+	slen := float32(math.Sqrt(float64(sdx*sdx + sdy*sdy)))
+	ox, oy := float32(0), float32(-14) // default: shift up
+	if slen > 0.01 {
+		// Unit perpendicular (rotate 90° CCW in screen space)
+		px := -sdy / slen
+		py := sdx / slen
+		ox = px * 14
+		oy = py * 14
+	}
+
+	text := fmt.Sprintf("%.1f m  %.0f°", length, angle)
+	tw := int32(len(text)*8 + 10)
+	tx := int32(mid.X+ox) - tw/2
+	ty := int32(mid.Y+oy) - 9
+
+	rl.DrawRectangle(tx-2, ty-2, tw+4, 20, rl.NewColor(30, 30, 35, 180))
+	rl.DrawText(text, tx+3, ty+1, 14, rl.White)
+}
+
+// drawArcLabel draws the arc length at the midpoint of the preview spline.
+func drawArcLabel(preview Spline, camera rl.Camera2D) {
+	if preview.Length <= 0 {
+		return
+	}
+	midPos, tangent := sampleSplineAtDistance(preview, preview.Length/2)
+	screen := rl.GetWorldToScreen2D(midPos, camera)
+
+	// Offset perpendicular to tangent so the label doesn't sit on the curve.
+	px := -tangent.Y
+	py := tangent.X
+	ox := px * 16
+	oy := py * 16
+
+	text := fmt.Sprintf("arc %.1f m", preview.Length*metersPerUnit)
+	tw := int32(len(text)*8 + 10)
+	tx := int32(screen.X+ox) - tw/2
+	ty := int32(screen.Y+oy) - 9
+
+	rl.DrawRectangle(tx-2, ty-2, tw+4, 20, rl.NewColor(20, 80, 160, 200))
+	rl.DrawText(text, tx+3, ty+1, 14, rl.NewColor(180, 220, 255, 255))
+}
+
+// drawDraftInfo draws measurement labels directly on the draft segments and arc.
+func drawDraftInfo(stage Stage, draft Draft, mouseWorld rl.Vector2, preview Spline, camera rl.Camera2D) {
+	switch stage {
+	case StageSetP1:
+		if draft.LockP1 {
+			drawSegmentLabel(draft.P1, mouseWorld, camera)
+			drawArcLabel(preview, camera)
+		} else {
+			drawSegmentLabel(draft.P0, mouseWorld, camera)
+		}
+	case StageSetP2:
+		drawSegmentLabel(draft.P1, mouseWorld, camera)
+		drawArcLabel(preview, camera)
+	case StageSetP3:
+		drawSegmentLabel(draft.P2, mouseWorld, camera)
+		drawArcLabel(preview, camera)
+	}
+}
+
 func mapBoolColor(condition bool, whenTrue, whenFalse rl.Color) rl.Color {
 	if condition {
 		return whenTrue
@@ -1448,6 +1571,41 @@ func drawAxes(camera rl.Camera2D) {
 	axis := rl.NewColor(180, 180, 185, 255)
 	rl.DrawLineV(rl.NewVector2(0, minY), rl.NewVector2(0, maxY), axis)
 	rl.DrawLineV(rl.NewVector2(minX, 0), rl.NewVector2(maxX, 0), axis)
+}
+
+// formatDistance formats a distance in metres to a human-readable string.
+func formatDistance(metres float32) string {
+	if metres >= 1000 {
+		km := metres / 1000
+		if km == float32(int(km)) {
+			return fmt.Sprintf("%d km", int(km))
+		}
+		return fmt.Sprintf("%.1f km", km)
+	}
+	return fmt.Sprintf("%d m", int(metres))
+}
+
+// drawScaleBar draws a fixed-size scale indicator in the bottom-left corner of the screen.
+// It shows what the current major grid spacing represents in real-world metres.
+func drawScaleBar(zoom float32) {
+	major := chooseGridSpacing(zoom) * metersPerUnit // real-world metres per major cell
+	barPx := major * zoom / metersPerUnit            // screen pixels for one major cell
+
+	margin := float32(20)
+	screenH := float32(rl.GetScreenHeight())
+	barY := screenH - margin - 8
+	barX := margin
+
+	label := formatDistance(major)
+	barColor := rl.NewColor(50, 50, 55, 220)
+
+	// Horizontal bar with end ticks
+	rl.DrawLineEx(rl.NewVector2(barX, barY), rl.NewVector2(barX+barPx, barY), 2, barColor)
+	rl.DrawLineEx(rl.NewVector2(barX, barY-5), rl.NewVector2(barX, barY+5), 2, barColor)
+	rl.DrawLineEx(rl.NewVector2(barX+barPx, barY-5), rl.NewVector2(barX+barPx, barY+5), 2, barColor)
+
+	labelW := int32(len(label) * 8)
+	rl.DrawText(label, int32(barX+barPx/2)-labelW/2, int32(barY-20), 16, barColor)
 }
 
 func chooseGridSpacing(zoom float32) float32 {
@@ -2003,8 +2161,15 @@ func colorForDestination(destinationSplineID int) rl.Color {
 	return palette[destinationSplineID%len(palette)]
 }
 
+// collisionRadius returns the radius of each of the two circles used to
+// approximate a car's hitbox (one at L/4 ahead of centre, one at L/4 behind).
+// Each circle must cover the corners of its half-rectangle (L/2 × W), so:
+//
+//	r = sqrt((L/4)² + (W/2)²)
 func collisionRadius(car Car) float32 {
-	return 0.5 * float32(math.Sqrt(float64(car.Length*car.Length+car.Width*car.Width)))
+	q := car.Length / 4
+	h := car.Width / 2
+	return float32(math.Sqrt(float64(q*q + h*h)))
 }
 
 func headingAngleDegrees(a, b rl.Vector2) float32 {
