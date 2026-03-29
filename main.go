@@ -57,6 +57,7 @@ const (
 	ModeCouple
 	ModeCut
 	ModeSpeedLimit
+	ModePreference
 )
 
 const (
@@ -146,6 +147,7 @@ type Spline struct {
 	HardCoupledIDs []int   // parallel lanes that also act as pathfinding neighbours
 	SoftCoupledIDs []int   // parallel lanes used for lane-changes only, not routing
 	SpeedLimitKmh  float32 // 0 = no limit
+	LanePreference int     // 0 = none; lower = higher preference
 }
 
 type Draft struct {
@@ -273,6 +275,7 @@ type SavedSpline struct {
 	HardCoupledIDs []int      `json:"hard_coupled_ids,omitempty"`
 	SoftCoupledIDs []int      `json:"soft_coupled_ids,omitempty"`
 	SpeedLimitKmh  float32    `json:"speed_limit_kmh,omitempty"`
+	LanePreference int        `json:"lane_preference,omitempty"`
 }
 
 type SavedRoute struct {
@@ -324,6 +327,7 @@ func main() {
 	coupleModeFirstID := -1
 	debugMode := false
 	selectedSpeedKmh := 50
+	lastPref := 0
 	nextSplineID := 1
 	nextRouteID := 1
 
@@ -354,6 +358,8 @@ func main() {
 				mode = ModeCut
 			case ModeCut:
 				mode = ModeSpeedLimit
+			case ModeSpeedLimit:
+				mode = ModePreference
 			default:
 				mode = ModeEdit
 			}
@@ -418,6 +424,15 @@ func main() {
 			routeStartSplineID = -1
 			coupleModeFirstID = -1
 		}
+		if rl.IsKeyPressed(rl.KeyV) {
+			mode = ModePreference
+			stage = StageIdle
+			draft = newDraft()
+			cutDraft = newCutDraft()
+			routePanel = RoutePanel{}
+			routeStartSplineID = -1
+			coupleModeFirstID = -1
+		}
 		if rl.IsKeyPressed(rl.KeyD) {
 			debugMode = !debugMode
 		}
@@ -458,6 +473,7 @@ func main() {
 					coupleModeFirstID = -1
 					nextSplineID = loadedNextSplineID
 					nextRouteID = loadedNextRouteID
+					lastPref = maxLoadedPreference(loadedSplines)
 					noticeText = fmt.Sprintf("Loaded %d splines, %d routes, %d cars from %s", len(splines), len(routes), len(cars), path)
 					noticeTimer = 3.0
 				}
@@ -536,6 +552,8 @@ func main() {
 			case ModeSpeedLimit:
 				splines = handleSpeedLimitMode(splines, hoveredSpline, selectedSpeedKmh)
 				selectedSpeedKmh = updateSpeedLimitPanel(selectedSpeedKmh)
+			case ModePreference:
+				splines, lastPref = handlePreferenceMode(splines, hoveredSpline, lastPref)
 			}
 		}
 
@@ -612,7 +630,12 @@ func main() {
 				drawDraftInfo(stage, draft, mouseWorld, preview, camera)
 			}
 		}
-		drawSpeedLimitLabels(splines, camera)
+		if mode == ModeSpeedLimit {
+			drawSpeedLimitLabels(splines, camera)
+		}
+		if mode == ModePreference {
+			drawPreferenceLabels(splines, camera)
+		}
 		drawHud(mode, stage, draft, hoveredSpline, routeStartSplineID, coupleModeFirstID, debugMode, camera.Zoom, len(splines), len(routes), len(cars))
 		if mode == ModeSpeedLimit {
 			drawSpeedLimitPanel(selectedSpeedKmh)
@@ -754,6 +777,25 @@ func handlePriorityMode(splines []Spline, hoveredSpline int) []Spline {
 	return splines
 }
 
+func handlePreferenceMode(splines []Spline, hoveredSpline, lastPref int) ([]Spline, int) {
+	if hoveredSpline < 0 {
+		return splines, lastPref
+	}
+	if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		splines[hoveredSpline].LanePreference = 1
+		lastPref = 1
+	}
+	if rl.IsMouseButtonPressed(rl.MouseButtonRight) {
+		if splines[hoveredSpline].LanePreference > 0 {
+			splines[hoveredSpline].LanePreference = 0
+		} else {
+			lastPref++
+			splines[hoveredSpline].LanePreference = lastPref
+		}
+	}
+	return splines, lastPref
+}
+
 func handleSpeedLimitMode(splines []Spline, hoveredSpline, selectedSpeedKmh int) []Spline {
 	if hoveredSpline < 0 {
 		return splines
@@ -836,6 +878,39 @@ func drawSpeedLimitLabels(splines []Spline, camera rl.Camera2D) {
 		rl.DrawCircleLines(cx, cy, float32(r), rl.NewColor(200, 30, 30, 255))
 		rl.DrawText(label, cx-textW/2, cy-fontSize/2, fontSize, rl.NewColor(200, 30, 30, 255))
 	}
+}
+
+// drawPreferenceLabels draws preference badges on splines that have a preference assigned,
+// in screen space, so they stay readable at any zoom level.
+func drawPreferenceLabels(splines []Spline, camera rl.Camera2D) {
+	color := rl.NewColor(30, 150, 60, 255)
+	for _, spline := range splines {
+		if spline.LanePreference <= 0 {
+			continue
+		}
+		mid := spline.Samples[simSamples/2]
+		screen := rl.GetWorldToScreen2D(mid, camera)
+		label := fmt.Sprintf("%d", spline.LanePreference)
+		fontSize := int32(14)
+		textW := rl.MeasureText(label, fontSize)
+		r := int32(14)
+		cx, cy := int32(screen.X), int32(screen.Y)
+		rl.DrawCircle(cx, cy, float32(r), rl.White)
+		rl.DrawCircleLines(cx, cy, float32(r), color)
+		rl.DrawText(label, cx-textW/2, cy-fontSize/2, fontSize, color)
+	}
+}
+
+// maxLoadedPreference returns the highest LanePreference value across all splines,
+// used to resume the preference counter after loading a file.
+func maxLoadedPreference(splines []Spline) int {
+	max := 0
+	for _, s := range splines {
+		if s.LanePreference > max {
+			max = s.LanePreference
+		}
+	}
+	return max
 }
 
 // drawSpeedLimitPanel draws the speed picker UI in screen space.
@@ -2440,6 +2515,9 @@ func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, route
 	case ModeSpeedLimit:
 		modeText = "Speed limits"
 		statusText = "Left click applies selected speed limit, right click removes it"
+	case ModePreference:
+		modeText = "Lane preference"
+		statusText = "Left click assigns next preference number, right click removes it"
 	}
 
 	hoverText := "none"
@@ -2452,7 +2530,7 @@ func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, route
 	}
 
 	rl.DrawText("Traffic spline editor", 24, 24, 22, text)
-	rl.DrawText("E: edit | R: route | P: priority | L: lane couple | C: cut | S: speed limits | D: debug | Ctrl+S: save | Ctrl+O: open | Tab: cycle", 24, 54, 18, muted)
+	rl.DrawText("E: edit | R: route | P: priority | L: lane couple | C: cut | S: speed limits | V: preference | D: debug | Ctrl+S: save | Ctrl+O: open | Tab: cycle", 24, 54, 18, muted)
 	rl.DrawText("Priority splines are purple. Lane coupling: left-click = hard (routing+LC, blue), right-click = soft (LC only, purple). Debug draws blame/LC lines.", 24, 78, 18, muted)
 	rl.DrawText(fmt.Sprintf("Mode: %s   Status: %s", modeText, statusText), 24, 108, 18, text)
 	rl.DrawText(fmt.Sprintf("Splines: %d   Routes: %d   Cars: %d   Hovered: %s   Debug: %s   Zoom: %.2fx   Scale: 1 unit = 1 m", splineCount, routeCount, carCount, hoverText, debugText, zoom), 24, 132, 18, text)
@@ -3185,6 +3263,7 @@ func saveSplineFile(splines []Spline, routes []Route, cars []Car, path string) e
 			HardCoupledIDs: append([]int(nil), spline.HardCoupledIDs...),
 			SoftCoupledIDs: append([]int(nil), spline.SoftCoupledIDs...),
 			SpeedLimitKmh:  spline.SpeedLimitKmh,
+			LanePreference: spline.LanePreference,
 		})
 	}
 	for _, route := range routes {
@@ -3236,6 +3315,7 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, int, int, error) {
 		spline.HardCoupledIDs = append([]int(nil), entry.HardCoupledIDs...)
 		spline.SoftCoupledIDs = append([]int(nil), entry.SoftCoupledIDs...)
 		spline.SpeedLimitKmh = entry.SpeedLimitKmh
+		spline.LanePreference = entry.LanePreference
 		loadedSplines = append(loadedSplines, spline)
 		if entry.ID > maxSplineID {
 			maxSplineID = entry.ID
