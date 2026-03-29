@@ -602,7 +602,6 @@ func main() {
 		drawCars(cars, allSplines, camera.Zoom)
 		if debugMode {
 			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, camera.Zoom)
-			drawDebugLaneLines(cars, splines, camera.Zoom)
 			drawLaneChangeSplines(laneChangeSplines, camera.Zoom)
 		}
 		rl.EndMode2D()
@@ -1327,40 +1326,6 @@ func drawCoupleMode(splines []Spline, firstSelectedID int, hoveredSpline int, zo
 	}
 }
 
-// drawDebugLaneLines draws, for each car on a spline with coupled lanes,
-// a line from the car's current position to the nearest point on each coupled spline.
-func drawDebugLaneLines(cars []Car, splines []Spline, zoom float32) {
-	lineColor := rl.NewColor(100, 220, 255, 200)
-	dotColor := rl.NewColor(100, 220, 255, 255)
-	thickness := pixelsToWorld(zoom, 1.5)
-	dotR := pixelsToWorld(zoom, 3)
-
-	splineIndexByID := buildSplineIndexByID(splines)
-
-	for _, car := range cars {
-		splineIdx, ok := splineIndexByID[car.CurrentSplineID]
-		if !ok {
-			continue
-		}
-		currentSpline := splines[splineIdx]
-		allCoupled := append(append([]int(nil), currentSpline.HardCoupledIDs...), currentSpline.SoftCoupledIDs...)
-		if len(allCoupled) == 0 {
-			continue
-		}
-
-		carPos, _ := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
-
-		for _, coupledID := range allCoupled {
-			cIdx, ok := splineIndexByID[coupledID]
-			if !ok {
-				continue
-			}
-			nearest := nearestSampleOnSpline(splines[cIdx], carPos)
-			rl.DrawLineEx(carPos, nearest, thickness, lineColor)
-			rl.DrawCircleV(nearest, dotR, dotColor)
-		}
-	}
-}
 
 func newCutDraft() CutDraft {
 	return CutDraft{OriginalSplineID: -1}
