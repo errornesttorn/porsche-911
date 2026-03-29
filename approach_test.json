@@ -1,0 +1,579 @@
+{
+  "splines": [
+    {
+      "id": 1,
+      "priority": false,
+      "p0": {
+        "X": -40.0289,
+        "Y": -4.0810432
+      },
+      "p1": {
+        "X": -29.923452,
+        "Y": -4.0810432
+      },
+      "p2": {
+        "X": 29.874073,
+        "Y": -3.997528
+      },
+      "p3": {
+        "X": 39.896008,
+        "Y": -3.914009
+      },
+      "hard_coupled_ids": [
+        2
+      ],
+      "soft_coupled_ids": [
+        4
+      ]
+    },
+    {
+      "id": 2,
+      "priority": false,
+      "p0": {
+        "X": -39.945385,
+        "Y": 0.011245728
+      },
+      "p1": {
+        "X": -30.00697,
+        "Y": 0.011245728
+      },
+      "p2": {
+        "X": 29.874073,
+        "Y": 0.011245728
+      },
+      "p3": {
+        "X": 39.97952,
+        "Y": 0.011245728
+      },
+      "hard_coupled_ids": [
+        1,
+        3
+      ],
+      "soft_coupled_ids": [
+        5,
+        11
+      ]
+    },
+    {
+      "id": 3,
+      "priority": false,
+      "p0": {
+        "X": -40.11242,
+        "Y": 3.9365005
+      },
+      "p1": {
+        "X": -29.839937,
+        "Y": 3.9365005
+      },
+      "p2": {
+        "X": 29.957592,
+        "Y": 4.0200195
+      },
+      "p3": {
+        "X": 39.97952,
+        "Y": 3.685955
+      },
+      "hard_coupled_ids": [
+        2,
+        6
+      ],
+      "soft_coupled_ids": [
+        4,
+        12
+      ]
+    },
+    {
+      "id": 4,
+      "priority": false,
+      "p0": {
+        "X": -120.03251,
+        "Y": -0.24526978
+      },
+      "p1": {
+        "X": -109.92706,
+        "Y": -0.16175461
+      },
+      "p2": {
+        "X": -49.8838,
+        "Y": 0.011245728
+      },
+      "p3": {
+        "X": -39.945385,
+        "Y": 0.011245728
+      },
+      "hard_coupled_ids": [
+        5
+      ],
+      "soft_coupled_ids": [
+        3,
+        1
+      ]
+    },
+    {
+      "id": 5,
+      "priority": false,
+      "p0": {
+        "X": -120.03251,
+        "Y": 3.7635002
+      },
+      "p1": {
+        "X": -110.010574,
+        "Y": 3.679985
+      },
+      "p2": {
+        "X": -50.384903,
+        "Y": 3.9365005
+      },
+      "p3": {
+        "X": -40.11242,
+        "Y": 3.9365005
+      },
+      "hard_coupled_ids": [
+        4
+      ],
+      "soft_coupled_ids": [
+        2,
+        6
+      ]
+    },
+    {
+      "id": 6,
+      "priority": false,
+      "p0": {
+        "X": -40.05645,
+        "Y": 7.9081078
+      },
+      "p1": {
+        "X": -29.867485,
+        "Y": 7.991623
+      },
+      "p2": {
+        "X": 29.930038,
+        "Y": 7.9081078
+      },
+      "p3": {
+        "X": 39.868454,
+        "Y": 7.9081078
+      },
+      "hard_coupled_ids": [
+        3
+      ],
+      "soft_coupled_ids": [
+        5
+      ]
+    },
+    {
+      "id": 7,
+      "priority": false,
+      "p0": {
+        "X": -150.08223,
+        "Y": -0.06864929
+      },
+      "p1": {
+        "X": -139.93169,
+        "Y": -0.16719818
+      },
+      "p2": {
+        "X": -130.13795,
+        "Y": -0.32878494
+      },
+      "p3": {
+        "X": -120.03251,
+        "Y": -0.24526978
+      }
+    },
+    {
+      "id": 8,
+      "priority": false,
+      "p0": {
+        "X": -149.88513,
+        "Y": 3.6762123
+      },
+      "p1": {
+        "X": -139.83313,
+        "Y": 3.6762123
+      },
+      "p2": {
+        "X": -130.05444,
+        "Y": 3.8470154
+      },
+      "p3": {
+        "X": -120.03251,
+        "Y": 3.7635002
+      }
+    },
+    {
+      "id": 9,
+      "priority": false,
+      "p0": {
+        "X": -149.78659,
+        "Y": -4.0106087
+      },
+      "p1": {
+        "X": -137.9607,
+        "Y": -4.0106087
+      },
+      "p2": {
+        "X": -130.13795,
+        "Y": -0.32878494
+      },
+      "p3": {
+        "X": -120.03251,
+        "Y": -0.24526978
+      }
+    },
+    {
+      "id": 10,
+      "priority": false,
+      "p0": {
+        "X": -149.98367,
+        "Y": 7.8152733
+      },
+      "p1": {
+        "X": -137.9607,
+        "Y": 7.8152733
+      },
+      "p2": {
+        "X": -130.05444,
+        "Y": 3.8470154
+      },
+      "p3": {
+        "X": -120.03251,
+        "Y": 3.7635002
+      }
+    },
+    {
+      "id": 11,
+      "priority": false,
+      "p0": {
+        "X": 39.97952,
+        "Y": 3.685955
+      },
+      "p1": {
+        "X": 50.001446,
+        "Y": 3.3518906
+      },
+      "p2": {
+        "X": 89.58672,
+        "Y": 4.0162315
+      },
+      "p3": {
+        "X": 100.13147,
+        "Y": 3.9176826
+      },
+      "hard_coupled_ids": [
+        12
+      ],
+      "soft_coupled_ids": [
+        2
+      ],
+      "speed_limit_kmh": 50
+    },
+    {
+      "id": 12,
+      "priority": false,
+      "p0": {
+        "X": 39.97952,
+        "Y": 0.011245728
+      },
+      "p1": {
+        "X": 50.084965,
+        "Y": 0.011245728
+      },
+      "p2": {
+        "X": 89.78382,
+        "Y": 0.07426834
+      },
+      "p3": {
+        "X": 99.835815,
+        "Y": 0.17281723
+      },
+      "hard_coupled_ids": [
+        11
+      ],
+      "soft_coupled_ids": [
+        3
+      ],
+      "speed_limit_kmh": 50
+    },
+    {
+      "id": 13,
+      "priority": false,
+      "p0": {
+        "X": 39.896008,
+        "Y": -3.914009
+      },
+      "p1": {
+        "X": 49.917942,
+        "Y": -3.83049
+      },
+      "p2": {
+        "X": 60.022026,
+        "Y": -10.273376
+      },
+      "p3": {
+        "X": 60.022026,
+        "Y": -19.931177
+      }
+    },
+    {
+      "id": 14,
+      "priority": false,
+      "p0": {
+        "X": 39.868454,
+        "Y": 7.9081078
+      },
+      "p1": {
+        "X": 49.80687,
+        "Y": 7.9081078
+      },
+      "p2": {
+        "X": 60.022026,
+        "Y": 14.265327
+      },
+      "p3": {
+        "X": 60.022026,
+        "Y": 23.726032
+      }
+    }
+  ],
+  "routes": [
+    {
+      "id": 1,
+      "start_spline_id": 10,
+      "end_spline_id": 13,
+      "path_ids": [
+        10,
+        4,
+        1,
+        13
+      ],
+      "spawn_per_minute": 32
+    },
+    {
+      "id": 2,
+      "start_spline_id": 8,
+      "end_spline_id": 12,
+      "path_ids": [
+        8,
+        4,
+        3,
+        12
+      ],
+      "spawn_per_minute": 32
+    },
+    {
+      "id": 3,
+      "start_spline_id": 7,
+      "end_spline_id": 11,
+      "path_ids": [
+        7,
+        4,
+        3,
+        11
+      ],
+      "spawn_per_minute": 32
+    },
+    {
+      "id": 4,
+      "start_spline_id": 9,
+      "end_spline_id": 14,
+      "path_ids": [
+        9,
+        5,
+        6,
+        14
+      ],
+      "spawn_per_minute": 32
+    }
+  ],
+  "cars": [
+    {
+      "route_id": 3,
+      "current_spline_id": 169,
+      "destination_spline_id": 11,
+      "distance_on_spline": 14.409583,
+      "speed": 13.925491,
+      "max_speed": 13.946668,
+      "accel": 3.377655,
+      "length": 4.5004406,
+      "width": 1.8467482
+    },
+    {
+      "route_id": 3,
+      "current_spline_id": 170,
+      "destination_spline_id": 11,
+      "distance_on_spline": 4.4211392,
+      "speed": 15.52821,
+      "max_speed": 28.40832,
+      "accel": 4.0306177,
+      "length": 4.4194546,
+      "width": 1.8506278
+    },
+    {
+      "route_id": 3,
+      "current_spline_id": 2,
+      "destination_spline_id": 11,
+      "distance_on_spline": 56.899967,
+      "speed": 16.935738,
+      "max_speed": 33.458145,
+      "accel": 2.908158,
+      "length": 4.7877784,
+      "width": 1.8987943
+    },
+    {
+      "route_id": 2,
+      "current_spline_id": 11,
+      "destination_spline_id": 12,
+      "distance_on_spline": 32.98911,
+      "speed": 26.565922,
+      "max_speed": 33.44976,
+      "accel": 2.5058146,
+      "length": 4.407133,
+      "width": 1.8893943
+    },
+    {
+      "route_id": 4,
+      "current_spline_id": 14,
+      "destination_spline_id": 14,
+      "distance_on_spline": 19.421545,
+      "speed": 28.813906,
+      "max_speed": 32.036674,
+      "accel": 3.3148782,
+      "length": 4.5828705,
+      "width": 1.9372363
+    },
+    {
+      "route_id": 3,
+      "current_spline_id": 2,
+      "destination_spline_id": 11,
+      "distance_on_spline": 29.290133,
+      "speed": 16.91554,
+      "max_speed": 21.901602,
+      "accel": 3.5563478,
+      "length": 4.219701,
+      "width": 1.9812407
+    },
+    {
+      "route_id": 2,
+      "current_spline_id": 3,
+      "destination_spline_id": 12,
+      "distance_on_spline": 71.05495,
+      "speed": 20.193705,
+      "max_speed": 30.191774,
+      "accel": 3.945054,
+      "length": 4.269511,
+      "width": 1.8175821
+    },
+    {
+      "route_id": 3,
+      "current_spline_id": 4,
+      "destination_spline_id": 11,
+      "distance_on_spline": 73.52627,
+      "speed": 19.759737,
+      "max_speed": 31.328074,
+      "accel": 2.6908374,
+      "length": 4.2590094,
+      "width": 1.9545339
+    },
+    {
+      "route_id": 2,
+      "current_spline_id": 5,
+      "destination_spline_id": 12,
+      "distance_on_spline": 52.239876,
+      "speed": 23.824253,
+      "max_speed": 25.298292,
+      "accel": 3.4423888,
+      "length": 4.515529,
+      "width": 1.8347603
+    },
+    {
+      "route_id": 4,
+      "current_spline_id": 5,
+      "destination_spline_id": 14,
+      "distance_on_spline": 30.746687,
+      "speed": 15.121021,
+      "max_speed": 15.143123,
+      "accel": 4.4957156,
+      "length": 4.7956734,
+      "width": 1.8102726
+    },
+    {
+      "route_id": 1,
+      "current_spline_id": 171,
+      "destination_spline_id": 13,
+      "distance_on_spline": 3.074865,
+      "speed": 13.782446,
+      "max_speed": 33.040524,
+      "accel": 3.287754,
+      "length": 4.0868063,
+      "width": 1.9653387
+    },
+    {
+      "route_id": 2,
+      "current_spline_id": 5,
+      "destination_spline_id": 12,
+      "distance_on_spline": 16.65336,
+      "speed": 17.96052,
+      "max_speed": 19.517553,
+      "accel": 3.4986963,
+      "length": 4.335215,
+      "width": 1.8081045
+    },
+    {
+      "route_id": 3,
+      "current_spline_id": 4,
+      "destination_spline_id": 11,
+      "distance_on_spline": 0.72507995,
+      "speed": 11.695996,
+      "max_speed": 23.710346,
+      "accel": 3.37406,
+      "length": 4.6724,
+      "width": 1.9948382
+    },
+    {
+      "route_id": 4,
+      "current_spline_id": 9,
+      "destination_spline_id": 14,
+      "distance_on_spline": 18.142673,
+      "speed": 11.229023,
+      "max_speed": 21.110382,
+      "accel": 3.4824204,
+      "length": 4.639395,
+      "width": 1.82191
+    },
+    {
+      "route_id": 2,
+      "current_spline_id": 8,
+      "destination_spline_id": 12,
+      "distance_on_spline": 10.682687,
+      "speed": 8.4282,
+      "max_speed": 30.681198,
+      "accel": 3.1791525,
+      "length": 4.410679,
+      "width": 1.8234185
+    },
+    {
+      "route_id": 3,
+      "current_spline_id": 7,
+      "destination_spline_id": 11,
+      "distance_on_spline": 1.7371163,
+      "speed": 3.3355243,
+      "max_speed": 34.058746,
+      "accel": 2.560945,
+      "length": 4.7164125,
+      "width": 1.853477
+    },
+    {
+      "route_id": 2,
+      "current_spline_id": 8,
+      "destination_spline_id": 12,
+      "distance_on_spline": 0.5980553,
+      "speed": 1.8442541,
+      "max_speed": 14.294207,
+      "accel": 2.5249178,
+      "length": 4.4331684,
+      "width": 1.9852555
+    }
+  ]
+}

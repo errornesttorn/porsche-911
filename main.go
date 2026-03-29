@@ -125,8 +125,6 @@ const (
 	// Minimum dot product of car heading vs destination lane tangent (cos 45° ≈ 0.71).
 	// Prevents switching onto a lane going the wrong way.
 	laneChangeDirCos         float32 = 0.71
-	laneChangeCooldownS      float32 = 5.0        // seconds between lane-change checks (testing value)
-	laneChangeRetrySecs      float32 = 1.0        // retry delay when conditions not met
 	maxCarSpeed              float32 = 36.1       // m/s — upper bound of car MaxSpeed range (130 km/h)
 	laneChangeForcedSpeedMPS float32 = 20.0 / 3.6 // 20 km/h — speed for last-resort lane switch
 	laneChangeForcedDistEnd  float32 = 15.0       // metres before spline end where last-resort fires
@@ -229,8 +227,6 @@ type Car struct {
 	LaneChangeSplineID int     // ID of the temporary bridging spline; -1 = none
 	AfterSplineID      int     // destination spline to continue on after the bridge
 	AfterSplineDist    float32 // arc-length on AfterSplineID where the bridge lands
-	LaneChangeCooldown float32 // seconds until the next lane-change eligibility check
-
 	// Forced lane-switch state (set when no direct path exists but a hard-coupled
 	// neighbour of the next physical spline does have a path).
 	DesiredLaneSplineID int     // spline to merge into; -1 = none
@@ -327,7 +323,6 @@ func main() {
 	routeStartSplineID := -1
 	coupleModeFirstID := -1
 	debugMode := false
-	randomLaneChanges := true
 	selectedSpeedKmh := 50
 	nextSplineID := 1
 	nextRouteID := 1
@@ -426,10 +421,6 @@ func main() {
 		if rl.IsKeyPressed(rl.KeyD) {
 			debugMode = !debugMode
 		}
-		if rl.IsKeyPressed(rl.KeyN) {
-			randomLaneChanges = !randomLaneChanges
-		}
-		forceLaneChange := rl.IsKeyPressed(rl.KeyF)
 		if isCtrlDown() && rl.IsKeyPressed(rl.KeyS) {
 			path, err := pickSplineFilePath(true)
 			if err != nil {
@@ -492,7 +483,7 @@ func main() {
 
 		vehicleCounts := buildVehicleCounts(cars)
 		routes = updateRouteVisuals(routes, splines, vehicleCounts)
-		laneChangeSplines, cars = computeLaneChanges(cars, splines, laneChangeSplines, &nextSplineID, dt, randomLaneChanges, forceLaneChange)
+		laneChangeSplines, cars = computeLaneChanges(cars, splines, laneChangeSplines, &nextSplineID, dt)
 		allSplines := mergedSplines(splines, laneChangeSplines)
 		brakingDecisions, debugBlameLinks := computeBrakingDecisions(cars, allSplines, vehicleCounts)
 		followCaps := computeFollowingSpeedCaps(cars, allSplines, vehicleCounts)
@@ -623,7 +614,7 @@ func main() {
 			}
 		}
 		drawSpeedLimitLabels(splines, camera)
-		drawHud(mode, stage, draft, hoveredSpline, routeStartSplineID, coupleModeFirstID, debugMode, randomLaneChanges, camera.Zoom, len(splines), len(routes), len(cars))
+		drawHud(mode, stage, draft, hoveredSpline, routeStartSplineID, coupleModeFirstID, debugMode, camera.Zoom, len(splines), len(routes), len(cars))
 		if mode == ModeSpeedLimit {
 			drawSpeedLimitPanel(selectedSpeedKmh)
 		}
@@ -1040,7 +1031,6 @@ func buildLaneChangeBridge(car *Car, destSplineID int, splines []Spline, splineI
 	car.LaneChangeSplineID = id
 	car.AfterSplineID = destSplineID
 	car.AfterSplineDist = p3Dist
-	car.LaneChangeCooldown = laneChangeCooldownS
 	return lcs, true
 }
 
@@ -1221,20 +1211,14 @@ func gcLaneChangeSplines(lcs []Spline, cars []Car) []Spline {
 	return out
 }
 
-// computeLaneChanges ticks each car's lane-change cooldown and, when it fires,
-// attempts to build a temporary bridging spline onto a coupled lane.
-// Every car checks every ~laneChangeCooldownS seconds (staggered at spawn).
-// When randomLaneChanges is false the timer-based triggering is suppressed.
-// When forceAll is true every eligible car attempts a lane change this frame
-// regardless of cooldown.
-func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int, dt float32, randomLaneChanges, forceAll bool) ([]Spline, []Car) {
+// computeLaneChanges handles desired-lane switches for each car.
+// Cars with a DesiredLaneSplineID attempt to merge as soon as a safe gap
+// exists; at the deadline the switch is forced regardless of gap.
+func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int, dt float32) ([]Spline, []Car) {
 	splineIndexByID := buildSplineIndexByID(splines)
 
 	for i := range cars {
 		car := &cars[i]
-		if randomLaneChanges {
-			car.LaneChangeCooldown -= dt
-		}
 
 		if car.LaneChanging {
 			continue
@@ -1266,41 +1250,6 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 					}
 				}
 			}
-			continue
-		}
-
-		if !forceAll && (!randomLaneChanges || car.LaneChangeCooldown > 0) {
-			continue
-		}
-		if car.Speed < laneChangeMinSpeed {
-			if randomLaneChanges {
-				car.LaneChangeCooldown = laneChangeRetrySecs
-			}
-			continue
-		}
-
-		splineIdx, ok := splineIndexByID[car.CurrentSplineID]
-		if !ok {
-			car.LaneChangeCooldown = laneChangeCooldownS
-			continue
-		}
-		currentSpline := splines[splineIdx]
-		allCoupled := append(append([]int(nil), currentSpline.HardCoupledIDs...), currentSpline.SoftCoupledIDs...)
-		if len(allCoupled) == 0 {
-			car.LaneChangeCooldown = laneChangeCooldownS
-			continue
-		}
-
-		switched := false
-		for _, destID := range allCoupled {
-			if newLcs, ok := buildLaneChangeBridge(car, destID, splines, splineIndexByID, lcs, nextID, false); ok {
-				lcs = newLcs
-				switched = true
-				break
-			}
-		}
-		if !switched {
-			car.LaneChangeCooldown = laneChangeCooldownS
 		}
 	}
 
@@ -1729,7 +1678,7 @@ func spawnCar(route Route) Car {
 		Braking:             false,
 		LaneChangeSplineID:  -1,
 		AfterSplineID:       -1,
-		LaneChangeCooldown:  rand.Float32() * laneChangeCooldownS,
+
 		DesiredLaneSplineID: -1,
 	}
 }
@@ -1906,7 +1855,10 @@ func predictCarTrajectory(car Car, splines []Spline, vehicleCounts map[int]int, 
 			Priority: spline.Priority,
 		})
 
-		if stepIndex == steps || !active || speed <= 0.01 {
+		if !active {
+			break
+		}
+		if stepIndex == steps || speed <= 0.01 {
 			continue
 		}
 
@@ -2484,7 +2436,7 @@ func drawNotice(text string) {
 	rl.DrawText(text, x+14, y+8, 18, rl.White)
 }
 
-func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, routeStartSplineID int, coupleModeFirstID int, debugMode bool, randomLaneChanges bool, zoom float32, splineCount, routeCount, carCount int) {
+func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, routeStartSplineID int, coupleModeFirstID int, debugMode bool, zoom float32, splineCount, routeCount, carCount int) {
 	panel := rl.NewColor(248, 248, 250, 240)
 	outline := rl.NewColor(210, 210, 215, 255)
 	text := rl.NewColor(30, 30, 35, 255)
@@ -2534,16 +2486,11 @@ func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, route
 		debugText = "on"
 	}
 
-	randLCText := "off"
-	if randomLaneChanges {
-		randLCText = "on"
-	}
-
 	rl.DrawText("Traffic spline editor", 24, 24, 22, text)
-	rl.DrawText("E: edit | R: route | P: priority | L: lane couple | C: cut | S: speed limits | D: debug | N: random LC | F: force LC | Ctrl+S: save | Ctrl+O: open | Tab: cycle", 24, 54, 18, muted)
+	rl.DrawText("E: edit | R: route | P: priority | L: lane couple | C: cut | S: speed limits | D: debug | Ctrl+S: save | Ctrl+O: open | Tab: cycle", 24, 54, 18, muted)
 	rl.DrawText("Priority splines are purple. Lane coupling: left-click = hard (routing+LC, blue), right-click = soft (LC only, purple). Debug draws blame/LC lines.", 24, 78, 18, muted)
 	rl.DrawText(fmt.Sprintf("Mode: %s   Status: %s", modeText, statusText), 24, 108, 18, text)
-	rl.DrawText(fmt.Sprintf("Splines: %d   Routes: %d   Cars: %d   Hovered: %s   Debug: %s   Random LC: %s   Zoom: %.2fx   Scale: 1 unit = 1 m", splineCount, routeCount, carCount, hoverText, debugText, randLCText, zoom), 24, 132, 18, text)
+	rl.DrawText(fmt.Sprintf("Splines: %d   Routes: %d   Cars: %d   Hovered: %s   Debug: %s   Zoom: %.2fx   Scale: 1 unit = 1 m", splineCount, routeCount, carCount, hoverText, debugText, zoom), 24, 132, 18, text)
 }
 
 func stageLabel(stage Stage, draft Draft) string {
@@ -3368,7 +3315,7 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, int, int, error) {
 			Braking:             false,
 			LaneChangeSplineID:  -1,
 			AfterSplineID:       -1,
-			LaneChangeCooldown:  rand.Float32() * laneChangeCooldownS,
+	
 			DesiredLaneSplineID: -1,
 		}
 		loadedCars = append(loadedCars, car)
