@@ -125,9 +125,11 @@ const (
 	// Minimum dot product of car heading vs destination lane tangent (cos 45° ≈ 0.71).
 	// Prevents switching onto a lane going the wrong way.
 	laneChangeDirCos    float32 = 0.71
-	laneChangeCooldownS float32 = 5.0  // seconds between lane-change checks (testing value)
-	laneChangeRetrySecs float32 = 1.0  // retry delay when conditions not met
-	maxCarSpeed         float32 = 36.1 // m/s — upper bound of car MaxSpeed range (130 km/h)
+	laneChangeCooldownS      float32 = 5.0        // seconds between lane-change checks (testing value)
+	laneChangeRetrySecs      float32 = 1.0        // retry delay when conditions not met
+	maxCarSpeed              float32 = 36.1       // m/s — upper bound of car MaxSpeed range (130 km/h)
+	laneChangeForcedSpeedMPS float32 = 10.0 / 3.6 // 10 km/h — speed for last-resort lane switch
+	laneChangeForcedDistEnd  float32 = 10.0       // metres before spline end where last-resort fires
 )
 
 type Spline struct {
@@ -914,32 +916,6 @@ func laneChangeFeasible(src, dst Spline, speed float32) bool {
 	return laneChangeFeasibleAt(src, dst, 0, speed)
 }
 
-// computeLaneChangeDeadline returns the last arc-length position on src from
-// which a lane change to dst is still geometrically possible at max speed.
-// The result is computed once via binary search and stored on the car.
-func computeLaneChangeDeadline(src, dst Spline) float32 {
-	speed := effectiveMaxSpeedMPS(src)
-	// If not feasible from the start there is no valid range at all.
-	if !laneChangeFeasibleAt(src, dst, 0, speed) {
-		return 0
-	}
-	// If feasible even at the very end there is no binding deadline.
-	if laneChangeFeasibleAt(src, dst, src.Length, speed) {
-		return src.Length
-	}
-	// Binary search for the last feasible position.
-	lo, hi := float32(0), src.Length
-	for i := 0; i < 20; i++ {
-		mid := (lo + hi) / 2
-		if laneChangeFeasibleAt(src, dst, mid, speed) {
-			lo = mid
-		} else {
-			hi = mid
-		}
-	}
-	return lo
-}
-
 // findForcedLaneChangePath looks for a physically reachable next spline whose
 // hard-coupled partners include one that has a valid path to the destination.
 // Returns the ID of the next spline to enter and the ID of the desired target
@@ -1212,15 +1188,17 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 			continue
 		}
 
-		// If a forced lane switch is pending, attempt it every tick — the
-		// crossDist == 0 check inside the builder naturally prevents too-early
-		// switches. Trying eagerly avoids the one-frame blind spot that arises
-		// from computeLaneChanges running before updateCars moves the car.
+		// If a forced lane switch is pending, attempt it once the car reaches
+		// the deadline (10 m before the spline end). At that point the car has
+		// already decelerated to ~10 km/h, so a one-frame overshoot is ~2 cm
+		// and harmless.
 		if car.DesiredLaneSplineID >= 0 {
-			if newLcs, ok := buildLaneChangeBridge(car, car.DesiredLaneSplineID, splines, splineIndexByID, lcs, nextID, true); ok {
-				lcs = newLcs
-				car.DesiredLaneSplineID = -1
-				car.DesiredLaneDeadline = 0
+			if car.DistanceOnSpline >= car.DesiredLaneDeadline {
+				if newLcs, ok := buildLaneChangeBridge(car, car.DesiredLaneSplineID, splines, splineIndexByID, lcs, nextID, true); ok {
+					lcs = newLcs
+					car.DesiredLaneSplineID = -1
+					car.DesiredLaneDeadline = 0
+				}
 			}
 			continue
 		}
@@ -2157,6 +2135,22 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 					targetSpeed = limitMPS
 				}
 			}
+			// If a forced lane switch is pending, begin decelerating to
+			// laneChangeForcedSpeedMPS in time to reach the deadline position.
+			if car.DesiredLaneSplineID >= 0 {
+				remaining := car.DesiredLaneDeadline - car.DistanceOnSpline
+				if remaining >= 0 && car.Speed > laneChangeForcedSpeedMPS {
+					// Use the normal coast-down deceleration (accel * 1.5), not the
+					// emergency-brake multiplier, since that's what actually applies
+					// here. A small safety factor (0.9) ensures we start a little early.
+					normalDecel := car.Accel * 1.5 * 0.9
+					brakingDist := (car.Speed*car.Speed - laneChangeForcedSpeedMPS*laneChangeForcedSpeedMPS) /
+						(2 * normalDecel)
+					if remaining <= brakingDist && targetSpeed > laneChangeForcedSpeedMPS {
+						targetSpeed = laneChangeForcedSpeedMPS
+					}
+				}
+			}
 			if car.Braking {
 				targetSpeed = 0
 			} else if followCap < targetSpeed {
@@ -2227,12 +2221,9 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 				}
 				nextSplineID = forcedNext
 				car.DesiredLaneSplineID = desiredLane
-				// Pre-compute and cache the last position on the forced spline where
-				// the switch is still geometrically possible.
+				// Deadline: 10 m before the end of the forced spline.
 				if src, srcOk := findSplineByID(splines, forcedNext); srcOk {
-					if dst, dstOk := findSplineByID(splines, desiredLane); dstOk {
-						car.DesiredLaneDeadline = computeLaneChangeDeadline(src, dst)
-					}
+					car.DesiredLaneDeadline = maxf(src.Length-laneChangeForcedDistEnd, 0)
 				}
 			}
 			car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
