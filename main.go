@@ -2338,9 +2338,25 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 			followCap = followCaps[i]
 		}
 
-		// Accumulate time spent behind a leader (used by the overtake mechanism).
+		// Accumulate frustration time: only counts when a leader is present AND
+		// the car is at least 10 km/h below its preferred speed on this spline.
+		const frustrateThreshMPS = 10.0 / 3.6
 		if !shouldBrake && followCap < float32(math.MaxFloat32) {
-			car.SlowedTimer += dt
+			frustrated := false
+			if spline, ok := findSplineByID(splines, car.CurrentSplineID); ok {
+				preferredSpeed := car.MaxSpeed * spline.SpeedFactor
+				if spline.SpeedLimitKmh > 0 {
+					if limitMPS := spline.SpeedLimitKmh / 3.6; limitMPS < preferredSpeed {
+						preferredSpeed = limitMPS
+					}
+				}
+				frustrated = preferredSpeed-car.Speed >= frustrateThreshMPS
+			}
+			if frustrated {
+				car.SlowedTimer += dt
+			} else {
+				car.SlowedTimer = 0
+			}
 		} else {
 			car.SlowedTimer = 0
 		}
