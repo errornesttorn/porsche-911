@@ -125,11 +125,13 @@ const (
 	laneChangeMinSpeed float32 = 3.0 // minimum m/s to attempt a lane change
 	// Minimum dot product of car heading vs destination lane tangent (cos 45° ≈ 0.71).
 	// Prevents switching onto a lane going the wrong way.
-	laneChangeDirCos              float32 = 0.71
-	preferenceChangeCooldownS    float32 = 10.0       // seconds between preference-based lane-change checks
-	maxCarSpeed                  float32 = 36.1       // m/s — upper bound of car MaxSpeed range (130 km/h)
-	laneChangeForcedSpeedMPS float32 = 20.0 / 3.6 // 20 km/h — speed for last-resort lane switch
-	laneChangeForcedDistEnd  float32 = 15.0       // metres before spline end where last-resort fires
+	laneChangeDirCos          float32 = 0.71
+	preferenceChangeCooldownS float32 = 7.5        // seconds between preference-based lane-change checks
+	overtakeSlowThresholdS    float32 = 3.0        // seconds behind a leader before attempting overtake
+	overtakeCooldownS         float32 = 7.5        // seconds between overtake attempts
+	maxCarSpeed               float32 = 36.1       // m/s — upper bound of car MaxSpeed range (130 km/h)
+	laneChangeForcedSpeedMPS  float32 = 20.0 / 3.6 // 20 km/h — speed for last-resort lane switch
+	laneChangeForcedDistEnd   float32 = 15.0       // metres before spline end where last-resort fires
 )
 
 type Spline struct {
@@ -236,6 +238,8 @@ type Car struct {
 	DesiredLaneDeadline float32 // arc-length on current spline beyond which the switch must start
 
 	PreferenceCooldown float32 // seconds until the next preference-based lane-change check
+	SlowedTimer        float32 // seconds the car has been held back by a leader
+	OvertakeCooldown   float32 // seconds until the next overtake attempt is allowed
 }
 
 type TrajectorySample struct {
@@ -1353,6 +1357,33 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 				}
 			}
 		}
+
+		// Overtake: if the car has been held back by a leader long enough, try
+		// moving to an adjacent lane that is exactly one preference step less
+		// preferred (number one higher). Never forced; requires a safe gap and a
+		// valid path to the destination. Resets PreferenceCooldown on success so
+		// the car does not immediately try to return to the preferred lane.
+		car.OvertakeCooldown -= dt
+		if car.SlowedTimer > overtakeSlowThresholdS && car.OvertakeCooldown <= 0 {
+			car.OvertakeCooldown = overtakeCooldownS
+			if destID := findOvertakeLane(*car, splines, splineIndexByID); destID >= 0 {
+				if _, _, pathOk := findShortestPathWeighted(splines, destID, car.DestinationSplineID, vehicleCounts); pathOk {
+					srcIdx, srcOk := splineIndexByID[car.CurrentSplineID]
+					destIdx, destOk := splineIndexByID[destID]
+					if srcOk && destOk {
+						if p3Dist, feasible := laneChangeLandingDist(*car, splines[srcIdx], splines[destIdx]); feasible {
+							if isLaneChangeLandingSafe(p3Dist, destID, *car, cars) {
+								if newLcs, ok := buildLaneChangeBridge(car, destID, splines, splineIndexByID, lcs, nextID, false); ok {
+									lcs = newLcs
+									car.PreferenceCooldown = preferenceChangeCooldownS
+									car.SlowedTimer = 0
+								}
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 
 	return lcs, cars
@@ -1393,6 +1424,35 @@ func findBetterPreferenceLane(car Car, splines []Spline, splineIndexByID map[int
 		}
 	}
 	return bestID
+}
+
+// findOvertakeLane returns the ID of a coupled lane whose LanePreference is
+// exactly currentPref+1 (one step less preferred — the overtaking lane).
+// Only works when the car is on a numbered lane; lanes with no preference are
+// never considered as targets. Returns -1 if no suitable lane exists.
+func findOvertakeLane(car Car, splines []Spline, splineIndexByID map[int]int) int {
+	idx, ok := splineIndexByID[car.CurrentSplineID]
+	if !ok {
+		return -1
+	}
+	currentSpline := splines[idx]
+	currentPref := currentSpline.LanePreference
+	if currentPref <= 0 {
+		return -1 // can only overtake from a lane that has a preference number
+	}
+	targetPref := currentPref + 1
+
+	allCoupled := append(append([]int(nil), currentSpline.HardCoupledIDs...), currentSpline.SoftCoupledIDs...)
+	for _, coupledID := range allCoupled {
+		cIdx, cOk := splineIndexByID[coupledID]
+		if !cOk {
+			continue
+		}
+		if splines[cIdx].LanePreference == targetPref {
+			return coupledID
+		}
+	}
+	return -1
 }
 
 // drawLaneChangeSplines renders active lane-change bridge splines in a
@@ -1465,7 +1525,6 @@ func drawCoupleMode(splines []Spline, firstSelectedID int, hoveredSpline int, zo
 		}
 	}
 }
-
 
 func newCutDraft() CutDraft {
 	return CutDraft{OriginalSplineID: -1}
@@ -1786,6 +1845,7 @@ func spawnCar(route Route) Car {
 
 		DesiredLaneSplineID: -1,
 		PreferenceCooldown:  rand.Float32() * preferenceChangeCooldownS,
+		OvertakeCooldown:    rand.Float32() * overtakeCooldownS,
 	}
 }
 
@@ -2276,6 +2336,13 @@ func updateCars(cars []Car, routes []Route, splines []Spline, vehicleCounts map[
 		followCap := float32(math.MaxFloat32)
 		if i < len(followCaps) {
 			followCap = followCaps[i]
+		}
+
+		// Accumulate time spent behind a leader (used by the overtake mechanism).
+		if !shouldBrake && followCap < float32(math.MaxFloat32) {
+			car.SlowedTimer += dt
+		} else {
+			car.SlowedTimer = 0
 		}
 
 		for {
@@ -3426,9 +3493,9 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, int, int, error) {
 			Braking:             false,
 			LaneChangeSplineID:  -1,
 			AfterSplineID:       -1,
-	
+
 			DesiredLaneSplineID: -1,
-		PreferenceCooldown:  rand.Float32() * preferenceChangeCooldownS,
+			PreferenceCooldown:  rand.Float32() * preferenceChangeCooldownS,
 		}
 		loadedCars = append(loadedCars, car)
 	}
