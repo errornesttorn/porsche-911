@@ -201,6 +201,7 @@ type Route struct {
 	SpawnPerMinute float32
 	NextSpawnIn    float32
 	Valid          bool
+	ColorIndex     int
 	Color          rl.Color
 }
 
@@ -213,6 +214,7 @@ type RoutePanel struct {
 	PathIDs         []int
 	PathLength      float32
 	SpawnPerMinute  float32
+	ColorIndex      int
 
 	DraggingSlider bool
 }
@@ -321,6 +323,7 @@ type SavedRoute struct {
 	EndSplineID    int     `json:"end_spline_id"`
 	PathIDs        []int   `json:"path_ids"`
 	SpawnPerMinute float32 `json:"spawn_per_minute"`
+	ColorIndex     int     `json:"color_index,omitempty"`
 }
 
 type SavedCar struct {
@@ -477,6 +480,7 @@ func main() {
 	durInputStr := ""      // current text in the active duration input
 	showPhaseIdx := -1     // >= 0 = phase being previewed via Show button
 
+	paused := false
 	noticeText := ""
 	noticeTimer := float32(0)
 	routeVisualsTimer := float32(0)
@@ -594,6 +598,9 @@ func main() {
 		if rl.IsKeyPressed(rl.KeyD) {
 			debugMode = !debugMode
 		}
+		if rl.IsKeyPressed(rl.KeySpace) && activeDurInput == -1 {
+			paused = !paused
+		}
 		if isCtrlDown() && rl.IsKeyPressed(rl.KeyS) {
 			path, err := pickSplineFilePath(true)
 			if err != nil {
@@ -696,14 +703,20 @@ func main() {
 			routes = updateRouteVisuals(routes, splines, vehicleCounts)
 			routeVisualsTimer = 0.5
 		}
-		laneChangeSplines, cars = computeLaneChanges(cars, splines, laneChangeSplines, &nextSplineID, vehicleCounts, dt)
+		if !paused {
+			laneChangeSplines, cars = computeLaneChanges(cars, splines, laneChangeSplines, &nextSplineID, vehicleCounts, dt)
+		}
 		allSplines := mergedSplines(splines, laneChangeSplines)
-		brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks := computeBrakingDecisions(cars, allSplines, vehicleCounts)
-		followCaps := computeFollowingSpeedCaps(cars, allSplines, vehicleCounts)
-		cars = updateCars(cars, routes, allSplines, vehicleCounts, brakingDecisions, holdSpeedDecisions, followCaps, trafficLights, trafficCycles, dt)
-		laneChangeSplines = gcLaneChangeSplines(laneChangeSplines, cars)
-		routes, cars = updateRouteSpawning(routes, cars, splines, dt)
-		trafficCycles = updateTrafficCycles(trafficCycles, dt)
+		var brakingDecisions, holdSpeedDecisions []bool
+		var debugBlameLinks, holdBlameLinks []DebugBlameLink
+		if !paused {
+			brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks = computeBrakingDecisions(cars, allSplines, vehicleCounts)
+			followCaps := computeFollowingSpeedCaps(cars, allSplines, vehicleCounts)
+			cars = updateCars(cars, routes, allSplines, vehicleCounts, brakingDecisions, holdSpeedDecisions, followCaps, trafficLights, trafficCycles, dt)
+			laneChangeSplines = gcLaneChangeSplines(laneChangeSplines, cars)
+			routes, cars = updateRouteSpawning(routes, cars, splines, dt)
+			trafficCycles = updateTrafficCycles(trafficCycles, dt)
+		}
 
 		if routePanel.Open {
 			var applied bool
@@ -1090,7 +1103,9 @@ func main() {
 		if routePanel.Open {
 			drawRoutePanel(routePanel, routes)
 		}
-		if noticeText != "" {
+		if paused {
+			drawNotice("⏸  Paused  (Space to resume)")
+		} else if noticeText != "" {
 			drawNotice(noticeText)
 		}
 		rl.DrawFPS(int32(rl.GetScreenWidth()-90), 10)
@@ -1194,9 +1209,11 @@ func handleRouteMode(routeStartSplineID int, routePanel RoutePanel, routes []Rou
 
 	existingRouteID := findRouteID(routes, routeStartSplineID, hoveredEnd.SplineID)
 	spawnPerMinute := float32(12.0)
+	colorIndex := pickNextColorIndex(routes)
 	if existingRouteID >= 0 {
 		if idx := findRouteIndexByID(routes, existingRouteID); idx >= 0 {
 			spawnPerMinute = routes[idx].SpawnPerMinute
+			colorIndex = routes[idx].ColorIndex
 		}
 	}
 
@@ -1208,6 +1225,7 @@ func handleRouteMode(routeStartSplineID int, routePanel RoutePanel, routes []Rou
 		PathIDs:         pathIDs,
 		PathLength:      pathLength,
 		SpawnPerMinute:  spawnPerMinute,
+		ColorIndex:      colorIndex,
 	}, ""
 }
 
@@ -2869,10 +2887,10 @@ func drawCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld rl.Vecto
 }
 
 func updateRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *int) (RoutePanel, []Route, []Car, bool) {
-	panelRect := rl.NewRectangle(float32(rl.GetScreenWidth())-360, 18, 340, 174)
+	panelRect := rl.NewRectangle(float32(rl.GetScreenWidth())-360, 18, 340, 234)
 	sliderRect := rl.NewRectangle(panelRect.X+18, panelRect.Y+82, panelRect.Width-36, 22)
-	applyRect := rl.NewRectangle(panelRect.X+18, panelRect.Y+126, 120, 32)
-	cancelRect := rl.NewRectangle(panelRect.X+202, panelRect.Y+126, 120, 32)
+	applyRect := rl.NewRectangle(panelRect.X+18, panelRect.Y+180, 120, 32)
+	cancelRect := rl.NewRectangle(panelRect.X+202, panelRect.Y+180, 120, 32)
 	mouse := rl.GetMousePosition()
 	applied := false
 
@@ -2888,6 +2906,19 @@ func updateRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID 
 		if pointInRect(mouse, sliderRect) {
 			panel.DraggingSlider = true
 			panel.SpawnPerMinute = sliderValueFromMouse(mouse.X, sliderRect, 0, spawnSliderMaxPerMinute)
+		}
+		// Colour swatch clicks
+		swatchSize := float32(20)
+		swatchStride := swatchSize + 4
+		for i := range routePalette {
+			col := i % 8
+			row := i / 8
+			sx := panelRect.X + 18 + float32(col)*swatchStride
+			sy := panelRect.Y + 128 + float32(row)*24
+			swatchRect := rl.NewRectangle(sx, sy, swatchSize, swatchSize)
+			if pointInRect(mouse, swatchRect) {
+				panel.ColorIndex = i
+			}
 		}
 		if pointInRect(mouse, applyRect) {
 			panel, routes, cars = applyRoutePanel(panel, routes, cars, nextRouteID)
@@ -2924,7 +2955,8 @@ func applyRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *
 			routes[idx].PathIDs = append([]int(nil), panel.PathIDs...)
 			routes[idx].PathLength = panel.PathLength
 			routes[idx].Valid = len(panel.PathIDs) > 0
-			routes[idx].Color = colorForDestination(routes[idx].EndSplineID)
+			routes[idx].ColorIndex = panel.ColorIndex
+			routes[idx].Color = routePaletteColor(panel.ColorIndex)
 			if routes[idx].NextSpawnIn <= 0 {
 				routes[idx].NextSpawnIn = randomizedSpawnDelay(spawn)
 			}
@@ -2943,7 +2975,8 @@ func applyRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *
 		SpawnPerMinute: spawn,
 		NextSpawnIn:    randomizedSpawnDelay(spawn),
 		Valid:          len(panel.PathIDs) > 0,
-		Color:          colorForDestination(panel.EndSplineID),
+		ColorIndex:     panel.ColorIndex,
+		Color:          routePaletteColor(panel.ColorIndex),
 	}
 	routes = append(routes, route)
 	return RoutePanel{}, routes, cars
@@ -2959,7 +2992,6 @@ func updateRouteVisuals(routes []Route, splines []Spline, vehicleCounts map[int]
 		routes[i].PathIDs = pathIDs
 		routes[i].PathLength = pathLength
 		routes[i].Valid = ok && len(pathIDs) > 0
-		routes[i].Color = colorForDestination(routes[i].EndSplineID)
 		if routes[i].SpawnPerMinute > 0 && routes[i].NextSpawnIn <= 0 {
 			routes[i].NextSpawnIn = randomizedSpawnDelay(routes[i].SpawnPerMinute)
 		}
@@ -3838,23 +3870,22 @@ func drawRoutePicking(routeStartSplineID int, routePanel RoutePanel, hoveredStar
 		if hoveredEnd.SplineIndex >= 0 {
 			drawEndpoint(hoveredEnd.Point, handleRadius*1.5, rl.NewColor(35, 85, 175, 255))
 			if pathIDs, _, ok := findShortestPathWeighted(splines, routeStartSplineID, hoveredEnd.SplineID, vehicleCounts); ok {
-				previewRoute := Route{PathIDs: pathIDs, Color: colorForDestination(hoveredEnd.SplineID), Valid: true}
+				previewRoute := Route{PathIDs: pathIDs, Color: routePaletteColor(routePanel.ColorIndex), Valid: true}
 				drawRoute(previewRoute, splines, pixelsToWorld(zoom, 4), zoom)
 			}
 		}
 	}
-	_ = routePanel
 }
 
 func drawRoutePanel(panel RoutePanel, routes []Route) {
-	panelRect := rl.NewRectangle(float32(rl.GetScreenWidth())-360, 18, 340, 174)
+	panelRect := rl.NewRectangle(float32(rl.GetScreenWidth())-360, 18, 340, 234)
 	sliderRect := rl.NewRectangle(panelRect.X+18, panelRect.Y+82, panelRect.Width-36, 22)
-	applyRect := rl.NewRectangle(panelRect.X+18, panelRect.Y+126, 120, 32)
-	cancelRect := rl.NewRectangle(panelRect.X+202, panelRect.Y+126, 120, 32)
+	applyRect := rl.NewRectangle(panelRect.X+18, panelRect.Y+180, 120, 32)
+	cancelRect := rl.NewRectangle(panelRect.X+202, panelRect.Y+180, 120, 32)
 
 	bg := rl.NewColor(248, 248, 250, 245)
 	outline := rl.NewColor(210, 210, 215, 255)
-	text := rl.NewColor(30, 30, 35, 255)
+	textCol := rl.NewColor(30, 30, 35, 255)
 	muted := rl.NewColor(90, 90, 100, 255)
 	accent := rl.NewColor(70, 110, 220, 255)
 	button := rl.NewColor(235, 236, 240, 255)
@@ -3865,13 +3896,13 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 	if panel.ExistingRouteID >= 0 {
 		title = "Edit existing route"
 	}
-	drawText(title, int32(panelRect.X+18), int32(panelRect.Y+16), 22, text)
+	drawText(title, int32(panelRect.X+18), int32(panelRect.Y+16), 22, textCol)
 	drawText(fmt.Sprintf("Start spline #%d → end spline #%d", panel.StartSplineID, panel.EndSplineID), int32(panelRect.X+18), int32(panelRect.Y+44), 18, muted)
 	meanSeconds := float32(0)
 	if panel.SpawnPerMinute > 0 {
 		meanSeconds = 60 / panel.SpawnPerMinute
 	}
-	drawText(fmt.Sprintf("Average spawn frequency: %.1f cars/min  (mean %.1fs)", panel.SpawnPerMinute, meanSeconds), int32(panelRect.X+18), int32(panelRect.Y+64), 18, text)
+	drawText(fmt.Sprintf("Average spawn frequency: %.1f cars/min  (mean %.1fs)", panel.SpawnPerMinute, meanSeconds), int32(panelRect.X+18), int32(panelRect.Y+64), 18, textCol)
 
 	rl.DrawRectangle(int32(sliderRect.X), int32(sliderRect.Y), int32(sliderRect.Width), int32(sliderRect.Height), rl.NewColor(229, 229, 234, 255))
 	fillWidth := sliderRect.Width * clampf(panel.SpawnPerMinute/spawnSliderMaxPerMinute, 0, 1)
@@ -3883,6 +3914,25 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 	knobRect := rl.NewRectangle(knobX-7, sliderRect.Y-4, 14, sliderRect.Height+8)
 	rl.DrawRectangle(int32(knobRect.X), int32(knobRect.Y), int32(knobRect.Width), int32(knobRect.Height), rl.White)
 	rl.DrawRectangleLines(int32(knobRect.X), int32(knobRect.Y), int32(knobRect.Width), int32(knobRect.Height), outline)
+
+	// ── Colour picker ──────────────────────────────────────────────────────
+	drawText("Route colour:", int32(panelRect.X+18), int32(panelRect.Y+112), 14, muted)
+	swatchSize := float32(20)
+	swatchStride := swatchSize + 4
+	for i, col := range routePalette {
+		swatchCol := i % 8
+		swatchRow := i / 8
+		sx := panelRect.X + 18 + float32(swatchCol)*swatchStride
+		sy := panelRect.Y + 128 + float32(swatchRow)*24
+		sr := rl.NewRectangle(sx, sy, swatchSize, swatchSize)
+		rl.DrawRectangleRec(sr, col)
+		if i == panel.ColorIndex {
+			rl.DrawRectangleLinesEx(sr, 2, rl.White)
+			rl.DrawRectangleLinesEx(rl.NewRectangle(sx-1, sy-1, swatchSize+2, swatchSize+2), 1, rl.NewColor(40, 40, 40, 200))
+		} else {
+			rl.DrawRectangleLinesEx(sr, 1, rl.NewColor(0, 0, 0, 40))
+		}
+	}
 
 	applyLabel := "Apply"
 	if panel.SpawnPerMinute <= 0.01 {
@@ -3896,9 +3946,9 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 	rl.DrawRectangle(int32(cancelRect.X), int32(cancelRect.Y), int32(cancelRect.Width), int32(cancelRect.Height), button)
 	rl.DrawRectangleLines(int32(applyRect.X), int32(applyRect.Y), int32(applyRect.Width), int32(applyRect.Height), outline)
 	rl.DrawRectangleLines(int32(cancelRect.X), int32(cancelRect.Y), int32(cancelRect.Width), int32(cancelRect.Height), outline)
-	drawText(applyLabel, int32(applyRect.X+34), int32(applyRect.Y+7), 20, text)
-	drawText("Close", int32(cancelRect.X+34), int32(cancelRect.Y+7), 20, text)
-	drawText(fmt.Sprintf("Current weighted cost: %.0f", panel.PathLength), int32(panelRect.X+18), int32(panelRect.Y+158), 16, muted)
+	drawText(applyLabel, int32(applyRect.X+34), int32(applyRect.Y+7), 20, textCol)
+	drawText("Close", int32(cancelRect.X+34), int32(cancelRect.Y+7), 20, textCol)
+	drawText(fmt.Sprintf("Current weighted cost: %.0f", panel.PathLength), int32(panelRect.X+18), int32(panelRect.Y+220), 16, muted)
 	_ = routes
 }
 
@@ -4964,6 +5014,7 @@ func saveSplineFile(splines []Spline, routes []Route, cars []Car, lights []Traff
 			EndSplineID:    route.EndSplineID,
 			PathIDs:        route.PathIDs,
 			SpawnPerMinute: route.SpawnPerMinute,
+			ColorIndex:     route.ColorIndex,
 		})
 	}
 	for _, car := range cars {
@@ -5052,7 +5103,8 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, []TrafficLight, []Tr
 			EndSplineID:    entry.EndSplineID,
 			PathIDs:        entry.PathIDs,
 			SpawnPerMinute: entry.SpawnPerMinute,
-			Color:          colorForDestination(entry.EndSplineID),
+			ColorIndex:     entry.ColorIndex,
+			Color:          routePaletteColor(entry.ColorIndex),
 		}
 		if entry.ID > maxRouteID {
 			maxRouteID = entry.ID
@@ -5185,20 +5237,46 @@ func randomizedSpawnDelay(spawnPerMinute float32) float32 {
 	return float32(-math.Log(u) / lambda)
 }
 
-func colorForDestination(destinationSplineID int) rl.Color {
-	palette := []rl.Color{
-		rl.NewColor(224, 94, 94, 255),
-		rl.NewColor(76, 150, 230, 255),
-		rl.NewColor(99, 190, 123, 255),
-		rl.NewColor(225, 169, 76, 255),
-		rl.NewColor(154, 108, 224, 255),
-		rl.NewColor(76, 191, 188, 255),
-		rl.NewColor(213, 104, 171, 255),
-	}
-	if destinationSplineID < 0 {
+var routePalette = []rl.Color{
+	rl.NewColor(224, 94, 94, 255),   // Red
+	rl.NewColor(76, 150, 230, 255),  // Blue
+	rl.NewColor(99, 190, 123, 255),  // Green
+	rl.NewColor(225, 169, 76, 255),  // Orange
+	rl.NewColor(154, 108, 224, 255), // Purple
+	rl.NewColor(76, 191, 188, 255),  // Cyan
+	rl.NewColor(213, 104, 171, 255), // Pink
+	rl.NewColor(218, 205, 60, 255),  // Yellow
+	rl.NewColor(140, 205, 70, 255),  // Lime
+	rl.NewColor(98, 118, 228, 255),  // Indigo
+	rl.NewColor(230, 112, 82, 255),  // Coral
+	rl.NewColor(62, 178, 152, 255),  // Teal
+	rl.NewColor(178, 132, 228, 255), // Lavender
+	rl.NewColor(225, 82, 128, 255),  // Rose
+	rl.NewColor(228, 158, 48, 255),  // Amber
+}
+
+func routePaletteColor(idx int) rl.Color {
+	n := len(routePalette)
+	if n == 0 {
 		return rl.NewColor(90, 90, 90, 255)
 	}
-	return palette[destinationSplineID%len(palette)]
+	return routePalette[((idx%n)+n)%n]
+}
+
+func pickNextColorIndex(routes []Route) int {
+	counts := make([]int, len(routePalette))
+	for _, r := range routes {
+		if r.ColorIndex >= 0 && r.ColorIndex < len(routePalette) {
+			counts[r.ColorIndex]++
+		}
+	}
+	minIdx := 0
+	for i, c := range counts {
+		if c < counts[minIdx] {
+			minIdx = i
+		}
+	}
+	return minIdx
 }
 
 // collisionRadius returns the radius of each of the two hitbox circles.
