@@ -639,6 +639,7 @@ func main() {
 		}
 		if mode == ModeSpeedLimit {
 			drawSpeedLimitLabels(splines, camera)
+			drawCarSpeedLabels(cars, allSplines, camera)
 		}
 		if mode == ModePreference {
 			drawPreferenceLabels(splines, camera)
@@ -2490,6 +2491,24 @@ func drawCars(cars []Car, splines []Spline, zoom float32) {
 		if car.Braking {
 			rl.DrawCircleV(pos, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), rl.NewColor(220, 50, 50, 255))
 		}
+	}
+}
+
+// drawCarSpeedLabels draws each car's current speed in km/h in screen space,
+// centred just above the car's position.
+func drawCarSpeedLabels(cars []Car, splines []Spline, camera rl.Camera2D) {
+	splineIndexByID := buildSplineIndexByID(splines)
+	fontSize := int32(12)
+	for _, car := range cars {
+		splineIdx, ok := splineIndexByID[car.CurrentSplineID]
+		if !ok {
+			continue
+		}
+		pos, _ := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+		screen := rl.GetWorldToScreen2D(pos, camera)
+		label := fmt.Sprintf("%d", int(car.Speed*3.6))
+		textW := rl.MeasureText(label, fontSize)
+		rl.DrawText(label, int32(screen.X)-textW/2, int32(screen.Y)-18, fontSize, rl.Black)
 	}
 }
 
