@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,6 +59,7 @@ const (
 	ModeCut
 	ModeSpeedLimit
 	ModePreference
+	ModeTrafficLight
 )
 
 const (
@@ -310,6 +312,43 @@ type SavedCar struct {
 	CurveSpeedMultiplier float32 `json:"curve_speed_multiplier,omitempty"`
 }
 
+// ---------- traffic lights ----------
+
+type TrafficState int
+
+const (
+	TrafficRed    TrafficState = iota
+	TrafficYellow TrafficState = iota
+	TrafficGreen  TrafficState = iota
+)
+
+// TrafficLight is a stop/go point placed on a spline.
+type TrafficLight struct {
+	ID           int
+	SplineID     int
+	DistOnSpline float32
+	WorldPos     rl.Vector2
+	CycleID      int // -1 = pending (not yet in any cycle)
+}
+
+// TrafficPhase is one step of a cycle. Each light not listed in GreenLightIDs is red.
+type TrafficPhase struct {
+	DurationSecs  float32
+	GreenLightIDs []int // IDs of lights that are green; all others are red
+}
+
+// TrafficCycle groups lights that share a timed phase sequence.
+type TrafficCycle struct {
+	ID         int
+	LightIDs   []int
+	Phases     []TrafficPhase
+	Timer      float32
+	PhaseIndex int  // which phase is currently active
+	Enabled    bool // when false the cycle is paused and all lights show red
+}
+
+// ---------- ui font ----------
+
 // uiFont is the Ubuntu font used for all on-screen text.
 var uiFont rl.Font
 
@@ -330,6 +369,7 @@ var toolbarItems = []toolbarItem{
 	{"C", "Cut", ModeCut, false},
 	{"S", "Speed", ModeSpeedLimit, false},
 	{"V", "Prefer", ModePreference, false},
+	{"T", "Traffic", ModeTrafficLight, false},
 	{"D", "Debug", 0, true},
 }
 
@@ -400,6 +440,17 @@ func main() {
 	lastPref := 0
 	nextSplineID := 1
 	nextRouteID := 1
+	nextLightID   := 1
+	nextCycleID   := 1
+	trafficLights := make([]TrafficLight, 0)
+	trafficCycles := make([]TrafficCycle, 0)
+	pendingLights := make([]TrafficLight, 0)
+	editingCycleID   := -1    // >= 0 when a cycle is open in the panel
+	editingLights    := false // true when the "Edit Lights" sub-mode is active
+	editingPhaseIdx  := -1    // >= 0 when a phase's light states are being toggled
+	activeDurInput   := -1    // >= 0 = phase index whose duration field is active
+	durInputStr      := ""    // current text in the active duration input
+	showPhaseIdx     := -1    // >= 0 = phase being previewed via Show button
 
 	noticeText := ""
 	noticeTimer := float32(0)
@@ -430,6 +481,8 @@ func main() {
 				mode = ModeSpeedLimit
 			case ModeSpeedLimit:
 				mode = ModePreference
+			case ModePreference:
+				mode = ModeTrafficLight
 			default:
 				mode = ModeEdit
 			}
@@ -496,6 +549,15 @@ func main() {
 		}
 		if rl.IsKeyPressed(rl.KeyV) {
 			mode = ModePreference
+			stage = StageIdle
+			draft = newDraft()
+			cutDraft = newCutDraft()
+			routePanel = RoutePanel{}
+			routeStartSplineID = -1
+			coupleModeFirstID = -1
+		}
+		if rl.IsKeyPressed(rl.KeyT) {
+			mode = ModeTrafficLight
 			stage = StageIdle
 			draft = newDraft()
 			cutDraft = newCutDraft()
@@ -597,6 +659,7 @@ func main() {
 		cars = updateCars(cars, routes, allSplines, vehicleCounts, brakingDecisions, followCaps, dt)
 		laneChangeSplines = gcLaneChangeSplines(laneChangeSplines, cars)
 		routes, cars = updateRouteSpawning(routes, cars, splines, dt)
+		trafficCycles = updateTrafficCycles(trafficCycles, dt)
 
 		if routePanel.Open {
 			var applied bool
@@ -645,6 +708,216 @@ func main() {
 				selectedSpeedKmh = updateSpeedLimitPanel(selectedSpeedKmh)
 			case ModePreference:
 				splines, lastPref = handlePreferenceMode(splines, hoveredSpline, lastPref)
+			case ModeTrafficLight:
+				phaseCount := 0
+				if editingCycleID >= 0 {
+					for _, c := range trafficCycles {
+						if c.ID == editingCycleID {
+							phaseCount = len(c.Phases)
+							break
+						}
+					}
+				}
+				pr := trafficCyclePanelRect(editingCycleID >= 0, phaseCount, len(pendingLights))
+				overPanel := rl.CheckCollisionPointRec(mouseScreen, pr)
+
+				// ── keyboard ──────────────────────────────────────────────
+				if rl.IsKeyPressed(rl.KeyEscape) {
+					if activeDurInput >= 0 {
+						activeDurInput = -1
+						durInputStr = ""
+					} else if editingPhaseIdx >= 0 {
+						editingPhaseIdx = -1
+					} else if editingCycleID >= 0 {
+						editingCycleID = -1
+						editingLights = false
+					} else {
+						pendingLights = pendingLights[:0]
+					}
+				}
+
+				// ── duration text input ───────────────────────────────────
+				if activeDurInput >= 0 {
+					for {
+						ch := rl.GetCharPressed()
+						if ch == 0 {
+							break
+						}
+						if (ch >= '0' && ch <= '9') || (ch == '.' && !containsRune(durInputStr, '.')) {
+							if len(durInputStr) < 7 {
+								durInputStr += string(ch)
+							}
+						}
+					}
+					if rl.IsKeyPressed(rl.KeyBackspace) && len(durInputStr) > 0 {
+						durInputStr = durInputStr[:len(durInputStr)-1]
+					}
+					if rl.IsKeyPressed(rl.KeyEnter) || rl.IsKeyPressed(rl.KeyKpEnter) {
+						trafficCycles = commitDurInput(trafficCycles, editingCycleID, activeDurInput, durInputStr)
+						activeDurInput = -1
+						durInputStr = ""
+					}
+					// click outside the input field → commit
+					if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+						for ci, c := range trafficCycles {
+							if c.ID != editingCycleID {
+								continue
+							}
+							if activeDurInput < len(c.Phases) {
+								row := getPhaseRowBtns(pr, activeDurInput)
+								if !rl.CheckCollisionPointRec(mouseScreen, row.durField) {
+									trafficCycles = commitDurInput(trafficCycles, editingCycleID, activeDurInput, durInputStr)
+									activeDurInput = -1
+									durInputStr = ""
+								}
+							}
+							_ = ci
+							break
+						}
+					}
+				}
+
+				// ── panel button clicks ───────────────────────────────────
+				// Find whether the current cycle is enabled
+				cycleIsOn := false
+				for _, c := range trafficCycles {
+					if c.ID == editingCycleID {
+						cycleIsOn = c.Enabled
+						break
+					}
+				}
+				if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && overPanel && activeDurInput < 0 {
+					if editingCycleID < 0 {
+						// new-cycle panel: Create button
+						if len(pendingLights) > 0 {
+							btn := trafficCreateBtnRect(len(pendingLights))
+							if rl.CheckCollisionPointRec(mouseScreen, btn) {
+								pendingLights, trafficLights, trafficCycles, editingCycleID = doCreateTrafficCycle(pendingLights, trafficLights, trafficCycles, &nextCycleID)
+							}
+						}
+					} else {
+						// cycle editor panel
+						onOffBtnR, editLightsBtn, closeBtnR := trafficHeaderBtnRects(pr)
+						// On/Off toggle
+						if rl.CheckCollisionPointRec(mouseScreen, onOffBtnR) {
+							trafficCycles = trafficToggleCycleEnabled(trafficCycles, editingCycleID)
+							// turning on: clear all editing state
+							if !cycleIsOn {
+								editingLights = false
+								editingPhaseIdx = -1
+								activeDurInput = -1
+								durInputStr = ""
+							}
+						}
+						// Edit Lights toggle (only when cycle is off)
+						if !cycleIsOn && rl.CheckCollisionPointRec(mouseScreen, editLightsBtn) {
+							editingLights = !editingLights
+							editingPhaseIdx = -1
+						}
+						if rl.CheckCollisionPointRec(mouseScreen, closeBtnR) {
+							editingCycleID = -1
+							editingLights = false
+							editingPhaseIdx = -1
+							showPhaseIdx = -1
+						}
+						// Add Phase button (only when cycle is off)
+						if !cycleIsOn && rl.CheckCollisionPointRec(mouseScreen, trafficAddPhaseBtnRect(pr)) {
+							trafficCycles = trafficAddPhase(trafficCycles, editingCycleID)
+						}
+						// Per-phase row buttons
+						for pi := 0; pi < phaseCount; pi++ {
+							row := getPhaseRowBtns(pr, pi)
+							// Show button: always active
+							if rl.CheckCollisionPointRec(mouseScreen, row.showBtn) {
+								if showPhaseIdx == pi {
+									showPhaseIdx = -1
+								} else {
+									showPhaseIdx = pi
+									editingPhaseIdx = -1
+								}
+							}
+							// Editing buttons: only when cycle is off
+							if !cycleIsOn {
+								if rl.CheckCollisionPointRec(mouseScreen, row.upBtn) && pi > 0 {
+									trafficCycles = trafficMovePhase(trafficCycles, editingCycleID, pi, -1)
+									if editingPhaseIdx == pi {
+										editingPhaseIdx--
+									}
+									if showPhaseIdx == pi {
+										showPhaseIdx--
+									}
+								}
+								if rl.CheckCollisionPointRec(mouseScreen, row.downBtn) && pi < phaseCount-1 {
+									trafficCycles = trafficMovePhase(trafficCycles, editingCycleID, pi, +1)
+									if editingPhaseIdx == pi {
+										editingPhaseIdx++
+									}
+									if showPhaseIdx == pi {
+										showPhaseIdx++
+									}
+								}
+								if rl.CheckCollisionPointRec(mouseScreen, row.durField) {
+									for _, c := range trafficCycles {
+										if c.ID == editingCycleID && pi < len(c.Phases) {
+											activeDurInput = pi
+											durInputStr = fmt.Sprintf("%.1f", c.Phases[pi].DurationSecs)
+											break
+										}
+									}
+								}
+								if rl.CheckCollisionPointRec(mouseScreen, row.editBtn) {
+									if editingPhaseIdx == pi {
+										editingPhaseIdx = -1
+									} else {
+										editingPhaseIdx = pi
+										editingLights = false
+										showPhaseIdx = -1
+									}
+								}
+								if rl.CheckCollisionPointRec(mouseScreen, row.delBtn) {
+									trafficCycles = trafficDeletePhase(trafficCycles, editingCycleID, pi)
+									if editingPhaseIdx == pi {
+										editingPhaseIdx = -1
+									} else if editingPhaseIdx > pi {
+										editingPhaseIdx--
+									}
+									if showPhaseIdx == pi {
+										showPhaseIdx = -1
+									} else if showPhaseIdx > pi {
+										showPhaseIdx--
+									}
+								}
+							}
+						}
+					}
+				} else if !overPanel && activeDurInput < 0 {
+					// ── world interactions ────────────────────────────────
+					if editingPhaseIdx >= 0 {
+						// toggle light state in this phase
+						if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+							if hitID := trafficLightAt(trafficLights, mouseWorld, camera.Zoom); hitID >= 0 {
+								trafficCycles = trafficToggleLightInPhase(trafficCycles, editingCycleID, editingPhaseIdx, hitID)
+							}
+						}
+					} else if editingCycleID >= 0 && editingLights {
+						trafficLights, trafficCycles = handleTrafficLightEdit(splines, trafficLights, trafficCycles, editingCycleID, mouseWorld, camera.Zoom, &nextLightID)
+					} else if editingCycleID < 0 {
+						if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && len(pendingLights) == 0 {
+							if hitID := trafficLightAt(trafficLights, mouseWorld, camera.Zoom); hitID >= 0 {
+								for _, l := range trafficLights {
+									if l.ID == hitID {
+										editingCycleID = l.CycleID
+										break
+									}
+								}
+							} else {
+								pendingLights = handleTrafficLightMode(splines, pendingLights, mouseWorld, camera.Zoom, &nextLightID)
+							}
+						} else {
+							pendingLights = handleTrafficLightMode(splines, pendingLights, mouseWorld, camera.Zoom, &nextLightID)
+						}
+					}
+				}
 			}
 		}
 
@@ -713,6 +986,14 @@ func main() {
 			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, camera.Zoom)
 			drawLaneChangeSplines(laneChangeSplines, camera.Zoom)
 		}
+		drawTrafficLights(trafficLights, pendingLights, trafficCycles, editingCycleID, editingPhaseIdx, showPhaseIdx, camera.Zoom)
+		if mode == ModeTrafficLight && (editingCycleID < 0 || editingLights) && editingPhaseIdx < 0 {
+			if _, _, snap, found := findNearestSplinePoint(splines, mouseWorld); found {
+				r := pixelsToWorld(camera.Zoom, 8)
+				rl.DrawCircleV(snap, r, rl.NewColor(255, 200, 0, 180))
+				rl.DrawRing(snap, r*0.6, r, 0, 360, 16, rl.NewColor(220, 160, 0, 220))
+			}
+		}
 		rl.EndMode2D()
 
 		drawScaleBar(camera.Zoom)
@@ -729,6 +1010,9 @@ func main() {
 			drawPreferenceLabels(splines, camera)
 		}
 		drawHud(mode, stage, draft, hoveredSpline, routeStartSplineID, coupleModeFirstID, debugMode, camera.Zoom, len(splines), len(routes), len(cars))
+		if mode == ModeTrafficLight {
+			drawTrafficCyclePanel(pendingLights, trafficLights, trafficCycles, editingCycleID, editingLights, editingPhaseIdx, activeDurInput, durInputStr, showPhaseIdx)
+		}
 		if mode == ModeSpeedLimit {
 			drawSpeedLimitPanel(selectedSpeedKmh)
 		}
@@ -886,6 +1170,699 @@ func handlePreferenceMode(splines []Spline, hoveredSpline, lastPref int) ([]Spli
 		}
 	}
 	return splines, lastPref
+}
+
+// ---------- traffic light mode handlers ----------
+
+func handleTrafficLightMode(splines []Spline, pending []TrafficLight, mouseWorld rl.Vector2, zoom float32, nextLightID *int) []TrafficLight {
+	if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		si, t, point, found := findNearestSplinePoint(splines, mouseWorld)
+		if found {
+			idx := int(t * float32(simSamples))
+			if idx > simSamples {
+				idx = simSamples
+			}
+			dist := splines[si].CumLen[idx]
+			pending = append(pending, TrafficLight{
+				ID:           *nextLightID,
+				SplineID:     splines[si].ID,
+				DistOnSpline: dist,
+				WorldPos:     point,
+				CycleID:      -1,
+			})
+			*nextLightID++
+		}
+	}
+	if rl.IsMouseButtonPressed(rl.MouseButtonRight) {
+		threshold := 15 / zoom
+		bestDSq := threshold * threshold
+		bestIdx := -1
+		for i, l := range pending {
+			d := distSq(l.WorldPos, mouseWorld)
+			if d < bestDSq {
+				bestDSq = d
+				bestIdx = i
+			}
+		}
+		if bestIdx >= 0 {
+			pending = append(pending[:bestIdx], pending[bestIdx+1:]...)
+		}
+	}
+	return pending
+}
+
+func doCreateTrafficCycle(pending []TrafficLight, lights []TrafficLight, cycles []TrafficCycle, nextCycleID *int) ([]TrafficLight, []TrafficLight, []TrafficCycle, int) {
+	cycleID := *nextCycleID
+	*nextCycleID++
+	ids := make([]int, len(pending))
+	for i, l := range pending {
+		l.CycleID = cycleID
+		ids[i] = l.ID
+		lights = append(lights, l)
+	}
+	cycles = append(cycles, TrafficCycle{
+		ID:         cycleID,
+		LightIDs:   ids,
+		Phases:     nil,
+		Timer:      0,
+		PhaseIndex: 0,
+		Enabled:    false,
+	})
+	return pending[:0], lights, cycles, cycleID
+}
+
+// effectivePhaseDur returns the duration of effective phase index ei in a cycle.
+// When n > 1, even ei = user phase, odd ei = 1-second transition.
+// When n == 1, there is only one effective phase (the single user phase).
+func effectivePhaseDur(c *TrafficCycle, ei int) float32 {
+	n := len(c.Phases)
+	if n <= 1 {
+		if n == 0 {
+			return 0.001
+		}
+		return maxf(c.Phases[0].DurationSecs, 0.001)
+	}
+	if ei%2 == 0 {
+		dur := c.Phases[ei/2].DurationSecs
+		if dur <= 0 {
+			dur = 0.001
+		}
+		return dur
+	}
+	return 1.0 // transition phase
+}
+
+func effectivePhaseCount(c *TrafficCycle) int {
+	n := len(c.Phases)
+	if n <= 1 {
+		return n
+	}
+	return 2 * n
+}
+
+func updateTrafficCycles(cycles []TrafficCycle, dt float32) []TrafficCycle {
+	for i := range cycles {
+		if !cycles[i].Enabled || len(cycles[i].Phases) == 0 {
+			continue
+		}
+		total := effectivePhaseCount(&cycles[i])
+		cycles[i].Timer += dt
+		dur := effectivePhaseDur(&cycles[i], cycles[i].PhaseIndex)
+		if cycles[i].Timer >= dur {
+			cycles[i].Timer -= dur
+			cycles[i].PhaseIndex = (cycles[i].PhaseIndex + 1) % total
+		}
+	}
+	return cycles
+}
+
+func phaseHasGreen(phase TrafficPhase, lightID int) bool {
+	for _, id := range phase.GreenLightIDs {
+		if id == lightID {
+			return true
+		}
+	}
+	return false
+}
+
+func trafficLightState(lightID, cycleID int, cycles []TrafficCycle) TrafficState {
+	for _, c := range cycles {
+		if c.ID != cycleID {
+			continue
+		}
+		if !c.Enabled || len(c.Phases) == 0 {
+			return TrafficRed
+		}
+		n := len(c.Phases)
+		ei := c.PhaseIndex
+		if n <= 1 || ei%2 == 0 {
+			// User phase
+			userIdx := ei / 2
+			if userIdx >= n {
+				userIdx = n - 1
+			}
+			if phaseHasGreen(c.Phases[userIdx], lightID) {
+				return TrafficGreen
+			}
+			return TrafficRed
+		}
+		// Transition phase between prevIdx and nextIdx
+		prevIdx := (ei / 2) % n
+		nextIdx := (prevIdx + 1) % n
+		prevGreen := phaseHasGreen(c.Phases[prevIdx], lightID)
+		nextGreen := phaseHasGreen(c.Phases[nextIdx], lightID)
+		if !prevGreen {
+			return TrafficRed
+		}
+		if nextGreen {
+			return TrafficGreen
+		}
+		return TrafficYellow
+	}
+	return TrafficRed
+}
+
+func trafficToggleCycleEnabled(cycles []TrafficCycle, cycleID int) []TrafficCycle {
+	for i := range cycles {
+		if cycles[i].ID != cycleID {
+			continue
+		}
+		cycles[i].Enabled = !cycles[i].Enabled
+		if cycles[i].Enabled {
+			cycles[i].Timer = 0
+			cycles[i].PhaseIndex = 0
+		}
+		break
+	}
+	return cycles
+}
+
+// ---------- traffic light panel ----------
+
+const trafficPanelW = 300
+
+// trafficCyclePanelRect computes the panel bounding rect.
+// editing=true means the cycle editor (with phase list); false = new-cycle creator.
+func trafficCyclePanelRect(editing bool, phaseCount, pendingCount int) rl.Rectangle {
+	x := float32(rl.GetScreenWidth()) - trafficPanelW - 12
+	y := float32(toolbarY+toolbarBtnH) + 30
+	var h float32
+	if !editing {
+		rows := pendingCount
+		if rows == 0 {
+			rows = 1
+		}
+		h = 44 + float32(rows)*22 + 48
+	} else {
+		rows := phaseCount
+		if rows == 0 {
+			rows = 1
+		}
+		h = 44 + 36 + float32(rows)*52 + 44
+	}
+	return rl.NewRectangle(x, y, trafficPanelW, h)
+}
+
+// trafficCreateBtnRect — "Create Traffic Cycle" button in new-cycle mode.
+func trafficCreateBtnRect(pendingCount int) rl.Rectangle {
+	pr := trafficCyclePanelRect(false, 0, pendingCount)
+	return rl.NewRectangle(pr.X+12, pr.Y+pr.Height-42, pr.Width-24, 32)
+}
+
+// trafficHeaderBtnRects returns [On/Off], [Edit Lights] and [Close] in the cycle-editor header.
+func trafficHeaderBtnRects(pr rl.Rectangle) (onOffBtn, editLightsBtn, closeBtn rl.Rectangle) {
+	closeBtn      = rl.NewRectangle(pr.X+pr.Width-12-48, pr.Y+8, 48, 26)
+	editLightsBtn = rl.NewRectangle(pr.X+pr.Width-12-48-6-72, pr.Y+8, 72, 26)
+	onOffBtn      = rl.NewRectangle(pr.X+pr.Width-12-48-6-72-6-46, pr.Y+8, 46, 26)
+	return
+}
+
+// trafficAddPhaseBtnRect — "+ Add Phase" button.
+func trafficAddPhaseBtnRect(pr rl.Rectangle) rl.Rectangle {
+	return rl.NewRectangle(pr.X+12, pr.Y+42, pr.Width-24, 28)
+}
+
+// phaseRowBtns holds all button/field rects for one phase row.
+// Each row has two sub-rows: (0) label + duration field, (1) action buttons.
+type phaseRowBtns struct {
+	durField                 rl.Rectangle
+	upBtn, downBtn           rl.Rectangle
+	showBtn, editBtn, delBtn rl.Rectangle
+}
+
+// getPhaseRowBtns returns the rects for phase row idx inside panel pr.
+// Each row is 52px tall: label+dur on top 24px, buttons on bottom 22px.
+func getPhaseRowBtns(pr rl.Rectangle, idx int) phaseRowBtns {
+	rowY := pr.Y + 78 + float32(idx)*52
+	x    := pr.X + 12
+	return phaseRowBtns{
+		// sub-row 1: duration field right-aligned
+		durField: rl.NewRectangle(pr.X+pr.Width-66, rowY+2, 48, 20),
+		// sub-row 2: buttons left-to-right
+		upBtn:   rl.NewRectangle(x,     rowY+26, 32, 20),
+		downBtn: rl.NewRectangle(x+36,  rowY+26, 38, 20),
+		showBtn: rl.NewRectangle(x+84,  rowY+26, 36, 20),
+		editBtn: rl.NewRectangle(x+124, rowY+26, 42, 20),
+		delBtn:  rl.NewRectangle(x+170, rowY+26, 44, 20),
+	}
+}
+
+func drawSmallBtn(r rl.Rectangle, label string, bg, fg rl.Color) {
+	rl.DrawRectangleRec(r, bg)
+	rl.DrawRectangleLinesEx(r, 1, rl.NewColor(0, 0, 0, 40))
+	lw := measureText(label, 12)
+	drawText(label, int32(r.X)+int32(r.Width)/2-lw/2, int32(r.Y)+int32(r.Height)/2-7, 12, fg)
+}
+
+func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles []TrafficCycle,
+	editingCycleID int, editingLights bool, editingPhaseIdx, activeDurInput int, durInputStr string, showPhaseIdx int) {
+	bg      := rl.NewColor(248, 248, 250, 245)
+	outline := rl.NewColor(210, 210, 215, 255)
+	dark    := rl.NewColor(28, 28, 33, 255)
+	muted   := rl.NewColor(100, 100, 110, 255)
+	sep     := rl.NewColor(220, 220, 224, 255)
+	disabledFg := rl.NewColor(170, 170, 178, 255)
+	disabledBg := rl.NewColor(220, 220, 224, 255)
+
+	if editingCycleID < 0 {
+		// ── New-cycle creator ────────────────────────────────────────────
+		pr := trafficCyclePanelRect(false, 0, len(pending))
+		rl.DrawRectangleRec(pr, bg)
+		rl.DrawRectangleLinesEx(pr, 1, outline)
+		drawText("New Traffic Cycle", int32(pr.X)+12, int32(pr.Y)+12, 15, dark)
+		rl.DrawLineEx(rl.NewVector2(pr.X+1, pr.Y+36), rl.NewVector2(pr.X+pr.Width-1, pr.Y+36), 1, sep)
+
+		y := int32(pr.Y) + 44
+		if len(pending) == 0 {
+			drawText("No lights selected yet", int32(pr.X)+12, y, 13, muted)
+		} else {
+			for _, l := range pending {
+				drawText(fmt.Sprintf("• Spline #%d  at %.1f m", l.SplineID, l.DistOnSpline), int32(pr.X)+12, y, 13, dark)
+				y += 22
+			}
+		}
+		btn := trafficCreateBtnRect(len(pending))
+		btnBg := rl.NewColor(47, 120, 60, 255)
+		if len(pending) == 0 {
+			btnBg = rl.NewColor(160, 160, 165, 255)
+		}
+		rl.DrawRectangleRec(btn, btnBg)
+		rl.DrawRectangleLinesEx(btn, 1, rl.NewColor(0, 0, 0, 40))
+		lbl := "Create Traffic Cycle"
+		lw := measureText(lbl, 13)
+		drawText(lbl, int32(btn.X)+int32(btn.Width)/2-lw/2, int32(btn.Y)+9, 13, rl.White)
+		if len(cycles) > 0 {
+			drawText(fmt.Sprintf("%d cycle(s) active", len(cycles)), int32(pr.X)+12, int32(pr.Y+pr.Height)+8, 12, muted)
+		}
+		return
+	}
+
+	// ── Cycle editor ─────────────────────────────────────────────────────
+	var cycle TrafficCycle
+	var found bool
+	for _, c := range cycles {
+		if c.ID == editingCycleID {
+			cycle = c
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+
+	cycleOn := cycle.Enabled
+
+	pr := trafficCyclePanelRect(true, len(cycle.Phases), 0)
+	rl.DrawRectangleRec(pr, bg)
+	rl.DrawRectangleLinesEx(pr, 1, outline)
+
+	// Header row
+	drawText(fmt.Sprintf("Cycle #%d", editingCycleID), int32(pr.X)+12, int32(pr.Y)+12, 15, dark)
+	onOffBtn, elBtn, clBtn := trafficHeaderBtnRects(pr)
+
+	// On/Off toggle — label shows current state
+	onOffBg := rl.NewColor(190, 50, 50, 255)
+	onOffLbl := "Off"
+	if cycleOn {
+		onOffBg  = rl.NewColor(47, 140, 60, 255)
+		onOffLbl = "On"
+	}
+	drawSmallBtn(onOffBtn, onOffLbl, onOffBg, rl.White)
+
+	// Edit Lights button (disabled when cycle is on)
+	elBg := rl.NewColor(47, 96, 198, 255)
+	elFg := rl.Color(rl.White)
+	if cycleOn {
+		elBg = disabledBg
+		elFg = disabledFg
+	} else if editingLights {
+		elBg = rl.NewColor(28, 62, 155, 255)
+	}
+	elLbl := "Edit Lights"
+	if editingLights && !cycleOn {
+		elLbl = "Done"
+	}
+	drawSmallBtn(elBtn, elLbl, elBg, elFg)
+	drawSmallBtn(clBtn, "Close", rl.NewColor(200, 60, 60, 255), rl.White)
+
+	rl.DrawLineEx(rl.NewVector2(pr.X+1, pr.Y+38), rl.NewVector2(pr.X+pr.Width-1, pr.Y+38), 1, sep)
+
+	// "+ Add Phase" button (disabled when cycle is on)
+	addBtn := trafficAddPhaseBtnRect(pr)
+	if cycleOn {
+		drawSmallBtn(addBtn, "+ Add Phase", disabledBg, disabledFg)
+	} else {
+		drawSmallBtn(addBtn, "+ Add Phase", rl.NewColor(70, 140, 80, 255), rl.White)
+	}
+
+	rl.DrawLineEx(rl.NewVector2(pr.X+1, pr.Y+74), rl.NewVector2(pr.X+pr.Width-1, pr.Y+74), 1, sep)
+
+	// Phase rows
+	if len(cycle.Phases) == 0 {
+		drawText("No phases yet", int32(pr.X)+12, int32(pr.Y)+80, 13, muted)
+	} else {
+		for pi, phase := range cycle.Phases {
+			row  := getPhaseRowBtns(pr, pi)
+			rowY := int32(pr.Y) + 78 + int32(pi)*52
+
+			// Determine whether this row is the current or transitioning-out phase.
+			// cycle.PhaseIndex is an effective index in the 2*N sequence:
+			//   even = user phase (ei/2), odd = transition (prev=ei/2, next=(ei/2+1)%n)
+			ei := cycle.PhaseIndex
+			inTransition := cycleOn && len(cycle.Phases) > 1 && ei%2 == 1
+			currentUserPhase := ei / 2 // integer division works for both even and odd
+			isCurrentPhase := cycleOn && pi == currentUserPhase && !inTransition
+			isLeavingPhase := cycleOn && inTransition && pi == currentUserPhase
+			isEnteringPhase := cycleOn && inTransition && pi == (currentUserPhase+1)%len(cycle.Phases)
+
+			if isCurrentPhase {
+				rl.DrawRectangle(int32(pr.X)+2, rowY, int32(pr.Width)-4, 50,
+					rl.NewColor(255, 240, 180, 160))
+			} else if isLeavingPhase {
+				rl.DrawRectangle(int32(pr.X)+2, rowY, int32(pr.Width)-4, 50,
+					rl.NewColor(255, 210, 100, 100))
+			} else if isEnteringPhase {
+				rl.DrawRectangle(int32(pr.X)+2, rowY, int32(pr.Width)-4, 50,
+					rl.NewColor(200, 255, 200, 100))
+			}
+
+			// Phase label (sub-row 1)
+			labelColor := dark
+			phaseLabel := fmt.Sprintf("Phase %d", pi+1)
+			if isCurrentPhase {
+				labelColor = rl.NewColor(140, 90, 0, 255)
+				phaseLabel = fmt.Sprintf("Phase %d  ▶", pi+1)
+			} else if isLeavingPhase {
+				labelColor = rl.NewColor(160, 100, 0, 255)
+				phaseLabel = fmt.Sprintf("Phase %d  →", pi+1)
+			} else if isEnteringPhase {
+				labelColor = rl.NewColor(30, 120, 30, 255)
+				phaseLabel = fmt.Sprintf("Phase %d  ←", pi+1)
+			}
+			drawText(phaseLabel, int32(pr.X)+12, rowY+3, 12, labelColor)
+
+			// Duration input field (sub-row 1, right side) — disabled when cycle on
+			fieldBg := rl.NewColor(255, 255, 255, 255)
+			if cycleOn {
+				fieldBg = rl.NewColor(235, 235, 238, 255)
+			} else if activeDurInput == pi {
+				fieldBg = rl.NewColor(240, 248, 255, 255)
+			}
+			rl.DrawRectangleRec(row.durField, fieldBg)
+			rl.DrawRectangleLinesEx(row.durField, 1, rl.NewColor(180, 180, 190, 255))
+			durStr := fmt.Sprintf("%.1f", phase.DurationSecs)
+			if !cycleOn && activeDurInput == pi {
+				durStr = durInputStr
+			}
+			durColor := dark
+			if cycleOn {
+				durColor = disabledFg
+			}
+			drawText(durStr, int32(row.durField.X)+4, int32(row.durField.Y)+3, 12, durColor)
+			if !cycleOn && activeDurInput == pi {
+				cw := measureText(durStr, 12)
+				rl.DrawRectangle(int32(row.durField.X)+4+cw+1, int32(row.durField.Y)+3, 1, 14, dark)
+			}
+			drawText("s", int32(row.durField.X)+int32(row.durField.Width)+3, int32(row.durField.Y)+3, 12, muted)
+
+			// Sub-row 2: action buttons
+			if cycleOn {
+				// Disabled Up/Down/Edit/Delete
+				drawSmallBtn(row.upBtn,   "Up",     disabledBg, disabledFg)
+				drawSmallBtn(row.downBtn, "Down",   disabledBg, disabledFg)
+				drawSmallBtn(row.editBtn, "Edit",   disabledBg, disabledFg)
+				drawSmallBtn(row.delBtn,  "Delete", disabledBg, disabledFg)
+			} else {
+				upBg   := rl.NewColor(200, 200, 205, 255)
+				downBg := rl.NewColor(200, 200, 205, 255)
+				if pi == 0 {
+					upBg = disabledBg
+				}
+				if pi == len(cycle.Phases)-1 {
+					downBg = disabledBg
+				}
+				drawSmallBtn(row.upBtn,   "Up",     upBg,   dark)
+				drawSmallBtn(row.downBtn, "Down",   downBg, dark)
+
+				editActive := editingPhaseIdx == pi
+				editBg := rl.NewColor(47, 96, 198, 255)
+				editLbl := "Edit"
+				if editActive {
+					editBg  = rl.NewColor(28, 62, 155, 255)
+					editLbl = "Done"
+				}
+				drawSmallBtn(row.editBtn, editLbl, editBg, rl.White)
+				drawSmallBtn(row.delBtn,  "Delete", rl.NewColor(200, 60, 60, 255), rl.White)
+			}
+
+			// Show button (always active)
+			showActive := showPhaseIdx == pi
+			showBg := rl.NewColor(130, 80, 180, 255)
+			if showActive {
+				showBg = rl.NewColor(90, 40, 140, 255)
+			}
+			drawSmallBtn(row.showBtn, "Show", showBg, rl.White)
+		}
+	}
+}
+
+// ---------- traffic light world drawing ----------
+
+func containsRune(s string, r rune) bool {
+	for _, c := range s {
+		if c == r {
+			return true
+		}
+	}
+	return false
+}
+
+func commitDurInput(cycles []TrafficCycle, cycleID, phaseIdx int, str string) []TrafficCycle {
+	val, err := strconv.ParseFloat(str, 32)
+	if err != nil || val <= 0 {
+		return cycles
+	}
+	for i := range cycles {
+		if cycles[i].ID != cycleID {
+			continue
+		}
+		if phaseIdx >= 0 && phaseIdx < len(cycles[i].Phases) {
+			cycles[i].Phases[phaseIdx].DurationSecs = float32(val)
+		}
+		break
+	}
+	return cycles
+}
+
+func trafficAddPhase(cycles []TrafficCycle, cycleID int) []TrafficCycle {
+	for i := range cycles {
+		if cycles[i].ID != cycleID {
+			continue
+		}
+		cycles[i].Phases = append(cycles[i].Phases, TrafficPhase{DurationSecs: 5, GreenLightIDs: nil})
+		break
+	}
+	return cycles
+}
+
+func trafficMovePhase(cycles []TrafficCycle, cycleID, idx, dir int) []TrafficCycle {
+	for i := range cycles {
+		if cycles[i].ID != cycleID {
+			continue
+		}
+		phases := cycles[i].Phases
+		target := idx + dir
+		if target < 0 || target >= len(phases) {
+			break
+		}
+		phases[idx], phases[target] = phases[target], phases[idx]
+		break
+	}
+	return cycles
+}
+
+func trafficDeletePhase(cycles []TrafficCycle, cycleID, idx int) []TrafficCycle {
+	for i := range cycles {
+		if cycles[i].ID != cycleID {
+			continue
+		}
+		phases := cycles[i].Phases
+		if idx < 0 || idx >= len(phases) {
+			break
+		}
+		cycles[i].Phases = append(phases[:idx], phases[idx+1:]...)
+		// Reset to start; editing only happens when cycle is off (PhaseIndex=0).
+		cycles[i].PhaseIndex = 0
+		cycles[i].Timer = 0
+		break
+	}
+	return cycles
+}
+
+func trafficToggleLightInPhase(cycles []TrafficCycle, cycleID, phaseIdx, lightID int) []TrafficCycle {
+	for i := range cycles {
+		if cycles[i].ID != cycleID {
+			continue
+		}
+		if phaseIdx < 0 || phaseIdx >= len(cycles[i].Phases) {
+			break
+		}
+		ids := cycles[i].Phases[phaseIdx].GreenLightIDs
+		for j, id := range ids {
+			if id == lightID {
+				cycles[i].Phases[phaseIdx].GreenLightIDs = append(ids[:j], ids[j+1:]...)
+				return cycles
+			}
+		}
+		cycles[i].Phases[phaseIdx].GreenLightIDs = append(ids, lightID)
+		break
+	}
+	return cycles
+}
+
+func drawTrafficLights(lights []TrafficLight, pending []TrafficLight, cycles []TrafficCycle, editingCycleID int, editingPhaseIdx int, showPhaseIdx int, zoom float32) {
+	r := pixelsToWorld(zoom, 8)
+	all := append(lights, pending...)
+	for _, l := range all {
+		var fill rl.Color
+		if l.CycleID < 0 {
+			fill = rl.NewColor(255, 165, 0, 220) // amber = pending
+		} else {
+			// Determine which phase index to display, if any override is active
+			displayPhase := -1
+			if editingCycleID >= 0 && l.CycleID == editingCycleID {
+				if showPhaseIdx >= 0 {
+					displayPhase = showPhaseIdx
+				} else if editingPhaseIdx >= 0 {
+					displayPhase = editingPhaseIdx
+				}
+			}
+			if displayPhase >= 0 {
+				isGreen := false
+				for _, c := range cycles {
+					if c.ID != l.CycleID {
+						continue
+					}
+					if displayPhase < len(c.Phases) {
+						for _, id := range c.Phases[displayPhase].GreenLightIDs {
+							if id == l.ID {
+								isGreen = true
+								break
+							}
+						}
+					}
+					break
+				}
+				if isGreen {
+					fill = rl.NewColor(40, 180, 60, 240)
+				} else {
+					fill = rl.NewColor(210, 35, 35, 240)
+				}
+			} else {
+				switch trafficLightState(l.ID, l.CycleID, cycles) {
+				case TrafficRed:
+					fill = rl.NewColor(210, 35, 35, 240)
+				case TrafficYellow:
+					fill = rl.NewColor(230, 175, 0, 240)
+				case TrafficGreen:
+					fill = rl.NewColor(40, 180, 60, 240)
+				}
+			}
+		}
+		rl.DrawCircleV(l.WorldPos, r, rl.NewColor(20, 20, 20, 220))
+		rl.DrawCircleV(l.WorldPos, r*0.7, fill)
+		// White ring around lights belonging to the currently-open cycle
+		if editingCycleID >= 0 && l.CycleID == editingCycleID {
+			rl.DrawRing(l.WorldPos, r*1.1, r*1.45, 0, 360, 24, rl.NewColor(255, 255, 255, 200))
+		}
+	}
+}
+
+// trafficLightAt returns the ID of the nearest placed light within click range,
+// or -1 if none.
+func trafficLightAt(lights []TrafficLight, pos rl.Vector2, zoom float32) int {
+	thresh := 15 / zoom
+	threshSq := thresh * thresh
+	for _, l := range lights {
+		if distSq(l.WorldPos, pos) < threshSq {
+			return l.ID
+		}
+	}
+	return -1
+}
+
+// trafficCycleLightCount returns how many placed lights belong to cycleID.
+func trafficCycleLightCount(cycleID int, lights []TrafficLight) int {
+	n := 0
+	for _, l := range lights {
+		if l.CycleID == cycleID {
+			n++
+		}
+	}
+	return n
+}
+
+// handleTrafficLightEdit adds or removes placed lights from an existing cycle.
+func handleTrafficLightEdit(splines []Spline, lights []TrafficLight, cycles []TrafficCycle, cycleID int, mouseWorld rl.Vector2, zoom float32, nextLightID *int) ([]TrafficLight, []TrafficCycle) {
+	if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		si, t, point, found := findNearestSplinePoint(splines, mouseWorld)
+		if found {
+			idx := int(t * float32(simSamples))
+			if idx > simSamples {
+				idx = simSamples
+			}
+			dist := splines[si].CumLen[idx]
+			newLight := TrafficLight{
+				ID:           *nextLightID,
+				SplineID:     splines[si].ID,
+				DistOnSpline: dist,
+				WorldPos:     point,
+				CycleID:      cycleID,
+			}
+			*nextLightID++
+			lights = append(lights, newLight)
+			for ci := range cycles {
+				if cycles[ci].ID == cycleID {
+					cycles[ci].LightIDs = append(cycles[ci].LightIDs, newLight.ID)
+					break
+				}
+			}
+		}
+	}
+	if rl.IsMouseButtonPressed(rl.MouseButtonRight) {
+		thresh := 15 / zoom
+		threshSq := thresh * thresh
+		bestDSq := threshSq
+		bestIdx := -1
+		removedID := -1
+		for i, l := range lights {
+			if l.CycleID != cycleID {
+				continue
+			}
+			if d := distSq(l.WorldPos, mouseWorld); d < bestDSq {
+				bestDSq = d
+				bestIdx = i
+				removedID = l.ID
+			}
+		}
+		if bestIdx >= 0 {
+			lights = append(lights[:bestIdx], lights[bestIdx+1:]...)
+			for ci := range cycles {
+				if cycles[ci].ID == cycleID {
+					ids := cycles[ci].LightIDs
+					for i, id := range ids {
+						if id == removedID {
+							cycles[ci].LightIDs = append(ids[:i], ids[i+1:]...)
+							break
+						}
+					}
+					break
+				}
+			}
+		}
+	}
+	return lights, cycles
 }
 
 func handleSpeedLimitMode(splines []Spline, hoveredSpline, selectedSpeedKmh int) []Spline {
@@ -2765,6 +3742,8 @@ func modeStatusText(mode EditorMode, stage Stage, draft Draft, routeStartSplineI
 		return "Left click: apply speed limit   Right click: remove"
 	case ModePreference:
 		return "Left click: assign 1 (reset counter)   Right click on empty: next number   Right click on assigned: remove"
+	case ModeTrafficLight:
+		return "Left click on spline: add light to cycle   Right click on light: remove from cycle   Then press Create"
 	}
 	return ""
 }
