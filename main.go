@@ -129,8 +129,8 @@ const (
 	// Prevents switching onto a lane going the wrong way.
 	laneChangeDirCos          float32 = 0.71
 	preferenceChangeCooldownS float32 = 7.5        // seconds between preference-based lane-change checks
-	overtakeSlowThresholdS    float32 = 3.0        // seconds behind a leader before attempting overtake
-	overtakeCooldownS         float32 = 7.5        // seconds between overtake attempts
+	overtakeSlowThresholdS    float32 = 2.0        // seconds behind a leader before attempting overtake
+	overtakeCooldownS         float32 = 3.5        // seconds between overtake attempts
 	maxCarSpeed               float32 = 36.1       // m/s — upper bound of car MaxSpeed range (130 km/h)
 	laneChangeForcedSpeedMPS  float32 = 20.0 / 3.6 // 20 km/h — speed for last-resort lane switch
 	laneChangeForcedDistEnd   float32 = 15.0       // metres before spline end where last-resort fires
@@ -293,9 +293,9 @@ type SavedTrafficLight struct {
 }
 
 type SavedTrafficPhase struct {
-	DurationSecs         float32 `json:"duration_secs"`
+	DurationSecs          float32 `json:"duration_secs"`
 	ClearanceDurationSecs float32 `json:"clearance_duration_secs,omitempty"`
-	GreenLightIDs        []int   `json:"green_light_ids,omitempty"`
+	GreenLightIDs         []int   `json:"green_light_ids,omitempty"`
 }
 
 type SavedTrafficCycle struct {
@@ -361,9 +361,9 @@ type TrafficLight struct {
 
 // TrafficPhase is one step of a cycle. Each light not listed in GreenLightIDs is red.
 type TrafficPhase struct {
-	DurationSecs         float32
+	DurationSecs          float32
 	ClearanceDurationSecs float32 // duration of the yellow clearance phase automatically inserted after this phase
-	GreenLightIDs        []int   // IDs of lights that are green; all others are red
+	GreenLightIDs         []int   // IDs of lights that are green; all others are red
 }
 
 // TrafficCycle groups lights that share a timed phase sequence.
@@ -1520,7 +1520,6 @@ func getPhaseRowBtns(pr rl.Rectangle, idx int) phaseRowBtns {
 	}
 }
 
-
 func drawSmallBtn(r rl.Rectangle, label string, bg, fg rl.Color) {
 	rl.DrawRectangleRec(r, bg)
 	rl.DrawRectangleLinesEx(r, 1, rl.NewColor(0, 0, 0, 40))
@@ -1777,7 +1776,6 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 	}
 
 }
-
 
 // ---------- traffic light world drawing ----------
 
@@ -5050,9 +5048,9 @@ func saveSplineFile(splines []Spline, routes []Route, cars []Car, lights []Traff
 		phases := make([]SavedTrafficPhase, len(c.Phases))
 		for i, p := range c.Phases {
 			phases[i] = SavedTrafficPhase{
-				DurationSecs:         p.DurationSecs,
+				DurationSecs:          p.DurationSecs,
 				ClearanceDurationSecs: p.ClearanceDurationSecs,
-				GreenLightIDs:        append([]int(nil), p.GreenLightIDs...),
+				GreenLightIDs:         append([]int(nil), p.GreenLightIDs...),
 			}
 		}
 		saved.TrafficCycles = append(saved.TrafficCycles, SavedTrafficCycle{
@@ -5178,9 +5176,9 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, []TrafficLight, []Tr
 				}
 			}
 			phases[i] = TrafficPhase{
-				DurationSecs:         p.DurationSecs,
+				DurationSecs:          p.DurationSecs,
 				ClearanceDurationSecs: clrDur,
-				GreenLightIDs:        append([]int(nil), p.GreenLightIDs...),
+				GreenLightIDs:         append([]int(nil), p.GreenLightIDs...),
 			}
 		}
 		loadedCycles = append(loadedCycles, TrafficCycle{
