@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -2580,19 +2581,22 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 		car.PreferenceCooldown -= dt
 		if car.PreferenceCooldown <= 0 {
 			car.PreferenceCooldown = preferenceChangeCooldownS
-			if destID := findBetterPreferenceLane(*car, splines, splineIndexByID); destID >= 0 {
-				if _, _, pathOk := findShortestPathWeighted(splines, destID, car.DestinationSplineID, vehicleCounts); pathOk {
-					srcIdx, srcOk := splineIndexByID[car.CurrentSplineID]
-					destIdx, destOk := splineIndexByID[destID]
-					if srcOk && destOk {
-						if p3Dist, feasible := laneChangeLandingDist(*car, splines[srcIdx], splines[destIdx]); feasible {
-							if isLaneChangeLandingSafe(p3Dist, destID, *car, cars) {
-								if newLcs, ok := buildLaneChangeBridge(car, destID, splines, splineIndexByID, lcs, nextID, false); ok {
-									lcs = newLcs
-								}
-							}
-						}
-					}
+			for _, destID := range findBetterPreferenceLaneCandidates(*car, splines, splineIndexByID) {
+				if _, _, pathOk := findShortestPathWeighted(splines, destID, car.DestinationSplineID, vehicleCounts); !pathOk {
+					continue
+				}
+				srcIdx, srcOk := splineIndexByID[car.CurrentSplineID]
+				destIdx, destOk := splineIndexByID[destID]
+				if !srcOk || !destOk {
+					continue
+				}
+				p3Dist, feasible := laneChangeLandingDist(*car, splines[srcIdx], splines[destIdx])
+				if !feasible || !isLaneChangeLandingSafe(p3Dist, destID, *car, cars) {
+					continue
+				}
+				if newLcs, ok := buildLaneChangeBridge(car, destID, splines, splineIndexByID, lcs, nextID, false); ok {
+					lcs = newLcs
+					break
 				}
 			}
 		}
@@ -2607,21 +2611,24 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 		if car.SlowedTimer > overtakeSlowThresholdS && car.OvertakeCooldown <= 0 &&
 			(!leaderFound || leaderSpeed <= car.Speed) {
 			car.OvertakeCooldown = overtakeCooldownS
-			if destID := findOvertakeLane(*car, splines, splineIndexByID); destID >= 0 {
-				if _, _, pathOk := findShortestPathWeighted(splines, destID, car.DestinationSplineID, vehicleCounts); pathOk {
-					srcIdx, srcOk := splineIndexByID[car.CurrentSplineID]
-					destIdx, destOk := splineIndexByID[destID]
-					if srcOk && destOk {
-						if p3Dist, feasible := laneChangeLandingDist(*car, splines[srcIdx], splines[destIdx]); feasible {
-							if isLaneChangeLandingSafe(p3Dist, destID, *car, cars) {
-								if newLcs, ok := buildLaneChangeBridge(car, destID, splines, splineIndexByID, lcs, nextID, false); ok {
-									lcs = newLcs
-									car.PreferenceCooldown = preferenceChangeCooldownS
-									car.SlowedTimer = 0
-								}
-							}
-						}
-					}
+			for _, destID := range findOvertakeLaneCandidates(*car, splines, splineIndexByID) {
+				if _, _, pathOk := findShortestPathWeighted(splines, destID, car.DestinationSplineID, vehicleCounts); !pathOk {
+					continue
+				}
+				srcIdx, srcOk := splineIndexByID[car.CurrentSplineID]
+				destIdx, destOk := splineIndexByID[destID]
+				if !srcOk || !destOk {
+					continue
+				}
+				p3Dist, feasible := laneChangeLandingDist(*car, splines[srcIdx], splines[destIdx])
+				if !feasible || !isLaneChangeLandingSafe(p3Dist, destID, *car, cars) {
+					continue
+				}
+				if newLcs, ok := buildLaneChangeBridge(car, destID, splines, splineIndexByID, lcs, nextID, false); ok {
+					lcs = newLcs
+					car.PreferenceCooldown = preferenceChangeCooldownS
+					car.SlowedTimer = 0
+					break
 				}
 			}
 		}
@@ -2630,21 +2637,23 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 	return lcs, cars
 }
 
-// findBetterPreferenceLane returns the ID of the coupled lane with the highest
-// preference (lowest non-zero LanePreference) that is strictly better than the
-// car's current lane. Lanes with no preference (0) are never considered as targets.
-// Returns -1 if no better lane exists.
-func findBetterPreferenceLane(car Car, splines []Spline, splineIndexByID map[int]int) int {
+// findBetterPreferenceLaneCandidates returns coupled lanes ordered from most to
+// least preferred among lanes that are strictly better than the current one.
+// Lanes with no preference (0) are never considered as targets.
+func findBetterPreferenceLaneCandidates(car Car, splines []Spline, splineIndexByID map[int]int) []int {
 	idx, ok := splineIndexByID[car.CurrentSplineID]
 	if !ok {
-		return -1
+		return nil
 	}
 	currentSpline := splines[idx]
 	currentPref := currentSpline.LanePreference // 0 = no preference assigned
 
 	allCoupled := append(append([]int(nil), currentSpline.HardCoupledIDs...), currentSpline.SoftCoupledIDs...)
-	bestPref := 0
-	bestID := -1
+	type candidate struct {
+		id   int
+		pref int
+	}
+	candidates := make([]candidate, 0, len(allCoupled))
 	for _, coupledID := range allCoupled {
 		cIdx, cOk := splineIndexByID[coupledID]
 		if !cOk {
@@ -2659,12 +2668,16 @@ func findBetterPreferenceLane(car Car, splines []Spline, splineIndexByID map[int
 		if currentPref != 0 && coupled.LanePreference >= currentPref {
 			continue
 		}
-		if bestID < 0 || coupled.LanePreference < bestPref {
-			bestPref = coupled.LanePreference
-			bestID = coupledID
-		}
+		candidates = append(candidates, candidate{id: coupledID, pref: coupled.LanePreference})
 	}
-	return bestID
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].pref < candidates[j].pref
+	})
+	result := make([]int, 0, len(candidates))
+	for _, candidate := range candidates {
+		result = append(result, candidate.id)
+	}
+	return result
 }
 
 // nearestLeaderSpeed returns the speed of the closest car ahead on the same
@@ -2712,33 +2725,34 @@ func nearestLeaderSpeed(carIdx int, cars []Car, splines []Spline, splineIndexByI
 	return bestSpeed, found
 }
 
-// findOvertakeLane returns the ID of a coupled lane whose LanePreference is
+// findOvertakeLaneCandidates returns coupled lanes whose LanePreference is
 // exactly currentPref+1 (one step less preferred — the overtaking lane).
 // Only works when the car is on a numbered lane; lanes with no preference are
-// never considered as targets. Returns -1 if no suitable lane exists.
-func findOvertakeLane(car Car, splines []Spline, splineIndexByID map[int]int) int {
+// never considered as targets.
+func findOvertakeLaneCandidates(car Car, splines []Spline, splineIndexByID map[int]int) []int {
 	idx, ok := splineIndexByID[car.CurrentSplineID]
 	if !ok {
-		return -1
+		return nil
 	}
 	currentSpline := splines[idx]
 	currentPref := currentSpline.LanePreference
 	if currentPref <= 0 {
-		return -1 // can only overtake from a lane that has a preference number
+		return nil // can only overtake from a lane that has a preference number
 	}
 	targetPref := currentPref + 1
 
 	allCoupled := append(append([]int(nil), currentSpline.HardCoupledIDs...), currentSpline.SoftCoupledIDs...)
+	candidates := make([]int, 0, len(allCoupled))
 	for _, coupledID := range allCoupled {
 		cIdx, cOk := splineIndexByID[coupledID]
 		if !cOk {
 			continue
 		}
 		if splines[cIdx].LanePreference == targetPref {
-			return coupledID
+			candidates = append(candidates, coupledID)
 		}
 	}
-	return -1
+	return candidates
 }
 
 // drawLaneChangeSplines renders active lane-change bridge splines in a
