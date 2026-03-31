@@ -2584,7 +2584,9 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 		// valid path to the destination. Resets PreferenceCooldown on success so
 		// the car does not immediately try to return to the preferred lane.
 		car.OvertakeCooldown -= dt
-		if car.SlowedTimer > overtakeSlowThresholdS && car.OvertakeCooldown <= 0 {
+		leaderSpeed, leaderFound := nearestLeaderSpeed(i, cars, splines, splineIndexByID)
+		if car.SlowedTimer > overtakeSlowThresholdS && car.OvertakeCooldown <= 0 &&
+			(!leaderFound || leaderSpeed <= car.Speed) {
 			car.OvertakeCooldown = overtakeCooldownS
 			if destID := findOvertakeLane(*car, splines, splineIndexByID); destID >= 0 {
 				if _, _, pathOk := findShortestPathWeighted(splines, destID, car.DestinationSplineID, vehicleCounts); pathOk {
@@ -2644,6 +2646,51 @@ func findBetterPreferenceLane(car Car, splines []Spline, splineIndexByID map[int
 		}
 	}
 	return bestID
+}
+
+// nearestLeaderSpeed returns the speed of the closest car ahead on the same
+// spline as cars[carIdx], and true. Returns 0, false if no such car is found
+// within followLookaheadM.
+func nearestLeaderSpeed(carIdx int, cars []Car, splines []Spline, splineIndexByID map[int]int) (float32, bool) {
+	car := cars[carIdx]
+	splineIdx, ok := splineIndexByID[car.CurrentSplineID]
+	if !ok {
+		return 0, false
+	}
+	spline := splines[splineIdx]
+	carPos, carHeading := sampleSplineAtDistance(spline, car.DistanceOnSpline)
+
+	bestDist := float32(math.MaxFloat32)
+	bestSpeed := float32(0)
+	found := false
+	for j, other := range cars {
+		if j == carIdx {
+			continue
+		}
+		if other.CurrentSplineID != car.CurrentSplineID {
+			continue
+		}
+		otherIdx, ok2 := splineIndexByID[other.CurrentSplineID]
+		if !ok2 {
+			continue
+		}
+		otherPos, _ := sampleSplineAtDistance(splines[otherIdx], other.DistanceOnSpline)
+		diff := rl.Vector2{X: otherPos.X - carPos.X, Y: otherPos.Y - carPos.Y}
+		proj := diff.X*carHeading.X + diff.Y*carHeading.Y
+		if proj <= 0 {
+			continue // behind us
+		}
+		euclidean := float32(math.Sqrt(float64(diff.X*diff.X + diff.Y*diff.Y)))
+		if euclidean > followLookaheadM {
+			continue
+		}
+		if euclidean < bestDist {
+			bestDist = euclidean
+			bestSpeed = other.Speed
+			found = true
+		}
+	}
+	return bestSpeed, found
 }
 
 // findOvertakeLane returns the ID of a coupled lane whose LanePreference is
