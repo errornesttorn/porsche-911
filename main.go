@@ -100,7 +100,7 @@ const (
 	// All car dimensions, speeds, and accelerations are stored in SI units (m, m/s, m/s²).
 	metersPerUnit float32 = 1.0
 
-	predictionHorizonSeconds float32 = 2.0
+	predictionHorizonSeconds float32 = 3.0
 	predictionStepSeconds    float32 = 0.15
 	blameAngleThresholdDeg   float32 = 45.0
 	brakeDecelMultiplier     float32 = 2.5
@@ -271,6 +271,7 @@ type CollisionPrediction struct {
 	PrevPosB  rl.Vector2
 	HeadingA  rl.Vector2
 	HeadingB  rl.Vector2
+	AlreadyCollided bool
 	PriorityA bool
 	PriorityB bool
 	SplineAID int
@@ -3397,6 +3398,7 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 				continue
 			}
 			blameI, blameJ := determineBlame(collision, cars[i], cars[j], graph.splines)
+			alreadyCollided := collision.AlreadyCollided
 			// Suppress blame if the blamed car recently left the other car's current spline —
 			// it has already cleared that segment and the other car is following behind.
 			if blameI && recentlyLeft(cars[i], cars[j].CurrentSplineID) {
@@ -3407,7 +3409,7 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 			}
 			// Suppress blame if the conflict would happen even when the blamed car is
 			// standing still — braking can never resolve such a conflict.
-			if blameI {
+			if blameI && !alreadyCollided {
 				if stationaryPredictions[i] == nil {
 					sc := cars[i]
 					sc.Speed = 0
@@ -3417,7 +3419,7 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 					blameI = false
 				}
 			}
-			if blameJ {
+			if blameJ && !alreadyCollided {
 				if stationaryPredictions[j] == nil {
 					sc := cars[j]
 					sc.Speed = 0
@@ -3477,6 +3479,11 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 			}
 			blameI, _ := determineBlame(collision, fasterCar, cars[j], graph.splines)
 			if blameI && !recentlyLeft(fasterCar, cars[j].CurrentSplineID) {
+				if collision.AlreadyCollided {
+					holdSpeed[i] = true
+					holdLinks = append(holdLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
+					break
+				}
 				// Suppress if the collision is unavoidable even when standing still —
 				// consistent with how braking blame is suppressed above.
 				if stationaryPredictions[i] == nil {
@@ -3682,25 +3689,29 @@ func predictCollision(aSamples, bSamples []TrajectorySample, carA, carB Car) (Co
 		if prevIndex < 0 {
 			prevIndex = 0
 		}
-		return CollisionPrediction{
-			Time:      aSamples[i].Time,
-			PosA:      pA,
-			PosB:      pB,
-			PrevPosA:  aSamples[prevIndex].Position,
-			PrevPosB:  bSamples[prevIndex].Position,
-			HeadingA:  hA,
-			HeadingB:  hB,
-			PriorityA: aSamples[i].Priority,
-			PriorityB: bSamples[i].Priority,
-			SplineAID: aSamples[i].SplineID,
-			SplineBID: bSamples[i].SplineID,
-		}, true
-	}
+			return CollisionPrediction{
+				Time:            aSamples[i].Time,
+				PosA:            pA,
+				PosB:            pB,
+				PrevPosA:        aSamples[prevIndex].Position,
+				PrevPosB:        bSamples[prevIndex].Position,
+				HeadingA:        hA,
+				HeadingB:        hB,
+				AlreadyCollided: i == 0,
+				PriorityA:       aSamples[i].Priority,
+				PriorityB:       bSamples[i].Priority,
+				SplineAID:       aSamples[i].SplineID,
+				SplineBID:       bSamples[i].SplineID,
+			}, true
+		}
 
 	return CollisionPrediction{}, false
 }
 
 func determineBlame(collision CollisionPrediction, carA, carB Car, splines []Spline) (bool, bool) {
+	if collision.AlreadyCollided {
+		return blameRearCar(collision, carA, carB)
+	}
 	if collision.PriorityA != collision.PriorityB {
 		if collision.PriorityA {
 			if normalCarOccupiesPriorityCollisionSpline(carB, collision.SplineAID, splines) {
