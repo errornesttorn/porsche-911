@@ -264,18 +264,18 @@ type TrajectorySample struct {
 }
 
 type CollisionPrediction struct {
-	Time      float32
-	PosA      rl.Vector2
-	PosB      rl.Vector2
-	PrevPosA  rl.Vector2
-	PrevPosB  rl.Vector2
-	HeadingA  rl.Vector2
-	HeadingB  rl.Vector2
+	Time            float32
+	PosA            rl.Vector2
+	PosB            rl.Vector2
+	PrevPosA        rl.Vector2
+	PrevPosB        rl.Vector2
+	HeadingA        rl.Vector2
+	HeadingB        rl.Vector2
 	AlreadyCollided bool
-	PriorityA bool
-	PriorityB bool
-	SplineAID int
-	SplineBID int
+	PriorityA       bool
+	PriorityB       bool
+	SplineAID       int
+	SplineBID       int
 }
 
 type pathCacheKey struct {
@@ -3285,7 +3285,7 @@ func updateRouteSpawning(routes []Route, cars []Car, splines []Spline, dt float3
 }
 
 // spawnBlocked returns true if placing candidate at its spawn point would
-// immediately overlap with any existing car using the two-circle hitbox.
+// immediately overlap with any existing car using the circle hitbox chain.
 func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 	spline, ok := findSplineByID(splines, candidate.CurrentSplineID)
 	if !ok {
@@ -3293,9 +3293,7 @@ func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 	}
 	pos, heading := sampleSplineAtDistance(spline, 0)
 	rC := collisionRadius(candidate)
-	offC := circleOffset(candidate)
-	cFront := vecAdd(pos, vecScale(heading, offC))
-	cBack := vecSub(pos, vecScale(heading, offC))
+	candidateOffsets := collisionCircleOffsets(candidate)
 
 	for _, other := range cars {
 		if other.CurrentSplineID != candidate.CurrentSplineID {
@@ -3309,15 +3307,16 @@ func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 		rO := collisionRadius(other)
 		thresh := rC + rO
 		threshSq := thresh * thresh
-		offO := circleOffset(other)
-		oFront := vecAdd(oPos, vecScale(oHeading, offO))
-		oBack := vecSub(oPos, vecScale(oHeading, offO))
+		otherOffsets := collisionCircleOffsets(other)
 
-		if distSq(cFront, oFront) <= threshSq ||
-			distSq(cFront, oBack) <= threshSq ||
-			distSq(cBack, oFront) <= threshSq ||
-			distSq(cBack, oBack) <= threshSq {
-			return true
+		for _, offC := range candidateOffsets {
+			cCircle := vecAdd(pos, vecScale(heading, offC))
+			for _, offO := range otherOffsets {
+				oCircle := vecAdd(oPos, vecScale(oHeading, offO))
+				if distSq(cCircle, oCircle) <= threshSq {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -3328,16 +3327,20 @@ func spawnCar(route Route) Car {
 	// Typical passenger car: 4.0-4.8 m long, 1.8-2.0 m wide.
 	// Speed range: ~50-130 km/h = 13.9-36.1 m/s.
 	// Acceleration: 2.5-4.5 m/s² (comfortable urban driving).
+	length := randRange(4.0, 4.8) / metersPerUnit
+	if rand.Float32() < 0.05 {
+		length *= 2
+	}
 	return Car{
 		RouteID:              route.ID,
 		CurrentSplineID:      route.StartSplineID,
 		DestinationSplineID:  route.EndSplineID,
 		PrevSplineIDs:        [2]int{-1, -1},
 		DistanceOnSpline:     0,
-		Speed:                randRange(0, 2),                     // m/s — starts nearly stationary
-		MaxSpeed:             randRange(22.2, 36.1),               // m/s — 80–130 km/h
-		Accel:                randRange(2.5, 4.5),                 // m/s²
-		Length:               randRange(4.0, 4.8) / metersPerUnit, // world units
+		Speed:                randRange(0, 2),       // m/s — starts nearly stationary
+		MaxSpeed:             randRange(22.2, 36.1), // m/s — 80–130 km/h
+		Accel:                randRange(2.5, 4.5),   // m/s²
+		Length:               length,
 		Width:                randRange(1.8, 2.0) / metersPerUnit, // world units
 		CurveSpeedMultiplier: randRange(0.8, 1.2),
 		Color:                route.Color,
@@ -3661,49 +3664,63 @@ func predictCollision(aSamples, bSamples []TrajectorySample, carA, carB Car) (Co
 		return CollisionPrediction{}, false
 	}
 
-	// Two-circle approximation: one circle at L/4 ahead of centre, one at L/4 behind.
-	// Radius for each circle: sqrt((L/4)² + (W/2)²) — covers the half-rectangle corners.
 	rA := collisionRadius(carA)
 	rB := collisionRadius(carB)
 	circleDist := rA + rB
 	circleDistSq := circleDist * circleDist
-	offA := circleOffset(carA)
-	offB := circleOffset(carB)
+	offsetsA := collisionCircleOffsets(carA)
+	offsetsB := collisionCircleOffsets(carB)
+	// Coarse reject: one bounding circle per car, centered on the vehicle center.
+	// Radius fully contains the current two-circle hitbox, so it can only reject
+	// impossible collisions and never create false negatives.
+	coarseRA := carA.Length/2 + 1.0
+	coarseRB := carB.Length/2 + 1.0
+	coarseDist := coarseRA + coarseRB
+	coarseDistSq := coarseDist * coarseDist
 
 	for i := 0; i < count; i++ {
 		pA, hA := aSamples[i].Position, aSamples[i].Heading
 		pB, hB := bSamples[i].Position, bSamples[i].Heading
+		if distSq(pA, pB) > coarseDistSq {
+			continue
+		}
 
-		aFront := vecAdd(pA, vecScale(hA, offA))
-		aBack := vecSub(pA, vecScale(hA, offA))
-		bFront := vecAdd(pB, vecScale(hB, offB))
-		bBack := vecSub(pB, vecScale(hB, offB))
-
-		if distSq(aFront, bFront) > circleDistSq &&
-			distSq(aFront, bBack) > circleDistSq &&
-			distSq(aBack, bFront) > circleDistSq &&
-			distSq(aBack, bBack) > circleDistSq {
+		collides := false
+		for _, offA := range offsetsA {
+			aCircle := vecAdd(pA, vecScale(hA, offA))
+			for _, offB := range offsetsB {
+				bCircle := vecAdd(pB, vecScale(hB, offB))
+				if distSq(aCircle, bCircle) <= circleDistSq {
+					collides = true
+					break
+				}
+			}
+			if collides {
+				break
+			}
+		}
+		if !collides {
 			continue
 		}
 		prevIndex := i - 1
 		if prevIndex < 0 {
 			prevIndex = 0
 		}
-			return CollisionPrediction{
-				Time:            aSamples[i].Time,
-				PosA:            pA,
-				PosB:            pB,
-				PrevPosA:        aSamples[prevIndex].Position,
-				PrevPosB:        bSamples[prevIndex].Position,
-				HeadingA:        hA,
-				HeadingB:        hB,
-				AlreadyCollided: i == 0,
-				PriorityA:       aSamples[i].Priority,
-				PriorityB:       bSamples[i].Priority,
-				SplineAID:       aSamples[i].SplineID,
-				SplineBID:       bSamples[i].SplineID,
-			}, true
-		}
+		return CollisionPrediction{
+			Time:            aSamples[i].Time,
+			PosA:            pA,
+			PosB:            pB,
+			PrevPosA:        aSamples[prevIndex].Position,
+			PrevPosB:        bSamples[prevIndex].Position,
+			HeadingA:        hA,
+			HeadingB:        hB,
+			AlreadyCollided: i == 0,
+			PriorityA:       aSamples[i].Priority,
+			PriorityB:       bSamples[i].Priority,
+			SplineAID:       aSamples[i].SplineID,
+			SplineBID:       bSamples[i].SplineID,
+		}, true
+	}
 
 	return CollisionPrediction{}, false
 }
@@ -3812,19 +3829,16 @@ func carHitboxTouchesSpline(car Car, targetSpline Spline, splines []Spline) bool
 		return false
 	}
 	pos, heading := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
-	offset := circleOffset(car)
 	radius := collisionRadius(car)
 	radiusSq := radius * radius
-
-	front := vecAdd(pos, vecScale(heading, offset))
-	back := vecSub(pos, vecScale(heading, offset))
-
-	nearestFront := nearestSampleOnSpline(targetSpline, front)
-	if distSq(front, nearestFront) <= radiusSq {
-		return true
+	for _, offset := range collisionCircleOffsets(car) {
+		circle := vecAdd(pos, vecScale(heading, offset))
+		nearest := nearestSampleOnSpline(targetSpline, circle)
+		if distSq(circle, nearest) <= radiusSq {
+			return true
+		}
 	}
-	nearestBack := nearestSampleOnSpline(targetSpline, back)
-	return distSq(back, nearestBack) <= radiusSq
+	return false
 }
 
 func buildLookaheadSplineSets(cars []Car, graph *RoadGraph, lookahead float32) []map[int]bool {
@@ -5658,7 +5672,7 @@ func pickNextColorIndex(routes []Route) int {
 	return minIdx
 }
 
-// collisionRadius returns the radius of each of the two hitbox circles.
+// collisionRadius returns the radius of each hitbox circle.
 // The circles are sized so they protrude exactly 0.5 m beyond the car's sides:
 //
 //	r = W/2 + 0.5
@@ -5666,13 +5680,30 @@ func collisionRadius(car Car) float32 {
 	return car.Width/2 + 0.5
 }
 
-// circleOffset returns how far each hitbox circle centre is placed from the
-// car's centre along its heading. Combined with collisionRadius this makes the
-// circles protrude exactly 1.0 m beyond the car's front and back:
-//
-//	offset = L/2 + 1.0 − r
-func circleOffset(car Car) float32 {
-	return car.Length/2 + 1.0 - collisionRadius(car)
+// collisionCircleOffsets returns circle-centre offsets along the car's heading.
+// There are always at least two circles, and more are inserted whenever the
+// spacing between neighbouring centres would otherwise exceed 2 m.
+func collisionCircleOffsets(car Car) []float32 {
+	span := 2 * (car.Length/2 + 1.0 - collisionRadius(car))
+	if span < 0 {
+		span = 0
+	}
+
+	count := int(math.Ceil(float64(span/2.0))) + 1
+	if count < 2 {
+		count = 2
+	}
+
+	offsets := make([]float32, count)
+	start := -span / 2
+	step := float32(0)
+	if count > 1 {
+		step = span / float32(count-1)
+	}
+	for i := range offsets {
+		offsets[i] = start + float32(i)*step
+	}
+	return offsets
 }
 
 func headingAngleDegrees(a, b rl.Vector2) float32 {
