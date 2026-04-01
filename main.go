@@ -3621,12 +3621,17 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 
 			overshoot := move - remaining
 			move = overshoot
-			simCar.DistanceOnSpline = 0
 
 			if simCar.CurrentSplineID == simCar.DestinationSplineID {
+				// Clamp the final predicted position to the end of the destination
+				// spline. Resetting to 0 here makes the car appear back at the start
+				// of the destination lane, which creates false entry collisions.
+				simCar.DistanceOnSpline = currentSpline.Length
 				active = false
 				break
 			}
+
+			simCar.DistanceOnSpline = 0
 
 			// Lane-change bridge completed in trajectory sim.
 			if simCar.LaneChanging && simCar.CurrentSplineID == simCar.LaneChangeSplineID {
