@@ -26,6 +26,7 @@ import (
 //   Mouse wheel: zoom toward the cursor
 //   E: edit splines mode
 //   R: route mode
+//   B: bus line mode
 //   P: priority paint mode
 //   D: toggle debug overlay
 //   F3: toggle profiling overlay
@@ -42,6 +43,12 @@ import (
 //   Left click on a spline end:   pick route destination
 //   Right click / Escape: cancel selection or close the route panel
 //
+// Bus mode:
+//   Left click on a spline start: pick line origin
+//   Left click on a spline end:   pick line destination
+//   In the panel: add bus stops on spline intersections
+//   Right click / Escape: cancel selection or close the line panel
+//
 // Priority mode:
 //   Left click on a hovered spline: mark it as priority
 //   Right click on a hovered spline: clear priority
@@ -54,15 +61,23 @@ type Stage int
 
 type EndKind int
 
+type VehicleKind int
+
 const (
 	ModeEdit EditorMode = iota
 	ModeRoute
+	ModeBus
 	ModePriority
 	ModeCouple
 	ModeCut
 	ModeSpeedLimit
 	ModePreference
 	ModeTrafficLight
+)
+
+const (
+	VehicleCar VehicleKind = iota
+	VehicleBus
 )
 
 const (
@@ -104,6 +119,12 @@ const (
 	predictionStepSeconds    float32 = 0.15
 	blameAngleThresholdDeg   float32 = 45.0
 	brakeDecelMultiplier     float32 = 2.5
+)
+
+const (
+	busStopMinDwellSeconds float32 = 10.0
+	busStopMaxDwellSeconds float32 = 20.0
+	stopFrontGapM          float32 = 5.0
 )
 
 const (
@@ -153,6 +174,7 @@ const (
 type Spline struct {
 	ID       int
 	Priority bool
+	BusOnly  bool
 
 	P0 rl.Vector2
 	P1 rl.Vector2
@@ -203,6 +225,11 @@ type EndHit struct {
 	Point       rl.Vector2
 }
 
+type BusStop struct {
+	SplineID int
+	WorldPos rl.Vector2
+}
+
 type Route struct {
 	ID int
 
@@ -216,18 +243,24 @@ type Route struct {
 	Valid          bool
 	ColorIndex     int
 	Color          rl.Color
+	VehicleKind    VehicleKind
+	BusStops       []BusStop
 }
 
 type RoutePanel struct {
 	Open bool
 
-	StartSplineID   int
-	EndSplineID     int
-	ExistingRouteID int
-	PathIDs         []int
-	PathLength      float32
-	SpawnPerMinute  float32
-	ColorIndex      int
+	StartSplineID    int
+	EndSplineID      int
+	ExistingRouteID  int
+	PathIDs          []int
+	PathLength       float32
+	SpawnPerMinute   float32
+	ColorIndex       int
+	VehicleKind      VehicleKind
+	BusStops         []BusStop
+	AddingBusStop    bool
+	StopStatusNotice string
 
 	DraggingSlider bool
 }
@@ -279,6 +312,10 @@ type Car struct {
 	PreferenceCooldown float32 // seconds until the next preference-based lane-change check
 	SlowedTimer        float32 // seconds the car has been held back by a leader
 	OvertakeCooldown   float32 // seconds until the next overtake attempt is allowed
+	VehicleKind        VehicleKind
+	NextBusStopIndex   int
+	BusStopTimer       float32
+	BusStopDuration    float32
 
 	Trailer Trailer
 }
@@ -311,8 +348,9 @@ type CollisionPrediction struct {
 }
 
 type pathCacheKey struct {
-	StartID int
-	EndID   int
+	StartID     int
+	EndID       int
+	VehicleKind VehicleKind
 }
 
 type pathCacheEntry struct {
@@ -485,6 +523,7 @@ type SavedTrafficCycle struct {
 type SavedSpline struct {
 	ID             int        `json:"id"`
 	Priority       bool       `json:"priority"`
+	BusOnly        bool       `json:"bus_only,omitempty"`
 	P0             rl.Vector2 `json:"p0"`
 	P1             rl.Vector2 `json:"p1"`
 	P2             rl.Vector2 `json:"p2"`
@@ -495,13 +534,21 @@ type SavedSpline struct {
 	LanePreference int        `json:"lane_preference,omitempty"`
 }
 
+type SavedBusStop struct {
+	SplineID  int     `json:"spline_id"`
+	WorldPosX float32 `json:"world_pos_x"`
+	WorldPosY float32 `json:"world_pos_y"`
+}
+
 type SavedRoute struct {
-	ID             int     `json:"id"`
-	StartSplineID  int     `json:"start_spline_id"`
-	EndSplineID    int     `json:"end_spline_id"`
-	PathIDs        []int   `json:"path_ids"`
-	SpawnPerMinute float32 `json:"spawn_per_minute"`
-	ColorIndex     int     `json:"color_index,omitempty"`
+	ID             int            `json:"id"`
+	StartSplineID  int            `json:"start_spline_id"`
+	EndSplineID    int            `json:"end_spline_id"`
+	PathIDs        []int          `json:"path_ids"`
+	SpawnPerMinute float32        `json:"spawn_per_minute"`
+	ColorIndex     int            `json:"color_index,omitempty"`
+	VehicleKind    string         `json:"vehicle_kind,omitempty"`
+	BusStops       []SavedBusStop `json:"bus_stops,omitempty"`
 }
 
 type SavedCar struct {
@@ -515,6 +562,10 @@ type SavedCar struct {
 	Length               float32 `json:"length"`
 	Width                float32 `json:"width"`
 	CurveSpeedMultiplier float32 `json:"curve_speed_multiplier,omitempty"`
+	VehicleKind          string  `json:"vehicle_kind,omitempty"`
+	NextBusStopIndex     int     `json:"next_bus_stop_index,omitempty"`
+	BusStopTimer         float32 `json:"bus_stop_timer,omitempty"`
+	BusStopDuration      float32 `json:"bus_stop_duration,omitempty"`
 }
 
 // ---------- traffic lights ----------
@@ -571,6 +622,7 @@ type toolbarItem struct {
 var toolbarItems = []toolbarItem{
 	{"E", "Edit", ModeEdit, false, false},
 	{"R", "Route", ModeRoute, false, false},
+	{"B", "Bus", ModeBus, false, false},
 	{"P", "Priority", ModePriority, false, false},
 	{"L", "Couple", ModeCouple, false, false},
 	{"C", "Cut", ModeCut, false, false},
@@ -688,6 +740,8 @@ func main() {
 			case ModeEdit:
 				mode = ModeRoute
 			case ModeRoute:
+				mode = ModeBus
+			case ModeBus:
 				mode = ModePriority
 			case ModePriority:
 				mode = ModeCouple
@@ -720,6 +774,15 @@ func main() {
 		}
 		if rl.IsKeyPressed(rl.KeyR) {
 			mode = ModeRoute
+			stage = StageIdle
+			draft = newDraft()
+			cutDraft = newCutDraft()
+			routePanel = RoutePanel{}
+			routeStartSplineID = -1
+			coupleModeFirstID = -1
+		}
+		if rl.IsKeyPressed(rl.KeyB) {
+			mode = ModeBus
 			stage = StageIdle
 			draft = newDraft()
 			cutDraft = newCutDraft()
@@ -933,9 +996,20 @@ func main() {
 
 		if routePanel.Open {
 			var applied bool
-			routePanel, routes, cars, applied = updateRoutePanel(routePanel, routes, cars, &nextRouteID)
+			routePanel, routes, cars, applied = updateRoutePanel(routePanel, routes, cars, &nextRouteID, baseGraph, splines, mouseScreen)
 			if applied {
 				routeStartSplineID = -1
+			}
+		}
+
+		if routePanel.Open && routePanel.VehicleKind == VehicleBus && routePanel.AddingBusStop && !mouseOnToolbar {
+			panelRect := routePanelRect(routePanel)
+			if !pointInRect(mouseScreen, panelRect) {
+				var changed bool
+				routePanel, changed = handleBusStopPlacement(routePanel, splines, baseGraph, mouseWorld, camera.Zoom)
+				if changed {
+					routePanel = syncRoutePanelPath(routePanel, baseGraph)
+				}
 			}
 		}
 
@@ -951,7 +1025,20 @@ func main() {
 				}
 			case ModeRoute:
 				var notice string
-				routeStartSplineID, routePanel, notice = handleRouteMode(routeStartSplineID, routePanel, routes, splines, vehicleCounts, hoveredStart, hoveredEnd)
+				routeStartSplineID, routePanel, notice = handleRouteMode(routeStartSplineID, routePanel, routes, baseGraph, hoveredStart, hoveredEnd, VehicleCar)
+				if notice != "" {
+					noticeText = notice
+					noticeTimer = 3.0
+				}
+			case ModeBus:
+				var notice string
+				if routeStartSplineID < 0 && rl.IsMouseButtonPressed(rl.MouseButtonRight) && hoveredSpline >= 0 {
+					splines, notice = toggleBusOnlySpline(splines, hoveredSpline)
+					routes = refreshRoutes(routes, splines)
+					laneChangeSplines = laneChangeSplines[:0]
+				} else {
+					routeStartSplineID, routePanel, notice = handleRouteMode(routeStartSplineID, routePanel, routes, baseGraph, hoveredStart, hoveredEnd, VehicleBus)
+				}
 				if notice != "" {
 					noticeText = notice
 					noticeTimer = 3.0
@@ -1230,6 +1317,17 @@ func main() {
 			}
 			drawRouteWithIndex(route, splines, splineIndexByID, pixelsToWorld(camera.Zoom, 2.0), camera.Zoom)
 		}
+		if routePanel.Open && len(routePanel.PathIDs) > 0 {
+			drawRouteWithIndex(Route{
+				PathIDs:       routePanel.PathIDs,
+				StartSplineID: routePanel.StartSplineID,
+				EndSplineID:   routePanel.EndSplineID,
+				Color:         routePaletteColor(routePanel.ColorIndex),
+				VehicleKind:   routePanel.VehicleKind,
+				BusStops:      routePanel.BusStops,
+				Valid:         true,
+			}, splines, splineIndexByID, pixelsToWorld(camera.Zoom, 3.0), camera.Zoom)
+		}
 
 		for i, spline := range splines {
 			color := splineDrawColor(spline)
@@ -1270,6 +1368,12 @@ func main() {
 
 		if mode == ModeRoute {
 			drawRoutePicking(routeStartSplineID, routePanel, hoveredStart, hoveredEnd, splines, vehicleCounts, camera.Zoom)
+		}
+		if mode == ModeBus {
+			drawRoutePicking(routeStartSplineID, routePanel, hoveredStart, hoveredEnd, splines, vehicleCounts, camera.Zoom)
+			if routePanel.Open && routePanel.AddingBusStop {
+				drawBusStopPlacementPreview(routePanel, splines, baseGraph, mouseWorld, camera.Zoom)
+			}
 		}
 
 		if mode == ModeCouple {
@@ -1424,7 +1528,7 @@ func handleEditMode(stage Stage, draft Draft, splines []Spline, hoveredSpline in
 	return stage, draft, splines, nextSplineID, topologyChanged
 }
 
-func handleRouteMode(routeStartSplineID int, routePanel RoutePanel, routes []Route, splines []Spline, vehicleCounts map[int]int, hoveredStart EndHit, hoveredEnd EndHit) (int, RoutePanel, string) {
+func handleRouteMode(routeStartSplineID int, routePanel RoutePanel, routes []Route, graph *RoadGraph, hoveredStart EndHit, hoveredEnd EndHit, vehicleKind VehicleKind) (int, RoutePanel, string) {
 	if rl.IsKeyPressed(rl.KeyEscape) || rl.IsMouseButtonPressed(rl.MouseButtonRight) {
 		return -1, RoutePanel{}, ""
 	}
@@ -1435,6 +1539,11 @@ func handleRouteMode(routeStartSplineID int, routePanel RoutePanel, routes []Rou
 
 	if routeStartSplineID < 0 {
 		if hoveredStart.SplineID >= 0 {
+			if vehicleKind == VehicleCar {
+				if spline, ok := graph.splineByID(hoveredStart.SplineID); ok && spline.BusOnly {
+					return routeStartSplineID, routePanel, "Bus-only splines cannot be used for car routes."
+				}
+			}
 			return hoveredStart.SplineID, routePanel, ""
 		}
 		return routeStartSplineID, routePanel, ""
@@ -1443,32 +1552,250 @@ func handleRouteMode(routeStartSplineID int, routePanel RoutePanel, routes []Rou
 	if hoveredEnd.SplineID < 0 {
 		return routeStartSplineID, routePanel, ""
 	}
-
-	pathIDs, pathLength, ok := findShortestPathWeighted(splines, routeStartSplineID, hoveredEnd.SplineID, vehicleCounts)
-	if !ok {
-		return -1, RoutePanel{}, "No valid path between the selected start and destination."
-	}
-
-	existingRouteID := findRouteID(routes, routeStartSplineID, hoveredEnd.SplineID)
-	spawnPerMinute := float32(12.0)
-	colorIndex := pickNextColorIndex(routes)
-	if existingRouteID >= 0 {
-		if idx := findRouteIndexByID(routes, existingRouteID); idx >= 0 {
-			spawnPerMinute = routes[idx].SpawnPerMinute
-			colorIndex = routes[idx].ColorIndex
+	if vehicleKind == VehicleCar {
+		if spline, ok := graph.splineByID(hoveredEnd.SplineID); ok && spline.BusOnly {
+			return routeStartSplineID, routePanel, "Bus-only splines cannot be used for car routes."
 		}
 	}
 
-	return -1, RoutePanel{
+	panel := RoutePanel{
 		Open:            true,
 		StartSplineID:   routeStartSplineID,
 		EndSplineID:     hoveredEnd.SplineID,
-		ExistingRouteID: existingRouteID,
-		PathIDs:         pathIDs,
-		PathLength:      pathLength,
-		SpawnPerMinute:  spawnPerMinute,
-		ColorIndex:      colorIndex,
-	}, ""
+		VehicleKind:     vehicleKind,
+		SpawnPerMinute:  defaultSpawnPerMinute(vehicleKind),
+		ColorIndex:      pickNextColorIndex(routes),
+		ExistingRouteID: findRouteID(routes, routeStartSplineID, hoveredEnd.SplineID, vehicleKind),
+	}
+	if panel.ExistingRouteID >= 0 {
+		if idx := findRouteIndexByID(routes, panel.ExistingRouteID); idx >= 0 {
+			panel.SpawnPerMinute = routes[idx].SpawnPerMinute
+			panel.ColorIndex = routes[idx].ColorIndex
+			panel.BusStops = append([]BusStop(nil), routes[idx].BusStops...)
+		}
+	}
+	panel = syncRoutePanelPath(panel, graph)
+	if !panel.ValidPath() {
+		return -1, RoutePanel{}, "No valid path between the selected start and destination."
+	}
+
+	return -1, panel, ""
+}
+
+func (p RoutePanel) ValidPath() bool {
+	return len(p.PathIDs) > 0
+}
+
+func defaultSpawnPerMinute(vehicleKind VehicleKind) float32 {
+	if vehicleKind == VehicleBus {
+		return 4.0
+	}
+	return 12.0
+}
+
+func syncRoutePanelPath(panel RoutePanel, graph *RoadGraph) RoutePanel {
+	preview := Route{
+		StartSplineID: panel.StartSplineID,
+		EndSplineID:   panel.EndSplineID,
+		VehicleKind:   panel.VehicleKind,
+		BusStops:      append([]BusStop(nil), panel.BusStops...),
+	}
+	pathIDs, pathLength, notice, _ := computeRoutePathWithGraph(preview, graph)
+	panel.PathIDs = pathIDs
+	panel.PathLength = pathLength
+	if notice != "" {
+		panel.StopStatusNotice = notice
+	} else if strings.HasPrefix(panel.StopStatusNotice, "Stop ") || strings.HasPrefix(panel.StopStatusNotice, "No valid path") {
+		panel.StopStatusNotice = ""
+	}
+	return panel
+}
+
+func computeRoutePathWithGraph(route Route, graph *RoadGraph) ([]int, float32, string, bool) {
+	if graph == nil {
+		return nil, 0, "", false
+	}
+	if route.VehicleKind == VehicleCar {
+		if startSpline, ok := graph.splineByID(route.StartSplineID); ok && startSpline.BusOnly {
+			return nil, 0, "Bus-only splines cannot be used for car routes.", false
+		}
+		if endSpline, ok := graph.splineByID(route.EndSplineID); ok && endSpline.BusOnly {
+			return nil, 0, "Bus-only splines cannot be used for car routes.", false
+		}
+	}
+	if route.VehicleKind != VehicleBus || len(route.BusStops) == 0 {
+		pathIDs, pathLength, ok := findShortestPathWeightedWithGraph(graph, route.StartSplineID, route.EndSplineID, route.VehicleKind)
+		if !ok {
+			return nil, 0, "No valid path between the selected start and destination.", false
+		}
+		return pathIDs, pathLength, "", ok
+	}
+
+	waypoints := make([]int, 0, len(route.BusStops)+2)
+	waypoints = append(waypoints, route.StartSplineID)
+	for _, stop := range route.BusStops {
+		waypoints = append(waypoints, stop.SplineID)
+	}
+	waypoints = append(waypoints, route.EndSplineID)
+
+	fullPath := make([]int, 0, 32)
+	totalCost := float32(0)
+	for i := 0; i < len(waypoints)-1; i++ {
+		segPath, segCost, ok := findShortestPathWeightedWithGraph(graph, waypoints[i], waypoints[i+1], route.VehicleKind)
+		if !ok || len(segPath) == 0 {
+			return nil, 0, fmt.Sprintf("Stop %d cannot be reached in sequence.", i+1), false
+		}
+		if len(fullPath) > 0 && fullPath[len(fullPath)-1] == segPath[0] {
+			segPath = segPath[1:]
+			if idx, ok := graph.indexByID[waypoints[i]]; ok {
+				segCost -= graph.segmentCosts[idx]
+			}
+		}
+		fullPath = append(fullPath, segPath...)
+		totalCost += segCost
+	}
+	return fullPath, totalCost, "", len(fullPath) > 0
+}
+
+func currentRouteTarget(route Route, nextBusStopIndex int) int {
+	if route.VehicleKind == VehicleBus && nextBusStopIndex >= 0 && nextBusStopIndex < len(route.BusStops) {
+		return route.BusStops[nextBusStopIndex].SplineID
+	}
+	return route.EndSplineID
+}
+
+func pickBestBusStopSpline(graph *RoadGraph, nodeKey string, fromSplineID, toSplineID int) (BusStop, bool) {
+	if graph == nil {
+		return BusStop{}, false
+	}
+	indices := graph.startsByNode[nodeKey]
+	if len(indices) == 0 {
+		return BusStop{}, false
+	}
+
+	bestCost := float32(math.MaxFloat32)
+	best := BusStop{}
+	found := false
+	for _, idx := range indices {
+		candidate := graph.splines[idx]
+		_, firstCost, okFirst := findShortestPathWeightedWithGraph(graph, fromSplineID, candidate.ID, VehicleBus)
+		_, secondCost, okSecond := findShortestPathWeightedWithGraph(graph, candidate.ID, toSplineID, VehicleBus)
+		if !okFirst || !okSecond {
+			continue
+		}
+		total := firstCost + secondCost - graph.segmentCosts[idx]
+		if !found || total < bestCost {
+			bestCost = total
+			best = BusStop{SplineID: candidate.ID, WorldPos: candidate.P0}
+			found = true
+		}
+	}
+	return best, found
+}
+
+func findBusStopCandidate(panel RoutePanel, splines []Spline, graph *RoadGraph, mouseWorld rl.Vector2, zoom float32) (BusStop, bool) {
+	if panel.VehicleKind != VehicleBus || graph == nil {
+		return BusStop{}, false
+	}
+	threshold := pixelsToWorld(zoom, 16)
+	thresholdSq := threshold * threshold
+	endsByNode := buildEndsByNode(splines)
+
+	fromSplineID := panel.StartSplineID
+	if n := len(panel.BusStops); n > 0 {
+		fromSplineID = panel.BusStops[n-1].SplineID
+	}
+
+	bestDist := thresholdSq
+	bestNodeKey := ""
+	bestPoint := rl.Vector2{}
+	for nodeKey, starts := range graph.startsByNode {
+		if len(starts) == 0 || len(endsByNode[nodeKey]) == 0 {
+			continue
+		}
+		point := graph.splines[starts[0]].P0
+		d := distSq(mouseWorld, point)
+		if d <= bestDist {
+			bestDist = d
+			bestNodeKey = nodeKey
+			bestPoint = point
+		}
+	}
+	if bestNodeKey == "" {
+		return BusStop{}, false
+	}
+
+	stop, ok := pickBestBusStopSpline(graph, bestNodeKey, fromSplineID, panel.EndSplineID)
+	if !ok {
+		return BusStop{}, false
+	}
+	stop.WorldPos = bestPoint
+	return stop, true
+}
+
+func handleBusStopPlacement(panel RoutePanel, splines []Spline, graph *RoadGraph, mouseWorld rl.Vector2, zoom float32) (RoutePanel, bool) {
+	if !panel.AddingBusStop {
+		return panel, false
+	}
+	if rl.IsKeyPressed(rl.KeyEscape) {
+		panel.AddingBusStop = false
+		panel.StopStatusNotice = ""
+		return panel, false
+	}
+	if rl.IsMouseButtonPressed(rl.MouseButtonRight) {
+		panel.AddingBusStop = false
+		panel.StopStatusNotice = ""
+		return panel, false
+	}
+	if !rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
+		return panel, false
+	}
+
+	stop, ok := findBusStopCandidate(panel, splines, graph, mouseWorld, zoom)
+	if !ok {
+		panel.StopStatusNotice = "Pick an intersection where buses can arrive and depart."
+		return panel, false
+	}
+	for _, existing := range panel.BusStops {
+		if existing.SplineID == stop.SplineID {
+			panel.StopStatusNotice = "That stop is already on the line."
+			return panel, false
+		}
+	}
+	panel.BusStops = append(panel.BusStops, stop)
+	panel.AddingBusStop = false
+	panel.StopStatusNotice = ""
+	return panel, true
+}
+
+func buildEndsByNode(splines []Spline) map[string][]int {
+	endsByNode := map[string][]int{}
+	for i, spline := range splines {
+		key := pointKey(spline.P3)
+		endsByNode[key] = append(endsByNode[key], i)
+	}
+	return endsByNode
+}
+
+func drawBusStopPlacementPreview(panel RoutePanel, splines []Spline, graph *RoadGraph, mouseWorld rl.Vector2, zoom float32) {
+	stop, ok := findBusStopCandidate(panel, splines, graph, mouseWorld, zoom)
+	if !ok {
+		return
+	}
+	r := pixelsToWorld(zoom, 9)
+	rl.DrawCircleV(stop.WorldPos, r, rl.NewColor(255, 210, 70, 220))
+	rl.DrawRing(stop.WorldPos, r*0.65, r*1.25, 0, 360, 24, rl.NewColor(210, 150, 0, 220))
+}
+
+func toggleBusOnlySpline(splines []Spline, hoveredSpline int) ([]Spline, string) {
+	if hoveredSpline < 0 {
+		return splines, ""
+	}
+	splines[hoveredSpline].BusOnly = !splines[hoveredSpline].BusOnly
+	if splines[hoveredSpline].BusOnly {
+		return splines, fmt.Sprintf("Spline #%d marked bus-only", splines[hoveredSpline].ID)
+	}
+	return splines, fmt.Sprintf("Spline #%d open to all vehicles", splines[hoveredSpline].ID)
 }
 
 func handlePriorityMode(splines []Spline, hoveredSpline int) []Spline {
@@ -2455,18 +2782,24 @@ func laneChangeFeasible(src, dst Spline, speed float32) bool {
 // Returns the ID of the next spline to enter and the ID of the desired target
 // spline to switch to once on that next spline.
 func findForcedLaneChangePath(splines []Spline, currentSplineID, destSplineID int, vehicleCounts map[int]int) (nextSplineID, desiredSplineID int, ok bool) {
-	return findForcedLaneChangePathWithGraph(newRoadGraph(splines, vehicleCounts), currentSplineID, destSplineID)
+	return findForcedLaneChangePathWithGraph(newRoadGraph(splines, vehicleCounts), currentSplineID, destSplineID, VehicleCar)
 }
 
-func findForcedLaneChangePathWithGraph(graph *RoadGraph, currentSplineID, destSplineID int) (nextSplineID, desiredSplineID int, ok bool) {
+func findForcedLaneChangePathWithGraph(graph *RoadGraph, currentSplineID, destSplineID int, vehicleKind VehicleKind) (nextSplineID, desiredSplineID int, ok bool) {
 	currentSpline, found := graph.splineByID(currentSplineID)
 	if !found {
 		return 0, 0, false
 	}
 	for _, nextIdx := range graph.startsByNode[pointKey(currentSpline.P3)] {
 		nextSpline := graph.splines[nextIdx]
+		if !isSplineUsableForVehicle(nextSpline, vehicleKind) {
+			continue
+		}
 		for _, coupledID := range nextSpline.HardCoupledIDs {
-			if _, _, pathOk := findShortestPathWeightedWithGraph(graph, coupledID, destSplineID); pathOk {
+			if coupledSpline, ok := graph.splineByID(coupledID); ok && !isSplineUsableForVehicle(coupledSpline, vehicleKind) {
+				continue
+			}
+			if _, _, pathOk := findShortestPathWeightedWithGraph(graph, coupledID, destSplineID, vehicleKind); pathOk {
 				return nextSpline.ID, coupledID, true
 			}
 		}
@@ -2817,9 +3150,9 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 		car.PreferenceCooldown -= dt
 		if car.PreferenceCooldown <= 0 {
 			car.PreferenceCooldown = preferenceChangeCooldownS
-			_, curPrefTime, curPrefTimeOk := findShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID)
+			_, curPrefTime, curPrefTimeOk := findShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
 			for _, destID := range findBetterPreferenceLaneCandidates(*car, splines, splineIndexByID) {
-				_, destTime, pathOk := findShortestPathWeightedWithGraph(graph, destID, car.DestinationSplineID)
+				_, destTime, pathOk := findShortestPathWeightedWithGraph(graph, destID, car.DestinationSplineID, car.VehicleKind)
 				if !pathOk {
 					continue
 				}
@@ -2852,9 +3185,9 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 		if car.SlowedTimer > overtakeSlowThresholdS && car.OvertakeCooldown <= 0 &&
 			(!leaderFound || leaderSpeed <= car.Speed) {
 			car.OvertakeCooldown = overtakeCooldownS
-			_, curOvertakeTime, curOvertakeTimeOk := findShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID)
+			_, curOvertakeTime, curOvertakeTimeOk := findShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
 			for _, destID := range findOvertakeLaneCandidates(*car, splines, splineIndexByID) {
-				_, destTime, pathOk := findShortestPathWeightedWithGraph(graph, destID, car.DestinationSplineID)
+				_, destTime, pathOk := findShortestPathWeightedWithGraph(graph, destID, car.DestinationSplineID, car.VehicleKind)
 				if !pathOk {
 					continue
 				}
@@ -3203,14 +3536,55 @@ func drawCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld rl.Vecto
 	}
 }
 
-func updateRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *int) (RoutePanel, []Route, []Car, bool) {
-	panelRect := rl.NewRectangle(float32(rl.GetScreenWidth())-360, 18, 340, 234)
-	sliderRect := rl.NewRectangle(panelRect.X+18, panelRect.Y+82, panelRect.Width-36, 22)
-	applyRect := rl.NewRectangle(panelRect.X+18, panelRect.Y+180, 120, 32)
-	cancelRect := rl.NewRectangle(panelRect.X+202, panelRect.Y+180, 120, 32)
-	mouse := rl.GetMousePosition()
+func routePanelRect(panel RoutePanel) rl.Rectangle {
+	height := float32(234)
+	if panel.VehicleKind == VehicleBus {
+		rows := len(panel.BusStops)
+		if rows < 1 {
+			rows = 1
+		}
+		height = 326 + float32(rows)*28
+	}
+	return rl.NewRectangle(float32(rl.GetScreenWidth())-360, 18, 340, height)
+}
+
+func routePanelSliderRect(panel RoutePanel) rl.Rectangle {
+	pr := routePanelRect(panel)
+	return rl.NewRectangle(pr.X+18, pr.Y+82, pr.Width-36, 22)
+}
+
+func routePanelBusAddRect(panel RoutePanel) rl.Rectangle {
+	pr := routePanelRect(panel)
+	return rl.NewRectangle(pr.X+18, pr.Y+180, pr.Width-36, 28)
+}
+
+func routePanelBusStopRowRect(panel RoutePanel, idx int) rl.Rectangle {
+	pr := routePanelRect(panel)
+	return rl.NewRectangle(pr.X+18, pr.Y+216+float32(idx)*28, pr.Width-36, 24)
+}
+
+func routePanelApplyRect(panel RoutePanel) rl.Rectangle {
+	pr := routePanelRect(panel)
+	return rl.NewRectangle(pr.X+18, pr.Y+pr.Height-54, 120, 32)
+}
+
+func routePanelCancelRect(panel RoutePanel) rl.Rectangle {
+	pr := routePanelRect(panel)
+	return rl.NewRectangle(pr.X+202, pr.Y+pr.Height-54, 120, 32)
+}
+
+func updateRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *int, graph *RoadGraph, splines []Spline, mouse rl.Vector2) (RoutePanel, []Route, []Car, bool) {
+	panelRect := routePanelRect(panel)
+	sliderRect := routePanelSliderRect(panel)
+	applyRect := routePanelApplyRect(panel)
+	cancelRect := routePanelCancelRect(panel)
 	applied := false
 
+	if panel.VehicleKind == VehicleBus && panel.AddingBusStop && (rl.IsKeyPressed(rl.KeyEscape) || rl.IsMouseButtonPressed(rl.MouseButtonRight)) {
+		panel.AddingBusStop = false
+		panel.StopStatusNotice = ""
+		return panel, routes, cars, false
+	}
 	if rl.IsKeyPressed(rl.KeyEscape) || rl.IsMouseButtonPressed(rl.MouseButtonRight) {
 		return RoutePanel{}, routes, cars, false
 	}
@@ -3237,6 +3611,23 @@ func updateRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID 
 				panel.ColorIndex = i
 			}
 		}
+		if panel.VehicleKind == VehicleBus {
+			addRect := routePanelBusAddRect(panel)
+			if pointInRect(mouse, addRect) {
+				panel.AddingBusStop = !panel.AddingBusStop
+				panel.StopStatusNotice = ""
+			}
+			for i := range panel.BusStops {
+				rowRect := routePanelBusStopRowRect(panel, i)
+				delRect := rl.NewRectangle(rowRect.X+rowRect.Width-58, rowRect.Y+2, 54, rowRect.Height-4)
+				if pointInRect(mouse, delRect) {
+					panel.BusStops = append(panel.BusStops[:i], panel.BusStops[i+1:]...)
+					panel.AddingBusStop = false
+					panel = syncRoutePanelPath(panel, graph)
+					break
+				}
+			}
+		}
 		if pointInRect(mouse, applyRect) {
 			panel, routes, cars = applyRoutePanel(panel, routes, cars, nextRouteID)
 			applied = true
@@ -3252,11 +3643,16 @@ func updateRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID 
 			panel.DraggingSlider = false
 		}
 	}
+	panel = syncRoutePanelPath(panel, graph)
+	_ = splines
 
 	return panel, routes, cars, applied
 }
 
 func applyRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *int) (RoutePanel, []Route, []Car) {
+	if panel.SpawnPerMinute > 0.01 && !panel.ValidPath() {
+		return panel, routes, cars
+	}
 	spawn := panel.SpawnPerMinute
 	if spawn <= 0.01 {
 		if panel.ExistingRouteID >= 0 {
@@ -3274,8 +3670,13 @@ func applyRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *
 			routes[idx].Valid = len(panel.PathIDs) > 0
 			routes[idx].ColorIndex = panel.ColorIndex
 			routes[idx].Color = routePaletteColor(panel.ColorIndex)
+			routes[idx].VehicleKind = panel.VehicleKind
+			routes[idx].BusStops = append([]BusStop(nil), panel.BusStops...)
 			if routes[idx].NextSpawnIn <= 0 {
 				routes[idx].NextSpawnIn = randomizedSpawnDelay(spawn)
+			}
+			if panel.VehicleKind == VehicleBus {
+				cars = removeCarsForRoute(cars, panel.ExistingRouteID)
 			}
 		}
 		return RoutePanel{}, routes, cars
@@ -3294,6 +3695,8 @@ func applyRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *
 		Valid:          len(panel.PathIDs) > 0,
 		ColorIndex:     panel.ColorIndex,
 		Color:          routePaletteColor(panel.ColorIndex),
+		VehicleKind:    panel.VehicleKind,
+		BusStops:       append([]BusStop(nil), panel.BusStops...),
 	}
 	routes = append(routes, route)
 	return RoutePanel{}, routes, cars
@@ -3310,7 +3713,7 @@ func updateRouteVisuals(routes []Route, splines []Spline, vehicleCounts map[int]
 
 func updateRouteVisualsWithGraph(routes []Route, graph *RoadGraph) []Route {
 	for i := range routes {
-		pathIDs, pathLength, ok := findShortestPathWeightedWithGraph(graph, routes[i].StartSplineID, routes[i].EndSplineID)
+		pathIDs, pathLength, _, ok := computeRoutePathWithGraph(routes[i], graph)
 		routes[i].PathIDs = pathIDs
 		routes[i].PathLength = pathLength
 		routes[i].Valid = ok && len(pathIDs) > 0
@@ -3330,7 +3733,7 @@ func updateRouteSpawning(routes []Route, cars []Car, splines []Spline, dt float3
 		if routes[i].NextSpawnIn > 0 {
 			continue
 		}
-		candidate := spawnCar(routes[i], splines)
+		candidate := spawnVehicle(routes[i], splines)
 		if !spawnBlocked(candidate, cars, splines) {
 			cars = append(cars, candidate)
 			routes[i].NextSpawnIn = randomizedSpawnDelay(routes[i].SpawnPerMinute)
@@ -3382,37 +3785,40 @@ func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 	return false
 }
 
-func spawnCar(route Route, splines []Spline) Car {
-	// All values in SI units: metres, m/s, m/s².
-	// Typical passenger car: 4.0-4.8 m long, 1.8-2.0 m wide.
-	// Speed range: ~80-130 km/h = 22.2-36.1 m/s.
-	// Acceleration: 2.5-4.5 m/s² (comfortable urban driving).
+func spawnVehicle(route Route, splines []Spline) Car {
 	length := randRange(4.0, 4.8) / metersPerUnit
 	width := randRange(1.8, 2.0) / metersPerUnit
-	if rand.Float32() < 0.25 {
-		length *= 2
-		width += 0.6
+	maxSpeed := randRange(22.2, 36.1)
+	accel := randRange(2.5, 4.5)
+	curveSpeedMultiplier := randRange(0.8, 1.2)
+	if route.VehicleKind == VehicleBus {
+		length = randRange(11.5, 15.0) / metersPerUnit
+		width = randRange(2.45, 2.65) / metersPerUnit
+		maxSpeed = randRange(13.9, 20.0)
+		accel = randRange(1.2, 2.0)
+		curveSpeedMultiplier = randRange(0.9, 1.05)
 	}
+
 	car := Car{
 		RouteID:              route.ID,
 		CurrentSplineID:      route.StartSplineID,
-		DestinationSplineID:  route.EndSplineID,
+		DestinationSplineID:  currentRouteTarget(route, 0),
 		PrevSplineIDs:        [2]int{-1, -1},
 		DistanceOnSpline:     0,
-		Speed:                randRange(0, 2),       // m/s — starts nearly stationary
-		MaxSpeed:             randRange(22.2, 36.1), // m/s — 80–130 km/h
-		Accel:                randRange(2.5, 4.5),   // m/s²
+		Speed:                randRange(0, 2),
+		MaxSpeed:             maxSpeed,
+		Accel:                accel,
 		Length:               length,
 		Width:                width,
-		CurveSpeedMultiplier: randRange(0.8, 1.2),
+		CurveSpeedMultiplier: curveSpeedMultiplier,
 		Color:                route.Color,
 		Braking:              false,
 		LaneChangeSplineID:   -1,
 		AfterSplineID:        -1,
-
-		DesiredLaneSplineID: -1,
-		PreferenceCooldown:  rand.Float32() * preferenceChangeCooldownS,
-		OvertakeCooldown:    rand.Float32() * overtakeCooldownS,
+		DesiredLaneSplineID:  -1,
+		PreferenceCooldown:   rand.Float32() * preferenceChangeCooldownS,
+		OvertakeCooldown:     rand.Float32() * overtakeCooldownS,
+		VehicleKind:          route.VehicleKind,
 	}
 	// Initialise rear pivot behind the front pivot along the spawn spline tangent.
 	if spline, ok := findSplineByID(splines, route.StartSplineID); ok {
@@ -3420,7 +3826,7 @@ func spawnCar(route Route, splines []Spline) Car {
 		car.RearPosition = vecSub(frontPos, vecScale(tangent, car.Length*wheelbaseFrac))
 
 		// 20% chance of spawning with a cargo trailer.
-		if rand.Float32() < 0.20 {
+		if route.VehicleKind == VehicleCar && rand.Float32() < 0.20 {
 			tLen := randRange(7.0, 10.0)
 			tWid := randRange(2.0, 2.4)
 			// Trailer rear pivot starts behind the cab's rear pivot by the trailer wheelbase.
@@ -3436,6 +3842,101 @@ func spawnCar(route Route, splines []Spline) Car {
 		}
 	}
 	return car
+}
+
+func beginBusStopDwell(route Route, car *Car) bool {
+	if route.VehicleKind != VehicleBus || car.NextBusStopIndex >= len(route.BusStops) {
+		return false
+	}
+	stop := route.BusStops[car.NextBusStopIndex]
+	car.Speed = 0
+	car.BusStopDuration = randRange(busStopMinDwellSeconds, busStopMaxDwellSeconds)
+	car.BusStopTimer = car.BusStopDuration
+	car.NextBusStopIndex++
+	if car.CurrentSplineID == stop.SplineID {
+		car.DestinationSplineID = currentRouteTarget(route, car.NextBusStopIndex)
+	} else {
+		// Hold the current stop spline as the immediate target until the bus
+		// physically enters it after the dwell.
+		car.DestinationSplineID = stop.SplineID
+	}
+	return true
+}
+
+func resumeBusRouteAfterStop(route Route, car *Car) {
+	if route.VehicleKind != VehicleBus || car.NextBusStopIndex <= 0 || car.NextBusStopIndex > len(route.BusStops) {
+		return
+	}
+	prevStopSplineID := route.BusStops[car.NextBusStopIndex-1].SplineID
+	if car.CurrentSplineID == prevStopSplineID {
+		car.DestinationSplineID = currentRouteTarget(route, car.NextBusStopIndex)
+	}
+}
+
+func computeBusStopSpeedCap(car Car, route Route, currentSpline Spline, graph *RoadGraph) float32 {
+	if route.VehicleKind != VehicleBus || car.NextBusStopIndex >= len(route.BusStops) {
+		return float32(math.MaxFloat32)
+	}
+	stopSplineID := route.BusStops[car.NextBusStopIndex].SplineID
+	decel := car.Accel * 1.5
+
+	checkStop := func(rawDistAhead float32) float32 {
+		adj := rawDistAhead - stopFrontGapM
+		if adj <= 0 {
+			return 0
+		}
+		return float32(math.Sqrt(float64(2 * decel * adj)))
+	}
+
+	if currentSpline.ID == stopSplineID {
+		if car.DistanceOnSpline <= stopFrontGapM {
+			return 0
+		}
+		return float32(math.MaxFloat32)
+	}
+
+	nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, stopSplineID, car.VehicleKind)
+	if !ok {
+		forcedNext, _, forcedOK := findForcedLaneChangePathWithGraph(graph, currentSpline.ID, stopSplineID, car.VehicleKind)
+		if !forcedOK {
+			return float32(math.MaxFloat32)
+		}
+		nextID = forcedNext
+	}
+	if nextID != stopSplineID {
+		return float32(math.MaxFloat32)
+	}
+	return checkStop(currentSpline.Length - car.DistanceOnSpline)
+}
+
+func shouldBeginBusStopDwell(car Car, route Route, currentSpline Spline, graph *RoadGraph) bool {
+	if route.VehicleKind != VehicleBus || car.BusStopTimer > 0 || car.NextBusStopIndex >= len(route.BusStops) {
+		return false
+	}
+	stopSplineID := route.BusStops[car.NextBusStopIndex].SplineID
+	const stopSpeedThreshold = 0.35
+	if car.Speed > stopSpeedThreshold {
+		return false
+	}
+
+	stopSlack := stopFrontGapM + 0.5
+	if currentSpline.ID == stopSplineID {
+		return car.DistanceOnSpline <= stopSlack
+	}
+
+	nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, stopSplineID, car.VehicleKind)
+	if !ok {
+		forcedNext, _, forcedOK := findForcedLaneChangePathWithGraph(graph, currentSpline.ID, stopSplineID, car.VehicleKind)
+		if !forcedOK {
+			return false
+		}
+		nextID = forcedNext
+	}
+	if nextID != stopSplineID {
+		return false
+	}
+	remaining := currentSpline.Length - car.DistanceOnSpline
+	return remaining <= stopSlack
 }
 
 // recentlyLeft returns true if the car was on splineID within its last two transitions.
@@ -3819,9 +4320,9 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 				continue
 			}
 
-			nextSplineID, ok := chooseNextSplineOnBestPathWithGraph(graph, simCar.CurrentSplineID, simCar.DestinationSplineID)
+			nextSplineID, ok := chooseNextSplineOnBestPathWithGraph(graph, simCar.CurrentSplineID, simCar.DestinationSplineID, simCar.VehicleKind)
 			if !ok {
-				forcedNext, _, forcedOk := findForcedLaneChangePathWithGraph(graph, simCar.CurrentSplineID, simCar.DestinationSplineID)
+				forcedNext, _, forcedOk := findForcedLaneChangePathWithGraph(graph, simCar.CurrentSplineID, simCar.DestinationSplineID, simCar.VehicleKind)
 				if !forcedOk {
 					active = false
 					break
@@ -4074,7 +4575,7 @@ func buildLookaheadSplineSets(cars []Car, graph *RoadGraph, lookahead float32) [
 		covered := currentSpline.Length - car.DistanceOnSpline
 		curID := car.CurrentSplineID
 		for steps := 0; covered < lookahead && steps < len(graph.splines); steps++ {
-			nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, curID, car.DestinationSplineID)
+			nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, curID, car.DestinationSplineID, car.VehicleKind)
 			if !ok {
 				break
 			}
@@ -4187,6 +4688,22 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 		if !ok || !routes[routeIdx].Valid {
 			continue
 		}
+		route := routes[routeIdx]
+		if route.VehicleKind == VehicleBus && car.DestinationSplineID <= 0 {
+			car.DestinationSplineID = currentRouteTarget(route, car.NextBusStopIndex)
+		}
+
+		if route.VehicleKind == VehicleBus && car.BusStopTimer > 0 {
+			car.BusStopTimer -= dt
+			if car.BusStopTimer < 0 {
+				car.BusStopTimer = 0
+			}
+			car.Speed = 0
+			car.Braking = false
+			car.SoftSlowing = false
+			alive = append(alive, car)
+			continue
+		}
 
 		shouldBrake := i < len(brakingDecisions) && brakingDecisions[i]
 		shouldHoldSpeed := !shouldBrake && i < len(holdSpeedDecisions) && holdSpeedDecisions[i]
@@ -4229,6 +4746,11 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 			if !ok {
 				break
 			}
+			if shouldBeginBusStopDwell(car, route, currentSpline, graph) {
+				beginBusStopDwell(route, &car)
+				alive = append(alive, car)
+				break
+			}
 
 			targetSpeed := car.MaxSpeed * currentSpline.SpeedFactor
 			if currentSpline.SpeedLimitKmh > 0 {
@@ -4244,6 +4766,9 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 			}
 			if tl := computeTrafficLightSpeedCap(car, currentSpline, graph, lights, cycles); tl < targetSpeed {
 				targetSpeed = tl
+			}
+			if bs := computeBusStopSpeedCap(car, route, currentSpline, graph); bs < targetSpeed {
+				targetSpeed = bs
 			}
 			// If a forced lane switch is pending, begin decelerating to
 			// laneChangeForcedSpeedMPS in time to reach the deadline position.
@@ -4321,6 +4846,9 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 						car.Trailer.RearPosition = vecSub(hitchPos, vecScale(normalize(trailerRearToHitch), car.Trailer.Length*wheelbaseFrac))
 					}
 				}
+				if shouldBeginBusStopDwell(car, route, currentSpline, graph) {
+					beginBusStopDwell(route, &car)
+				}
 				alive = append(alive, car)
 				break
 			}
@@ -4347,7 +4875,7 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 				continue
 			}
 
-			nextSplineID, ok := chooseNextSplineOnBestPathWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID)
+			nextSplineID, ok := chooseNextSplineOnBestPathWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
 			if ok {
 				// Normal path found — any pending forced-switch is no longer needed.
 				if car.DesiredLaneSplineID >= 0 {
@@ -4357,7 +4885,7 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 			} else {
 				// No direct path: check whether entering a physical next spline whose
 				// hard-coupled partner has a path can rescue the car.
-				forcedNext, desiredLane, forcedOk := findForcedLaneChangePathWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID)
+				forcedNext, desiredLane, forcedOk := findForcedLaneChangePathWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
 				if !forcedOk {
 					break
 				}
@@ -4371,6 +4899,7 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 			car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
 			car.PrevSplineIDs[0] = car.CurrentSplineID
 			car.CurrentSplineID = nextSplineID
+			resumeBusRouteAfterStop(route, &car)
 
 			// Opportunistic lane change: check whether a hard-coupled parallel lane
 			// offers a significantly faster route to the destination.  If so, treat it
@@ -4378,10 +4907,10 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 			// Only runs when no forced-switch is already pending.
 			if car.DesiredLaneSplineID < 0 && car.CurrentSplineID != car.DestinationSplineID {
 				if newSpline, scOk := graph.splineByID(car.CurrentSplineID); scOk && len(newSpline.HardCoupledIDs) > 0 {
-					_, curTime, curOk := findShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID)
+					_, curTime, curOk := findShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
 					if curOk {
 						for _, cid := range newSpline.HardCoupledIDs {
-							_, coupledTime, coupledOk := findShortestPathWeightedWithGraph(graph, cid, car.DestinationSplineID)
+							_, coupledTime, coupledOk := findShortestPathWeightedWithGraph(graph, cid, car.DestinationSplineID, car.VehicleKind)
 							if coupledOk && curTime-coupledTime >= 20.0 {
 								car.DesiredLaneSplineID = cid
 								car.DesiredLaneDeadline = maxf(newSpline.Length-laneChangeForcedDistEnd, 0)
@@ -4430,10 +4959,22 @@ func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom fl
 			rl.DrawRectanglePro(trailerRect, trailerOrigin, trailerAngle, car.Trailer.Color)
 		}
 		rl.DrawRectanglePro(rect, origin, angle, car.Color)
+		if car.VehicleKind == VehicleBus {
+			windowColor := rl.NewColor(235, 243, 250, 220)
+			windowRect := rl.NewRectangle(center.X, center.Y, car.Length*0.72, car.Width*0.42)
+			windowOrigin := rl.NewVector2(windowRect.Width/2, windowRect.Height/2)
+			rl.DrawRectanglePro(windowRect, windowOrigin, angle, windowColor)
+			frontRect := rl.NewRectangle(center.X+bodyHeading.X*car.Length*0.28, center.Y+bodyHeading.Y*car.Length*0.28, car.Length*0.12, car.Width*0.78)
+			frontOrigin := rl.NewVector2(frontRect.Width/2, frontRect.Height/2)
+			rl.DrawRectanglePro(frontRect, frontOrigin, angle, rl.NewColor(30, 30, 35, 90))
+		}
 		if car.Braking {
 			rl.DrawCircleV(center, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), rl.NewColor(220, 50, 50, 255))
 		} else if debugMode && car.SoftSlowing {
 			rl.DrawCircleV(center, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), rl.NewColor(60, 120, 220, 255))
+		}
+		if car.VehicleKind == VehicleBus && car.BusStopTimer > 0 {
+			rl.DrawCircleV(center, maxf(car.Width*0.24, pixelsToWorld(zoom, 2.5)), rl.NewColor(255, 200, 40, 255))
 		}
 	}
 }
@@ -4547,6 +5088,15 @@ func drawRouteWithIndex(route Route, splines []Spline, indexByID map[int]int, th
 	if end, ok := findSplineByID(splines, route.EndSplineID); ok {
 		drawEndpoint(end.P3, destR, color)
 	}
+	if route.VehicleKind == VehicleBus {
+		stopFill := rl.NewColor(route.Color.R, route.Color.G, route.Color.B, 220)
+		stopOuter := rl.NewColor(20, 20, 25, 220)
+		stopR := pixelsToWorld(zoom, 7)
+		for _, stop := range route.BusStops {
+			rl.DrawCircleV(stop.WorldPos, stopR, stopOuter)
+			rl.DrawCircleV(stop.WorldPos, stopR*0.72, stopFill)
+		}
+	}
 }
 
 func drawRoute(route Route, splines []Spline, thickness float32, zoom float32) {
@@ -4564,7 +5114,7 @@ func drawRoutePicking(routeStartSplineID int, routePanel RoutePanel, hoveredStar
 		}
 		if hoveredEnd.SplineIndex >= 0 {
 			drawEndpoint(hoveredEnd.Point, handleRadius*1.5, rl.NewColor(35, 85, 175, 255))
-			if pathIDs, _, ok := findShortestPathWeighted(splines, routeStartSplineID, hoveredEnd.SplineID, vehicleCounts); ok {
+			if pathIDs, _, ok := findShortestPathWeighted(splines, routeStartSplineID, hoveredEnd.SplineID, vehicleCounts, routePanel.VehicleKind); ok {
 				previewRoute := Route{PathIDs: pathIDs, Color: routePaletteColor(routePanel.ColorIndex), Valid: true}
 				drawRoute(previewRoute, splines, pixelsToWorld(zoom, 4), zoom)
 			}
@@ -4573,10 +5123,10 @@ func drawRoutePicking(routeStartSplineID int, routePanel RoutePanel, hoveredStar
 }
 
 func drawRoutePanel(panel RoutePanel, routes []Route) {
-	panelRect := rl.NewRectangle(float32(rl.GetScreenWidth())-360, 18, 340, 234)
-	sliderRect := rl.NewRectangle(panelRect.X+18, panelRect.Y+82, panelRect.Width-36, 22)
-	applyRect := rl.NewRectangle(panelRect.X+18, panelRect.Y+180, 120, 32)
-	cancelRect := rl.NewRectangle(panelRect.X+202, panelRect.Y+180, 120, 32)
+	panelRect := routePanelRect(panel)
+	sliderRect := routePanelSliderRect(panel)
+	applyRect := routePanelApplyRect(panel)
+	cancelRect := routePanelCancelRect(panel)
 
 	bg := rl.NewColor(248, 248, 250, 245)
 	outline := rl.NewColor(210, 210, 215, 255)
@@ -4584,6 +5134,7 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 	muted := rl.NewColor(90, 90, 100, 255)
 	accent := rl.NewColor(70, 110, 220, 255)
 	button := rl.NewColor(235, 236, 240, 255)
+	danger := rl.NewColor(200, 60, 60, 255)
 
 	rl.DrawRectangle(int32(panelRect.X), int32(panelRect.Y), int32(panelRect.Width), int32(panelRect.Height), bg)
 	rl.DrawRectangleLines(int32(panelRect.X), int32(panelRect.Y), int32(panelRect.Width), int32(panelRect.Height), outline)
@@ -4591,13 +5142,22 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 	if panel.ExistingRouteID >= 0 {
 		title = "Edit existing route"
 	}
+	unitLabel := "cars"
+	if panel.VehicleKind == VehicleBus {
+		if panel.ExistingRouteID >= 0 {
+			title = "Edit bus line"
+		} else {
+			title = "Create bus line"
+		}
+		unitLabel = "buses"
+	}
 	drawText(title, int32(panelRect.X+18), int32(panelRect.Y+16), 22, textCol)
 	drawText(fmt.Sprintf("Start spline #%d → end spline #%d", panel.StartSplineID, panel.EndSplineID), int32(panelRect.X+18), int32(panelRect.Y+44), 18, muted)
 	meanSeconds := float32(0)
 	if panel.SpawnPerMinute > 0 {
 		meanSeconds = 60 / panel.SpawnPerMinute
 	}
-	drawText(fmt.Sprintf("Average spawn frequency: %.1f cars/min  (mean %.1fs)", panel.SpawnPerMinute, meanSeconds), int32(panelRect.X+18), int32(panelRect.Y+64), 18, textCol)
+	drawText(fmt.Sprintf("Average spawn frequency: %.1f %s/min  (mean %.1fs)", panel.SpawnPerMinute, unitLabel, meanSeconds), int32(panelRect.X+18), int32(panelRect.Y+64), 18, textCol)
 
 	rl.DrawRectangle(int32(sliderRect.X), int32(sliderRect.Y), int32(sliderRect.Width), int32(sliderRect.Height), rl.NewColor(229, 229, 234, 255))
 	fillWidth := sliderRect.Width * clampf(panel.SpawnPerMinute/spawnSliderMaxPerMinute, 0, 1)
@@ -4629,6 +5189,40 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 		}
 	}
 
+	if panel.VehicleKind == VehicleBus {
+		addRect := routePanelBusAddRect(panel)
+		addLabel := "Add bus stop"
+		addColor := rl.NewColor(47, 120, 60, 255)
+		if panel.AddingBusStop {
+			addLabel = "Pick in map..."
+			addColor = rl.NewColor(210, 150, 20, 255)
+		}
+		drawText("Bus stops:", int32(panelRect.X+18), int32(panelRect.Y+166), 14, muted)
+		rl.DrawRectangleRec(addRect, addColor)
+		rl.DrawRectangleLinesEx(addRect, 1, rl.NewColor(0, 0, 0, 40))
+		addW := measureText(addLabel, 14)
+		drawText(addLabel, int32(addRect.X)+int32(addRect.Width)/2-addW/2, int32(addRect.Y)+7, 14, rl.White)
+
+		if len(panel.BusStops) == 0 {
+			drawText("No stops yet. Add intersections in travel order.", int32(panelRect.X+18), int32(panelRect.Y+220), 13, muted)
+		} else {
+			for i, stop := range panel.BusStops {
+				rowRect := routePanelBusStopRowRect(panel, i)
+				rl.DrawRectangleRec(rowRect, rl.NewColor(242, 243, 246, 255))
+				rl.DrawRectangleLinesEx(rowRect, 1, outline)
+				drawText(fmt.Sprintf("%d. stop on spline #%d", i+1, stop.SplineID), int32(rowRect.X)+8, int32(rowRect.Y)+5, 13, textCol)
+				delRect := rl.NewRectangle(rowRect.X+rowRect.Width-58, rowRect.Y+2, 54, rowRect.Height-4)
+				rl.DrawRectangleRec(delRect, danger)
+				rl.DrawRectangleLinesEx(delRect, 1, rl.NewColor(0, 0, 0, 40))
+				drawText("Remove", int32(delRect.X)+7, int32(delRect.Y)+4, 12, rl.White)
+			}
+		}
+
+		if panel.StopStatusNotice != "" {
+			drawText(panel.StopStatusNotice, int32(panelRect.X+18), int32(applyRect.Y)-28, 12, muted)
+		}
+	}
+
 	applyLabel := "Apply"
 	if panel.SpawnPerMinute <= 0.01 {
 		if panel.ExistingRouteID >= 0 {
@@ -4643,7 +5237,11 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 	rl.DrawRectangleLines(int32(cancelRect.X), int32(cancelRect.Y), int32(cancelRect.Width), int32(cancelRect.Height), outline)
 	drawText(applyLabel, int32(applyRect.X+34), int32(applyRect.Y+7), 20, textCol)
 	drawText("Close", int32(cancelRect.X+34), int32(cancelRect.Y+7), 20, textCol)
-	drawText(fmt.Sprintf("Current weighted cost: %.0f", panel.PathLength), int32(panelRect.X+18), int32(panelRect.Y+220), 16, muted)
+	if panel.VehicleKind == VehicleBus {
+		drawText(fmt.Sprintf("Current weighted cost: %.0f", panel.PathLength), int32(panelRect.X+18), int32(panelRect.Y+panelRect.Height)-26, 16, muted)
+	} else {
+		drawText(fmt.Sprintf("Current weighted cost: %.0f", panel.PathLength), int32(panelRect.X+18), int32(panelRect.Y+220), 16, muted)
+	}
 	_ = routes
 }
 
@@ -4665,6 +5263,11 @@ func modeStatusText(mode EditorMode, stage Stage, draft Draft, routeStartSplineI
 			return fmt.Sprintf("Pick destination for start spline #%d", routeStartSplineID)
 		}
 		return "Click a spline start to begin a route"
+	case ModeBus:
+		if routeStartSplineID >= 0 {
+			return fmt.Sprintf("Pick destination for bus line start spline #%d", routeStartSplineID)
+		}
+		return "Left click: begin a bus line   Right click on a spline: toggle bus-only"
 	case ModePriority:
 		return "Left click: set priority   Right click: clear"
 	case ModeCouple:
@@ -4795,8 +5398,14 @@ func newSpline(id int, p0, p1, p2, p3 rl.Vector2) Spline {
 }
 
 func splineDrawColor(s Spline) rl.Color {
+	if s.Priority && s.BusOnly {
+		return rl.NewColor(95, 125, 195, 255)
+	}
 	if s.Priority {
 		return rl.NewColor(130, 75, 215, 255)
+	}
+	if s.BusOnly {
+		return rl.NewColor(28, 145, 125, 255)
 	}
 	return rl.NewColor(35, 85, 175, 255)
 }
@@ -4999,13 +5608,10 @@ func computeTrafficLightSpeedCap(car Car, currentSpline Spline, graph *RoadGraph
 	}
 
 	checkLight := func(rawDistAhead float32) {
-		// DistanceOnSpline is measured from the car's centre, so subtract a
-		// full car length to make the front stop at least car.Length before
-		// the light position.
-		adj := rawDistAhead - car.Length
+		// Hold a fixed 5 m gap between the vehicle's front and the light.
+		adj := rawDistAhead - stopFrontGapM
 		if adj <= 0 {
-			// Car centre is already within car.Length of the light — must stop
-			// immediately and stay stopped while the light is red.
+			// Already inside the target gap — stop immediately and hold.
 			result = 0
 			return
 		}
@@ -5030,7 +5636,7 @@ func computeTrafficLightSpeedCap(car Car, currentSpline Spline, graph *RoadGraph
 
 	// Also check lights on the next spline if the lookahead extends past the end.
 	if remaining < lookahead {
-		nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, car.DestinationSplineID)
+		nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, car.DestinationSplineID, car.VehicleKind)
 		if ok {
 			if _, ok2 := graph.splineByID(nextID); ok2 {
 				for _, l := range lights {
@@ -5101,7 +5707,7 @@ func computeAnticipatoryTargetSpeed(car Car, currentSpline Spline, graph *RoadGr
 	// If the lookahead extends past the end of the current spline, scan the
 	// next most-likely spline from its beginning.
 	if remaining < lookahead {
-		nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, car.DestinationSplineID)
+		nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, car.DestinationSplineID, car.VehicleKind)
 		if ok {
 			if nextSpline, ok2 := graph.splineByID(nextID); ok2 {
 				budget := lookahead - remaining
@@ -5470,15 +6076,19 @@ func buildVehicleCounts(cars []Car) map[int]int {
 	return counts
 }
 
-func findShortestPathWeighted(splines []Spline, startSplineID, endSplineID int, vehicleCounts map[int]int) ([]int, float32, bool) {
-	return findShortestPathWeightedWithGraph(newRoadGraph(splines, vehicleCounts), startSplineID, endSplineID)
+func isSplineUsableForVehicle(s Spline, vehicleKind VehicleKind) bool {
+	return vehicleKind == VehicleBus || !s.BusOnly
 }
 
-func findShortestPathWeightedWithGraph(graph *RoadGraph, startSplineID, endSplineID int) ([]int, float32, bool) {
+func findShortestPathWeighted(splines []Spline, startSplineID, endSplineID int, vehicleCounts map[int]int, vehicleKind VehicleKind) ([]int, float32, bool) {
+	return findShortestPathWeightedWithGraph(newRoadGraph(splines, vehicleCounts), startSplineID, endSplineID, vehicleKind)
+}
+
+func findShortestPathWeightedWithGraph(graph *RoadGraph, startSplineID, endSplineID int, vehicleKind VehicleKind) ([]int, float32, bool) {
 	if graph == nil || len(graph.splines) == 0 {
 		return nil, 0, false
 	}
-	key := pathCacheKey{StartID: startSplineID, EndID: endSplineID}
+	key := pathCacheKey{StartID: startSplineID, EndID: endSplineID, VehicleKind: vehicleKind}
 	if cached, ok := graph.pathCache[key]; ok {
 		graph.pathCacheHits++
 		return append([]int(nil), cached.PathIDs...), cached.Cost, cached.OK
@@ -5487,6 +6097,10 @@ func findShortestPathWeightedWithGraph(graph *RoadGraph, startSplineID, endSplin
 	startIdx, okStart := graph.indexByID[startSplineID]
 	endIdx, okEnd := graph.indexByID[endSplineID]
 	if !okStart || !okEnd {
+		graph.pathCache[key] = pathCacheEntry{OK: false}
+		return nil, 0, false
+	}
+	if vehicleKind == VehicleCar && startIdx != endIdx && graph.splines[endIdx].BusOnly {
 		graph.pathCache[key] = pathCacheEntry{OK: false}
 		return nil, 0, false
 	}
@@ -5511,6 +6125,9 @@ func findShortestPathWeightedWithGraph(graph *RoadGraph, startSplineID, endSplin
 			break
 		}
 		for _, nextIdx := range graph.routeNeighbors[item.idx] {
+			if vehicleKind == VehicleCar && graph.splines[nextIdx].BusOnly {
+				continue
+			}
 			alt := item.dist + graph.segmentCosts[nextIdx]
 			if alt < dist[nextIdx] {
 				dist[nextIdx] = alt
@@ -5544,11 +6161,11 @@ func findShortestPathWeightedWithGraph(graph *RoadGraph, startSplineID, endSplin
 	return pathIDs, dist[endIdx], true
 }
 
-func chooseNextSplineOnBestPath(splines []Spline, currentSplineID, destinationSplineID int, vehicleCounts map[int]int) (int, bool) {
-	return chooseNextSplineOnBestPathWithGraph(newRoadGraph(splines, vehicleCounts), currentSplineID, destinationSplineID)
+func chooseNextSplineOnBestPath(splines []Spline, currentSplineID, destinationSplineID int, vehicleCounts map[int]int, vehicleKind VehicleKind) (int, bool) {
+	return chooseNextSplineOnBestPathWithGraph(newRoadGraph(splines, vehicleCounts), currentSplineID, destinationSplineID, vehicleKind)
 }
 
-func chooseNextSplineOnBestPathWithGraph(graph *RoadGraph, currentSplineID, destinationSplineID int) (int, bool) {
+func chooseNextSplineOnBestPathWithGraph(graph *RoadGraph, currentSplineID, destinationSplineID int, vehicleKind VehicleKind) (int, bool) {
 	currentSpline, ok := graph.splineByID(currentSplineID)
 	if !ok {
 		return 0, false
@@ -5563,7 +6180,10 @@ func chooseNextSplineOnBestPathWithGraph(graph *RoadGraph, currentSplineID, dest
 	found := false
 	for _, idx := range candidateIndices {
 		candidate := graph.splines[idx]
-		_, cost, ok := findShortestPathWeightedWithGraph(graph, candidate.ID, destinationSplineID)
+		if !isSplineUsableForVehicle(candidate, vehicleKind) {
+			continue
+		}
+		_, cost, ok := findShortestPathWeightedWithGraph(graph, candidate.ID, destinationSplineID, vehicleKind)
 		if !ok {
 			continue
 		}
@@ -5659,9 +6279,9 @@ func findSplineByID(splines []Spline, id int) (Spline, bool) {
 	return Spline{}, false
 }
 
-func findRouteID(routes []Route, startSplineID, endSplineID int) int {
+func findRouteID(routes []Route, startSplineID, endSplineID int, vehicleKind VehicleKind) int {
 	for _, route := range routes {
-		if route.StartSplineID == startSplineID && route.EndSplineID == endSplineID {
+		if route.StartSplineID == startSplineID && route.EndSplineID == endSplineID && route.VehicleKind == vehicleKind {
 			return route.ID
 		}
 	}
@@ -5801,6 +6421,7 @@ func saveSplineFile(splines []Spline, routes []Route, cars []Car, lights []Traff
 		saved.Splines = append(saved.Splines, SavedSpline{
 			ID:             spline.ID,
 			Priority:       spline.Priority,
+			BusOnly:        spline.BusOnly,
 			P0:             spline.P0,
 			P1:             spline.P1,
 			P2:             spline.P2,
@@ -5812,6 +6433,14 @@ func saveSplineFile(splines []Spline, routes []Route, cars []Car, lights []Traff
 		})
 	}
 	for _, route := range routes {
+		savedStops := make([]SavedBusStop, 0, len(route.BusStops))
+		for _, stop := range route.BusStops {
+			savedStops = append(savedStops, SavedBusStop{
+				SplineID:  stop.SplineID,
+				WorldPosX: stop.WorldPos.X,
+				WorldPosY: stop.WorldPos.Y,
+			})
+		}
 		saved.Routes = append(saved.Routes, SavedRoute{
 			ID:             route.ID,
 			StartSplineID:  route.StartSplineID,
@@ -5819,6 +6448,8 @@ func saveSplineFile(splines []Spline, routes []Route, cars []Car, lights []Traff
 			PathIDs:        route.PathIDs,
 			SpawnPerMinute: route.SpawnPerMinute,
 			ColorIndex:     route.ColorIndex,
+			VehicleKind:    vehicleKindString(route.VehicleKind),
+			BusStops:       savedStops,
 		})
 	}
 	for _, car := range cars {
@@ -5833,6 +6464,10 @@ func saveSplineFile(splines []Spline, routes []Route, cars []Car, lights []Traff
 			Length:               car.Length,
 			Width:                car.Width,
 			CurveSpeedMultiplier: car.CurveSpeedMultiplier,
+			VehicleKind:          vehicleKindString(car.VehicleKind),
+			NextBusStopIndex:     car.NextBusStopIndex,
+			BusStopTimer:         car.BusStopTimer,
+			BusStopDuration:      car.BusStopDuration,
 		})
 	}
 
@@ -5885,6 +6520,7 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, []TrafficLight, []Tr
 	for _, entry := range saved.Splines {
 		spline := newSpline(entry.ID, entry.P0, entry.P1, entry.P2, entry.P3)
 		spline.Priority = entry.Priority
+		spline.BusOnly = entry.BusOnly
 		spline.HardCoupledIDs = append([]int(nil), entry.HardCoupledIDs...)
 		spline.SoftCoupledIDs = append([]int(nil), entry.SoftCoupledIDs...)
 		spline.SpeedLimitKmh = entry.SpeedLimitKmh
@@ -5900,6 +6536,14 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, []TrafficLight, []Tr
 	loadedRoutes := make([]Route, 0, len(saved.Routes))
 	maxRouteID := 0
 	for _, entry := range saved.Routes {
+		stops := make([]BusStop, 0, len(entry.BusStops))
+		for _, savedStop := range entry.BusStops {
+			stops = append(stops, BusStop{
+				SplineID: savedStop.SplineID,
+				WorldPos: rl.NewVector2(savedStop.WorldPosX, savedStop.WorldPosY),
+			})
+		}
+		vehicleKind := vehicleKindFromString(entry.VehicleKind)
 		route := Route{
 			ID:             entry.ID,
 			StartSplineID:  entry.StartSplineID,
@@ -5908,6 +6552,8 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, []TrafficLight, []Tr
 			SpawnPerMinute: entry.SpawnPerMinute,
 			ColorIndex:     entry.ColorIndex,
 			Color:          routePaletteColor(entry.ColorIndex),
+			VehicleKind:    vehicleKind,
+			BusStops:       stops,
 		}
 		if entry.ID > maxRouteID {
 			maxRouteID = entry.ID
@@ -5921,6 +6567,7 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, []TrafficLight, []Tr
 		routeColorByID[r.ID] = r.Color
 	}
 	for _, entry := range saved.Cars {
+		vehicleKind := vehicleKindFromString(entry.VehicleKind)
 		car := Car{
 			RouteID:              entry.RouteID,
 			CurrentSplineID:      entry.CurrentSplineID,
@@ -5937,12 +6584,23 @@ func loadSplineFile(path string) ([]Spline, []Route, []Car, []TrafficLight, []Tr
 			Braking:              false,
 			LaneChangeSplineID:   -1,
 			AfterSplineID:        -1,
-
-			DesiredLaneSplineID: -1,
-			PreferenceCooldown:  rand.Float32() * preferenceChangeCooldownS,
+			DesiredLaneSplineID:  -1,
+			PreferenceCooldown:   rand.Float32() * preferenceChangeCooldownS,
+			VehicleKind:          vehicleKind,
+			NextBusStopIndex:     entry.NextBusStopIndex,
+			BusStopTimer:         entry.BusStopTimer,
+			BusStopDuration:      entry.BusStopDuration,
 		}
 		if car.CurveSpeedMultiplier == 0 {
 			car.CurveSpeedMultiplier = randRange(0.8, 1.2)
+		}
+		if car.VehicleKind == VehicleBus {
+			for _, route := range loadedRoutes {
+				if route.ID == car.RouteID {
+					car.DestinationSplineID = currentRouteTarget(route, car.NextBusStopIndex)
+					break
+				}
+			}
 		}
 		loadedCars = append(loadedCars, car)
 	}
@@ -6038,6 +6696,20 @@ func randomizedSpawnDelay(spawnPerMinute float32) float32 {
 	lambda := float64(spawnPerMinute) / 60.0
 	u := math.Max(rand.Float64(), 1e-5)
 	return float32(-math.Log(u) / lambda)
+}
+
+func vehicleKindString(kind VehicleKind) string {
+	if kind == VehicleBus {
+		return "bus"
+	}
+	return "car"
+}
+
+func vehicleKindFromString(s string) VehicleKind {
+	if strings.EqualFold(s, "bus") {
+		return VehicleBus
+	}
+	return VehicleCar
 }
 
 var routePalette = []rl.Color{
