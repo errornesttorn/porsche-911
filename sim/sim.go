@@ -10,6 +10,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 )
 
 type VehicleKind int
@@ -340,6 +341,13 @@ type World struct {
 	BasePathMisses  int
 	AllPathHits     int
 	AllPathMisses   int
+
+	RouteVisualsMS float64
+	LaneChangesMS  float64
+	GraphBuildMS   float64
+	BrakingMS      float64
+	FollowMS       float64
+	UpdateCarsMS   float64
 }
 
 func NewWorld() World {
@@ -394,27 +402,54 @@ func (w *World) ResetTransientState() {
 	w.HoldBlameLinks = nil
 }
 
+func sinceMS(start time.Time) float64 {
+	return float64(time.Since(start).Microseconds()) / 1000.0
+}
+
 func (w *World) Step(dt float32) {
+	w.RouteVisualsMS = 0
+	w.LaneChangesMS = 0
+	w.GraphBuildMS = 0
+	w.BrakingMS = 0
+	w.FollowMS = 0
+	w.UpdateCarsMS = 0
+
+	graphStart := time.Now()
 	vehicleCounts := BuildVehicleCounts(w.Cars)
 	baseGraph := NewRoadGraph(w.Splines, vehicleCounts)
+	w.GraphBuildMS += sinceMS(graphStart)
 
 	w.RouteVisualsTimer -= dt
 	if w.RouteVisualsTimer <= 0 {
+		routeVisualsStart := time.Now()
 		w.Routes = UpdateRouteVisualsWithGraph(w.Routes, baseGraph)
+		w.RouteVisualsMS = sinceMS(routeVisualsStart)
 		w.RouteVisualsTimer = 0.5
 	}
 
+	laneChangesStart := time.Now()
 	w.LaneChangeSplines, w.Cars = computeLaneChanges(w.Cars, w.Splines, w.LaneChangeSplines, &w.NextSplineID, baseGraph, dt)
+	w.LaneChangesMS = sinceMS(laneChangesStart)
 
+	graphStart = time.Now()
 	allSplines := mergedSplines(w.Splines, w.LaneChangeSplines)
 	allGraph := NewRoadGraph(allSplines, vehicleCounts)
+	w.GraphBuildMS += sinceMS(graphStart)
 
+	brakingStart := time.Now()
 	brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks := computeBrakingDecisions(w.Cars, allGraph)
+	w.BrakingMS = sinceMS(brakingStart)
+
+	followStart := time.Now()
 	followCaps := computeFollowingSpeedCaps(w.Cars, allGraph)
+	w.FollowMS = sinceMS(followStart)
+
+	updateCarsStart := time.Now()
 	w.Cars = updateCars(w.Cars, w.Routes, allGraph, brakingDecisions, holdSpeedDecisions, followCaps, w.TrafficLights, w.TrafficCycles, dt)
 	w.LaneChangeSplines = gcLaneChangeSplines(w.LaneChangeSplines, w.Cars)
 	w.Routes, w.Cars = updateRouteSpawning(w.Routes, w.Cars, w.Splines, dt)
 	w.TrafficCycles = UpdateTrafficCycles(w.TrafficCycles, dt)
+	w.UpdateCarsMS = sinceMS(updateCarsStart)
 
 	w.DebugBlameLinks = debugBlameLinks
 	w.HoldBlameLinks = holdBlameLinks

@@ -698,9 +698,7 @@ func main() {
 		}
 
 		if !paused {
-			stageStart := time.Now()
 			world.Step(dt)
-			frameProf.updateCarsMS = sinceMS(stageStart)
 		}
 
 		splines := world.Splines
@@ -733,6 +731,12 @@ func main() {
 		frameProf.basePathMisses = world.BasePathMisses
 		frameProf.allPathHits = world.AllPathHits
 		frameProf.allPathMisses = world.AllPathMisses
+		frameProf.routeVisualsMS = world.RouteVisualsMS
+		frameProf.laneChangesMS = world.LaneChangesMS
+		frameProf.graphBuildMS = world.GraphBuildMS
+		frameProf.brakingMS = world.BrakingMS
+		frameProf.followMS = world.FollowMS
+		frameProf.updateCarsMS = world.UpdateCarsMS
 
 		if routePanel.Open {
 			var applied bool
