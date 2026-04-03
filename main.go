@@ -1,20 +1,18 @@
 package main
 
 import (
-	"container/heap"
-	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
+	simpkg "mygame/sim"
 )
 
 // Run with:
@@ -61,7 +59,7 @@ type Stage int
 
 type EndKind int
 
-type VehicleKind int
+type VehicleKind = simpkg.VehicleKind
 
 const (
 	ModeEdit EditorMode = iota
@@ -76,8 +74,8 @@ const (
 )
 
 const (
-	VehicleCar VehicleKind = iota
-	VehicleBus
+	VehicleCar = simpkg.VehicleCar
+	VehicleBus = simpkg.VehicleBus
 )
 
 const (
@@ -171,32 +169,81 @@ const (
 	wheelbaseFrac float32 = rearPivotFrac - frontPivotFrac // 0.60
 )
 
-type Spline struct {
-	ID       int
-	Priority bool
-	BusOnly  bool
+type Vec2 = simpkg.Vec2
 
-	P0 rl.Vector2
-	P1 rl.Vector2
-	P2 rl.Vector2
-	P3 rl.Vector2
-
-	Length         float32
-	SpeedFactor    float32
-	Samples        [simSamples + 1]rl.Vector2
-	CumLen         [simSamples + 1]float32
-	HardCoupledIDs []int     // parallel lanes that also act as pathfinding neighbours
-	SoftCoupledIDs []int     // parallel lanes used for lane-changes only, not routing
-	SpeedLimitKmh  float32   // 0 = no limit
-	LanePreference int       // 0 = none; lower = higher preference
-	CurveSpeedMPS  []float32 // max speed at each curveSpeedIntervalM mark along the spline
-	TravelTimeS    float32   // traversal time at spline max speed without congestion
+func NewVec2(x, y float32) Vec2 {
+	return simpkg.NewVec2(x, y)
 }
 
+func toRLVec2(v Vec2) rl.Vector2 {
+	return rl.Vector2{X: v.X, Y: v.Y}
+}
+
+func fromRLVec2(v rl.Vector2) Vec2 {
+	return Vec2{X: v.X, Y: v.Y}
+}
+
+type Color = simpkg.Color
+
+func NewColor(r, g, b, a uint8) Color {
+	return simpkg.NewColor(r, g, b, a)
+}
+
+func toRLColor(c Color) rl.Color {
+	return rl.Color(c)
+}
+
+func fromRLColor(c rl.Color) Color {
+	return Color(c)
+}
+
+func drawCircleV(center Vec2, radius float32, color Color) {
+	rl.DrawCircleV(toRLVec2(center), radius, color)
+}
+
+func drawRing(center Vec2, innerRadius, outerRadius, startAngle, endAngle float32, segments int32, color Color) {
+	rl.DrawRing(toRLVec2(center), innerRadius, outerRadius, startAngle, endAngle, segments, color)
+}
+
+func drawLineEx(startPos, endPos Vec2, thick float32, color Color) {
+	rl.DrawLineEx(toRLVec2(startPos), toRLVec2(endPos), thick, color)
+}
+
+func drawLineV(startPos, endPos Vec2, color Color) {
+	rl.DrawLineV(toRLVec2(startPos), toRLVec2(endPos), color)
+}
+
+func drawCircleLinesV(center Vec2, radius float32, color Color) {
+	rl.DrawCircleLinesV(toRLVec2(center), radius, color)
+}
+
+func drawRectanglePro(rec rl.Rectangle, origin Vec2, rotation float32, color Color) {
+	rl.DrawRectanglePro(rec, toRLVec2(origin), rotation, color)
+}
+
+func getWorldToScreen2D(position Vec2, camera rl.Camera2D) Vec2 {
+	return fromRLVec2(rl.GetWorldToScreen2D(toRLVec2(position), camera))
+}
+
+func bezierPoint(p0, p1, p2, p3 Vec2, t float32) Vec2 {
+	u := 1 - t
+	uu := u * u
+	tt := t * t
+	uuu := uu * u
+	ttt := tt * t
+
+	return Vec2{
+		X: uuu*p0.X + 3*uu*t*p1.X + 3*u*tt*p2.X + ttt*p3.X,
+		Y: uuu*p0.Y + 3*uu*t*p1.Y + 3*u*tt*p2.Y + ttt*p3.Y,
+	}
+}
+
+type Spline = simpkg.Spline
+
 type Draft struct {
-	P0 rl.Vector2
-	P1 rl.Vector2
-	P2 rl.Vector2
+	P0 Vec2
+	P1 Vec2
+	P2 Vec2
 
 	HasP1 bool
 	HasP2 bool
@@ -211,41 +258,23 @@ type Draft struct {
 type CutDraft struct {
 	OriginalSplineID       int
 	OriginalSplinePriority bool
-	CutPoint               rl.Vector2
+	CutPoint               Vec2
 	CutT                   float32
 	// de Casteljau sub-spline control points
-	LeftP  [4]rl.Vector2 // left half  P0..P3
-	RightP [4]rl.Vector2 // right half P0..P3
+	LeftP  [4]Vec2 // left half  P0..P3
+	RightP [4]Vec2 // right half P0..P3
 }
 
 type EndHit struct {
 	SplineIndex int
 	SplineID    int
 	Kind        EndKind
-	Point       rl.Vector2
+	Point       Vec2
 }
 
-type BusStop struct {
-	SplineID int
-	WorldPos rl.Vector2
-}
+type BusStop = simpkg.BusStop
 
-type Route struct {
-	ID int
-
-	StartSplineID int
-	EndSplineID   int
-
-	PathIDs        []int
-	PathLength     float32
-	SpawnPerMinute float32
-	NextSpawnIn    float32
-	Valid          bool
-	ColorIndex     int
-	Color          rl.Color
-	VehicleKind    VehicleKind
-	BusStops       []BusStop
-}
+type Route = simpkg.Route
 
 type RoutePanel struct {
 	Open bool
@@ -268,131 +297,12 @@ type RoutePanel struct {
 // Trailer is an optional cargo trailer towed by a Car.
 // Its front hitch is rigidly the cab's RearPosition; its own RearPosition is
 // pulled toward the hitch each tick, exactly mirroring the cab's rear-pull logic.
-type Trailer struct {
-	HasTrailer   bool
-	Length       float32
-	Width        float32
-	Color        rl.Color
-	RearPosition rl.Vector2 // trailer rear axle, world space
-}
+type Trailer = simpkg.Trailer
+type Car = simpkg.Car
+type TrajectorySample = simpkg.TrajectorySample
+type CollisionPrediction = simpkg.CollisionPrediction
 
-type Car struct {
-	RouteID int
-
-	CurrentSplineID     int
-	DestinationSplineID int
-	PrevSplineIDs       [2]int     // last two splines before current; -1 = none
-	DistanceOnSpline    float32    // arc-length of the car's FRONT pivot on the current spline
-	RearPosition        rl.Vector2 // world-space position of the rear pivot; pulled each tick
-	// LateralOffset is the signed lateral displacement of the front pivot from the spline
-	// centre-line (positive = right of travel). It is smoothly driven toward a target
-	// value derived from local curvature so that the car body stays centred over the
-	// road instead of drifting to the inside on bends.
-	LateralOffset        float32
-	Speed                float32
-	MaxSpeed             float32
-	Accel                float32
-	Length               float32
-	Width                float32
-	CurveSpeedMultiplier float32 // per-car multiplier on curvature speed limits (0.8–1.2)
-	Color                rl.Color
-	Braking              bool
-	SoftSlowing          bool // capped by a leading car's speed (follow-cap mechanism)
-
-	// Lane-change state.
-	LaneChanging       bool
-	LaneChangeSplineID int     // ID of the temporary bridging spline; -1 = none
-	AfterSplineID      int     // destination spline to continue on after the bridge
-	AfterSplineDist    float32 // arc-length on AfterSplineID where the bridge lands
-	// Forced lane-switch state (set when no direct path exists but a hard-coupled
-	// neighbour of the next physical spline does have a path).
-	DesiredLaneSplineID int     // spline to merge into; -1 = none
-	DesiredLaneDeadline float32 // arc-length on current spline beyond which the switch must start
-
-	PreferenceCooldown float32 // seconds until the next preference-based lane-change check
-	SlowedTimer        float32 // seconds the car has been held back by a leader
-	OvertakeCooldown   float32 // seconds until the next overtake attempt is allowed
-	VehicleKind        VehicleKind
-	NextBusStopIndex   int
-	BusStopTimer       float32
-	BusStopDuration    float32
-
-	Trailer Trailer
-}
-
-type TrajectorySample struct {
-	Time     float32
-	Position rl.Vector2
-	Heading  rl.Vector2
-	Priority bool
-	SplineID int
-	// Trailer fields (zero value = no trailer).
-	HasTrailer      bool
-	TrailerPosition rl.Vector2
-	TrailerHeading  rl.Vector2
-}
-
-type CollisionPrediction struct {
-	Time            float32
-	PosA            rl.Vector2
-	PosB            rl.Vector2
-	PrevPosA        rl.Vector2
-	PrevPosB        rl.Vector2
-	HeadingA        rl.Vector2
-	HeadingB        rl.Vector2
-	AlreadyCollided bool
-	PriorityA       bool
-	PriorityB       bool
-	SplineAID       int
-	SplineBID       int
-}
-
-type pathCacheKey struct {
-	StartID     int
-	EndID       int
-	VehicleKind VehicleKind
-}
-
-type pathCacheEntry struct {
-	PathIDs []int
-	Cost    float32
-	OK      bool
-}
-
-type dijkstraItem struct {
-	idx  int
-	dist float32
-}
-
-type dijkstraHeap []dijkstraItem
-
-func (h dijkstraHeap) Len() int            { return len(h) }
-func (h dijkstraHeap) Less(i, j int) bool  { return h[i].dist < h[j].dist }
-func (h dijkstraHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *dijkstraHeap) Push(x interface{}) { *h = append(*h, x.(dijkstraItem)) }
-func (h *dijkstraHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	item := old[n-1]
-	*h = old[:n-1]
-	return item
-}
-
-type RoadGraph struct {
-	splines         []Spline
-	indexByID       map[int]int
-	startsByNode    map[string][]int
-	routeNeighbors  [][]int
-	segmentCosts    []float32
-	pathCache       map[pathCacheKey]pathCacheEntry
-	pathCacheHits   int
-	pathCacheMisses int
-}
-
-type carPose struct {
-	pos     rl.Vector2
-	heading rl.Vector2
-}
+type RoadGraph = simpkg.RoadGraph
 
 type frameProfile struct {
 	frameMS        float64
@@ -447,162 +357,21 @@ func sinceMS(start time.Time) float64 {
 	return float64(time.Since(start).Microseconds()) / 1000.0
 }
 
-func newRoadGraph(splines []Spline, vehicleCounts map[int]int) *RoadGraph {
-	indexByID := buildSplineIndexByID(splines)
-	startsByNode := buildStartsByNode(splines)
-	routeNeighbors := make([][]int, len(splines))
-	segmentCosts := make([]float32, len(splines))
-	for i, spline := range splines {
-		segmentCosts[i] = segmentTravelCost(spline, vehicleCounts)
-		next := startsByNode[pointKey(spline.P3)]
-		if len(next) > 0 {
-			routeNeighbors[i] = append([]int(nil), expandWithCoupledNeighbors(next, splines, indexByID)...)
-		}
-	}
-	return &RoadGraph{
-		splines:        splines,
-		indexByID:      indexByID,
-		startsByNode:   startsByNode,
-		routeNeighbors: routeNeighbors,
-		segmentCosts:   segmentCosts,
-		pathCache:      make(map[pathCacheKey]pathCacheEntry),
-	}
-}
-
-func (g *RoadGraph) splineByID(id int) (Spline, bool) {
-	idx, ok := g.indexByID[id]
-	if !ok {
-		return Spline{}, false
-	}
-	return g.splines[idx], true
-}
-
-func (g *RoadGraph) nextPhysicalIndices(currentSplineID int) []int {
-	currentSpline, ok := g.splineByID(currentSplineID)
-	if !ok {
-		return nil
-	}
-	return g.startsByNode[pointKey(currentSpline.P3)]
-}
-
-type DebugBlameLink struct {
-	FromCarIndex int
-	ToCarIndex   int
-}
-
-type SavedSplineFile struct {
-	Splines       []SavedSpline       `json:"splines"`
-	Routes        []SavedRoute        `json:"routes,omitempty"`
-	Cars          []SavedCar          `json:"cars,omitempty"`
-	TrafficLights []SavedTrafficLight `json:"traffic_lights,omitempty"`
-	TrafficCycles []SavedTrafficCycle `json:"traffic_cycles,omitempty"`
-}
-
-type SavedTrafficLight struct {
-	ID           int     `json:"id"`
-	SplineID     int     `json:"spline_id"`
-	DistOnSpline float32 `json:"dist_on_spline"`
-	WorldPosX    float32 `json:"world_pos_x"`
-	WorldPosY    float32 `json:"world_pos_y"`
-	CycleID      int     `json:"cycle_id"`
-}
-
-type SavedTrafficPhase struct {
-	DurationSecs          float32 `json:"duration_secs"`
-	ClearanceDurationSecs float32 `json:"clearance_duration_secs,omitempty"`
-	GreenLightIDs         []int   `json:"green_light_ids,omitempty"`
-}
-
-type SavedTrafficCycle struct {
-	ID                 int                 `json:"id"`
-	Enabled            bool                `json:"enabled"`
-	YellowDurationSecs float32             `json:"yellow_duration_secs,omitempty"`
-	Phases             []SavedTrafficPhase `json:"phases,omitempty"`
-}
-
-type SavedSpline struct {
-	ID             int        `json:"id"`
-	Priority       bool       `json:"priority"`
-	BusOnly        bool       `json:"bus_only,omitempty"`
-	P0             rl.Vector2 `json:"p0"`
-	P1             rl.Vector2 `json:"p1"`
-	P2             rl.Vector2 `json:"p2"`
-	P3             rl.Vector2 `json:"p3"`
-	HardCoupledIDs []int      `json:"hard_coupled_ids,omitempty"`
-	SoftCoupledIDs []int      `json:"soft_coupled_ids,omitempty"`
-	SpeedLimitKmh  float32    `json:"speed_limit_kmh,omitempty"`
-	LanePreference int        `json:"lane_preference,omitempty"`
-}
-
-type SavedBusStop struct {
-	SplineID  int     `json:"spline_id"`
-	WorldPosX float32 `json:"world_pos_x"`
-	WorldPosY float32 `json:"world_pos_y"`
-}
-
-type SavedRoute struct {
-	ID             int            `json:"id"`
-	StartSplineID  int            `json:"start_spline_id"`
-	EndSplineID    int            `json:"end_spline_id"`
-	PathIDs        []int          `json:"path_ids"`
-	SpawnPerMinute float32        `json:"spawn_per_minute"`
-	ColorIndex     int            `json:"color_index,omitempty"`
-	VehicleKind    string         `json:"vehicle_kind,omitempty"`
-	BusStops       []SavedBusStop `json:"bus_stops,omitempty"`
-}
-
-type SavedCar struct {
-	RouteID              int     `json:"route_id"`
-	CurrentSplineID      int     `json:"current_spline_id"`
-	DestinationSplineID  int     `json:"destination_spline_id"`
-	DistanceOnSpline     float32 `json:"distance_on_spline"`
-	Speed                float32 `json:"speed"`
-	MaxSpeed             float32 `json:"max_speed"`
-	Accel                float32 `json:"accel"`
-	Length               float32 `json:"length"`
-	Width                float32 `json:"width"`
-	CurveSpeedMultiplier float32 `json:"curve_speed_multiplier,omitempty"`
-	VehicleKind          string  `json:"vehicle_kind,omitempty"`
-	NextBusStopIndex     int     `json:"next_bus_stop_index,omitempty"`
-	BusStopTimer         float32 `json:"bus_stop_timer,omitempty"`
-	BusStopDuration      float32 `json:"bus_stop_duration,omitempty"`
-}
+type DebugBlameLink = simpkg.DebugBlameLink
 
 // ---------- traffic lights ----------
 
-type TrafficState int
+type TrafficState = simpkg.TrafficState
 
 const (
-	TrafficRed    TrafficState = iota
-	TrafficYellow TrafficState = iota
-	TrafficGreen  TrafficState = iota
+	TrafficRed    = simpkg.TrafficRed
+	TrafficYellow = simpkg.TrafficYellow
+	TrafficGreen  = simpkg.TrafficGreen
 )
 
-// TrafficLight is a stop/go point placed on a spline.
-type TrafficLight struct {
-	ID           int
-	SplineID     int
-	DistOnSpline float32
-	WorldPos     rl.Vector2
-	CycleID      int // -1 = pending (not yet in any cycle)
-}
-
-// TrafficPhase is one step of a cycle. Each light not listed in GreenLightIDs is red.
-type TrafficPhase struct {
-	DurationSecs          float32
-	ClearanceDurationSecs float32 // duration of the yellow clearance phase automatically inserted after this phase
-	GreenLightIDs         []int   // IDs of lights that are green; all others are red
-}
-
-// TrafficCycle groups lights that share a timed phase sequence.
-type TrafficCycle struct {
-	ID         int
-	LightIDs   []int
-	Phases     []TrafficPhase
-	Timer      float32
-	PhaseIndex int  // which phase is currently active
-	Enabled    bool // when false the cycle is paused and all lights show red
-}
+type TrafficLight = simpkg.TrafficLight
+type TrafficPhase = simpkg.TrafficPhase
+type TrafficCycle = simpkg.TrafficCycle
 
 // ---------- ui font ----------
 
@@ -646,15 +415,15 @@ func toolbarBtnRect(i int) rl.Rectangle {
 	return rl.NewRectangle(x, float32(toolbarY), toolbarBtnW, toolbarBtnH)
 }
 
-func isMouseOverToolbar(mouse rl.Vector2) bool {
+func isMouseOverToolbar(mouse Vec2) bool {
 	n := len(toolbarItems)
 	totalW := float32(n*toolbarBtnW + (n-1)*toolbarBtnGap)
 	return mouse.X >= float32(toolbarX) && mouse.X <= float32(toolbarX)+totalW &&
 		mouse.Y >= float32(toolbarY) && mouse.Y <= float32(toolbarY+toolbarBtnH)
 }
 
-func drawText(text string, x, y, size int32, color rl.Color) {
-	rl.DrawTextEx(uiFont, text, rl.NewVector2(float32(x), float32(y)), float32(size), 1, color)
+func drawText(text string, x, y, size int32, color Color) {
+	rl.DrawTextEx(uiFont, text, rl.NewVector2(float32(x), float32(y)), float32(size), 1, toRLColor(color))
 }
 
 func measureText(text string, size int32) int32 {
@@ -683,10 +452,7 @@ func main() {
 		1,
 	)
 
-	splines := make([]Spline, 0, 128)
-	laneChangeSplines := make([]Spline, 0, 32)
-	routes := make([]Route, 0, 32)
-	cars := make([]Car, 0, 256)
+	world := simpkg.NewWorld()
 
 	mode := ModeEdit
 	stage := StageIdle
@@ -701,12 +467,6 @@ func main() {
 	prof := profiler{}
 	selectedSpeedKmh := 50
 	lastPref := 0
-	nextSplineID := 1
-	nextRouteID := 1
-	nextLightID := 1
-	nextCycleID := 1
-	trafficLights := make([]TrafficLight, 0)
-	trafficCycles := make([]TrafficCycle, 0)
 	pendingLights := make([]TrafficLight, 0)
 	editingCycleID := -1   // >= 0 when a cycle is open in the panel
 	editingLights := false // true when the "Edit Lights" sub-mode is active
@@ -718,7 +478,6 @@ func main() {
 	paused := false
 	noticeText := ""
 	noticeTimer := float32(0)
-	routeVisualsTimer := float32(0)
 
 	for !rl.WindowShouldClose() {
 		frameStart := time.Now()
@@ -862,11 +621,11 @@ func main() {
 				noticeText = fmt.Sprintf("Save failed: %v", err)
 				noticeTimer = 3.0
 			} else if path != "" {
-				if err := saveSplineFile(splines, routes, cars, trafficLights, trafficCycles, path); err != nil {
+				if err := world.Save(path); err != nil {
 					noticeText = fmt.Sprintf("Save failed: %v", err)
 				} else {
 					noticeText = fmt.Sprintf("Saved %d splines, %d routes, %d cars, %d lights to %s",
-						len(splines), len(routes), len(cars), len(trafficLights), path)
+						len(world.Splines), len(world.Routes), len(world.Cars), len(world.TrafficLights), path)
 				}
 				noticeTimer = 3.0
 			}
@@ -877,21 +636,15 @@ func main() {
 				noticeText = fmt.Sprintf("Load failed: %v", err)
 				noticeTimer = 3.0
 			} else if path != "" {
-				loadedSplines, loadedRoutes, loadedCars, loadedLights, loadedCycles,
-					loadedNextSplineID, loadedNextRouteID, loadedNextLightID, loadedNextCycleID, err := loadSplineFile(path)
+				loadedWorld, err := simpkg.LoadWorld(path)
 				if err != nil {
 					noticeText = fmt.Sprintf("Load failed: %v", err)
 					noticeTimer = 3.0
 				} else {
-					splines = loadedSplines
-					routes = loadedRoutes
-					cars = loadedCars
-					trafficLights = loadedLights
-					trafficCycles = loadedCycles
+					world = *loadedWorld
 					stage = StageIdle
 					draft = newDraft()
 					cutDraft = newCutDraft()
-					laneChangeSplines = laneChangeSplines[:0]
 					routePanel = RoutePanel{}
 					routeStartSplineID = -1
 					coupleModeFirstID = -1
@@ -902,13 +655,9 @@ func main() {
 					activeDurInput = -1
 					durInputStr = ""
 					pendingLights = pendingLights[:0]
-					nextSplineID = loadedNextSplineID
-					nextRouteID = loadedNextRouteID
-					nextLightID = loadedNextLightID
-					nextCycleID = loadedNextCycleID
-					lastPref = maxLoadedPreference(loadedSplines)
+					lastPref = maxLoadedPreference(world.Splines)
 					noticeText = fmt.Sprintf("Loaded %d splines, %d routes, %d cars, %d lights from %s",
-						len(splines), len(routes), len(cars), len(trafficLights), path)
+						len(world.Splines), len(world.Routes), len(world.Cars), len(world.TrafficLights), path)
 					noticeTimer = 3.0
 				}
 			}
@@ -919,14 +668,15 @@ func main() {
 			zoomCameraToMouse(&camera, wheel)
 		}
 
-		mouseScreen := rl.GetMousePosition()
-		mouseWorld := rl.GetScreenToWorld2D(mouseScreen, camera)
+		mouseScreenRL := rl.GetMousePosition()
+		mouseScreen := fromRLVec2(mouseScreenRL)
+		mouseWorld := fromRLVec2(rl.GetScreenToWorld2D(mouseScreenRL, camera))
 		mouseOnToolbar := isMouseOverToolbar(mouseScreen)
 
 		// Toolbar click — switch mode / toggle debug
 		if rl.IsMouseButtonPressed(rl.MouseButtonLeft) && mouseOnToolbar {
 			for i, item := range toolbarItems {
-				if rl.CheckCollisionPointRec(mouseScreen, toolbarBtnRect(i)) {
+				if rl.CheckCollisionPointRec(mouseScreenRL, toolbarBtnRect(i)) {
 					if item.isDbg {
 						debugMode = !debugMode
 					} else if item.isHitbox {
@@ -945,6 +695,23 @@ func main() {
 			}
 		}
 
+		if !paused {
+			stageStart := time.Now()
+			world.Step(dt)
+			frameProf.updateCarsMS = sinceMS(stageStart)
+		}
+
+		splines := world.Splines
+		laneChangeSplines := world.LaneChangeSplines
+		routes := world.Routes
+		cars := world.Cars
+		trafficLights := world.TrafficLights
+		trafficCycles := world.TrafficCycles
+		nextSplineID := world.NextSplineID
+		nextRouteID := world.NextRouteID
+		nextLightID := world.NextLightID
+		nextCycleID := world.NextCycleID
+
 		hoverRadius := pixelsToWorld(camera.Zoom, hoverPixels)
 		snapRadius := pixelsToWorld(camera.Zoom, snapPixels)
 		handleRadius := pixelsToWorld(camera.Zoom, handlePixels)
@@ -955,44 +722,15 @@ func main() {
 		hoveredStart := findNearbyStart(splines, mouseWorld, snapRadius)
 
 		frameProf.inputMS = sinceMS(inputStart)
-		vehicleCounts := buildVehicleCounts(cars)
-		graphStart := time.Now()
-		baseGraph := newRoadGraph(splines, vehicleCounts)
-		routeVisualsTimer -= dt
-		if routeVisualsTimer <= 0 {
-			stageStart := time.Now()
-			routes = updateRouteVisualsWithGraph(routes, baseGraph)
-			routeVisualsTimer = 0.5
-			frameProf.routeVisualsMS = sinceMS(stageStart)
-		}
-		if !paused {
-			stageStart := time.Now()
-			laneChangeSplines, cars = computeLaneChanges(cars, splines, laneChangeSplines, &nextSplineID, baseGraph, dt)
-			frameProf.laneChangesMS = sinceMS(stageStart)
-		}
-		allSplines := mergedSplines(splines, laneChangeSplines)
-		allGraph := newRoadGraph(allSplines, vehicleCounts)
-		frameProf.graphBuildMS = sinceMS(graphStart)
-		var brakingDecisions, holdSpeedDecisions []bool
-		var debugBlameLinks, holdBlameLinks []DebugBlameLink
-		if !paused {
-			stageStart := time.Now()
-			brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks = computeBrakingDecisions(cars, allGraph)
-			frameProf.brakingMS = sinceMS(stageStart)
-			stageStart = time.Now()
-			followCaps := computeFollowingSpeedCaps(cars, allGraph)
-			frameProf.followMS = sinceMS(stageStart)
-			stageStart = time.Now()
-			cars = updateCars(cars, routes, allGraph, brakingDecisions, holdSpeedDecisions, followCaps, trafficLights, trafficCycles, dt)
-			frameProf.updateCarsMS = sinceMS(stageStart)
-			laneChangeSplines = gcLaneChangeSplines(laneChangeSplines, cars)
-			routes, cars = updateRouteSpawning(routes, cars, splines, dt)
-			trafficCycles = updateTrafficCycles(trafficCycles, dt)
-		}
-		frameProf.basePathHits = baseGraph.pathCacheHits
-		frameProf.basePathMisses = baseGraph.pathCacheMisses
-		frameProf.allPathHits = allGraph.pathCacheHits
-		frameProf.allPathMisses = allGraph.pathCacheMisses
+		vehicleCounts := simpkg.BuildVehicleCounts(cars)
+		baseGraph := simpkg.NewRoadGraph(splines, vehicleCounts)
+		allSplines := simpkg.MergedSplines(splines, laneChangeSplines)
+		debugBlameLinks := world.DebugBlameLinks
+		holdBlameLinks := world.HoldBlameLinks
+		frameProf.basePathHits = world.BasePathHits
+		frameProf.basePathMisses = world.BasePathMisses
+		frameProf.allPathHits = world.AllPathHits
+		frameProf.allPathMisses = world.AllPathMisses
 
 		if routePanel.Open {
 			var applied bool
@@ -1076,7 +814,7 @@ func main() {
 					}
 				}
 				pr := trafficCyclePanelRect(editingCycleID >= 0, phaseCount, len(pendingLights))
-				overPanel := rl.CheckCollisionPointRec(mouseScreen, pr)
+				overPanel := rl.CheckCollisionPointRec(mouseScreenRL, pr)
 
 				// ── keyboard ──────────────────────────────────────────────
 				if rl.IsKeyPressed(rl.KeyEscape) {
@@ -1129,7 +867,7 @@ func main() {
 									activeField = getPhaseRowBtns(pr, clrIdx).clearField
 								}
 							}
-							if !rl.CheckCollisionPointRec(mouseScreen, activeField) {
+							if !rl.CheckCollisionPointRec(mouseScreenRL, activeField) {
 								trafficCycles = commitDurInput(trafficCycles, editingCycleID, activeDurInput, durInputStr)
 								activeDurInput = -1
 								durInputStr = ""
@@ -1154,7 +892,7 @@ func main() {
 						// new-cycle panel: Create button
 						if len(pendingLights) > 0 {
 							btn := trafficCreateBtnRect(len(pendingLights))
-							if rl.CheckCollisionPointRec(mouseScreen, btn) {
+							if rl.CheckCollisionPointRec(mouseScreenRL, btn) {
 								pendingLights, trafficLights, trafficCycles, editingCycleID = doCreateTrafficCycle(pendingLights, trafficLights, trafficCycles, &nextCycleID)
 							}
 						}
@@ -1162,7 +900,7 @@ func main() {
 						// cycle editor panel
 						onOffBtnR, editLightsBtn, closeBtnR := trafficHeaderBtnRects(pr)
 						// On/Off toggle
-						if rl.CheckCollisionPointRec(mouseScreen, onOffBtnR) {
+						if rl.CheckCollisionPointRec(mouseScreenRL, onOffBtnR) {
 							trafficCycles = trafficToggleCycleEnabled(trafficCycles, editingCycleID)
 							// turning on: clear all editing/preview state
 							if !cycleIsOn {
@@ -1174,25 +912,25 @@ func main() {
 							}
 						}
 						// Edit Lights toggle (only when cycle is off)
-						if !cycleIsOn && rl.CheckCollisionPointRec(mouseScreen, editLightsBtn) {
+						if !cycleIsOn && rl.CheckCollisionPointRec(mouseScreenRL, editLightsBtn) {
 							editingLights = !editingLights
 							editingPhaseIdx = -1
 						}
-						if rl.CheckCollisionPointRec(mouseScreen, closeBtnR) {
+						if rl.CheckCollisionPointRec(mouseScreenRL, closeBtnR) {
 							editingCycleID = -1
 							editingLights = false
 							editingPhaseIdx = -1
 							showPhaseIdx = -1
 						}
 						// Add Phase button (only when cycle is off)
-						if !cycleIsOn && rl.CheckCollisionPointRec(mouseScreen, trafficAddPhaseBtnRect(pr)) {
+						if !cycleIsOn && rl.CheckCollisionPointRec(mouseScreenRL, trafficAddPhaseBtnRect(pr)) {
 							trafficCycles = trafficAddPhase(trafficCycles, editingCycleID)
 						}
 						// Per-phase row buttons
 						for pi := 0; pi < phaseCount; pi++ {
 							row := getPhaseRowBtns(pr, pi)
 							// Show (cycle off) / Skip (cycle on) button: always active
-							if rl.CheckCollisionPointRec(mouseScreen, row.showBtn) {
+							if rl.CheckCollisionPointRec(mouseScreenRL, row.showBtn) {
 								if cycleIsOn {
 									trafficCycles = trafficSkipToPhase(trafficCycles, editingCycleID, pi)
 								} else {
@@ -1206,7 +944,7 @@ func main() {
 							}
 							// Editing buttons: only when cycle is off
 							if !cycleIsOn {
-								if rl.CheckCollisionPointRec(mouseScreen, row.upBtn) && pi > 0 {
+								if rl.CheckCollisionPointRec(mouseScreenRL, row.upBtn) && pi > 0 {
 									trafficCycles = trafficMovePhase(trafficCycles, editingCycleID, pi, -1)
 									if editingPhaseIdx == pi {
 										editingPhaseIdx--
@@ -1215,7 +953,7 @@ func main() {
 										showPhaseIdx--
 									}
 								}
-								if rl.CheckCollisionPointRec(mouseScreen, row.downBtn) && pi < phaseCount-1 {
+								if rl.CheckCollisionPointRec(mouseScreenRL, row.downBtn) && pi < phaseCount-1 {
 									trafficCycles = trafficMovePhase(trafficCycles, editingCycleID, pi, +1)
 									if editingPhaseIdx == pi {
 										editingPhaseIdx++
@@ -1224,7 +962,7 @@ func main() {
 										showPhaseIdx++
 									}
 								}
-								if rl.CheckCollisionPointRec(mouseScreen, row.durField) {
+								if rl.CheckCollisionPointRec(mouseScreenRL, row.durField) {
 									for _, c := range trafficCycles {
 										if c.ID == editingCycleID && pi < len(c.Phases) {
 											activeDurInput = pi
@@ -1233,7 +971,7 @@ func main() {
 										}
 									}
 								}
-								if rl.CheckCollisionPointRec(mouseScreen, row.clearField) {
+								if rl.CheckCollisionPointRec(mouseScreenRL, row.clearField) {
 									for _, c := range trafficCycles {
 										if c.ID == editingCycleID && pi < len(c.Phases) {
 											activeDurInput = -(pi + 3)
@@ -1246,7 +984,7 @@ func main() {
 										}
 									}
 								}
-								if rl.CheckCollisionPointRec(mouseScreen, row.editBtn) {
+								if rl.CheckCollisionPointRec(mouseScreenRL, row.editBtn) {
 									if editingPhaseIdx == pi {
 										editingPhaseIdx = -1
 									} else {
@@ -1255,7 +993,7 @@ func main() {
 										showPhaseIdx = -1
 									}
 								}
-								if rl.CheckCollisionPointRec(mouseScreen, row.delBtn) {
+								if rl.CheckCollisionPointRec(mouseScreenRL, row.delBtn) {
 									trafficCycles = trafficDeletePhase(trafficCycles, editingCycleID, pi)
 									if editingPhaseIdx == pi {
 										editingPhaseIdx = -1
@@ -1302,6 +1040,17 @@ func main() {
 			}
 		}
 
+		world.Splines = splines
+		world.LaneChangeSplines = laneChangeSplines
+		world.Routes = routes
+		world.Cars = cars
+		world.TrafficLights = trafficLights
+		world.TrafficCycles = trafficCycles
+		world.NextSplineID = nextSplineID
+		world.NextRouteID = nextRouteID
+		world.NextLightID = nextLightID
+		world.NextCycleID = nextCycleID
+
 		drawStart := time.Now()
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.RayWhite)
@@ -1310,7 +1059,7 @@ func main() {
 		drawGrid(camera)
 		drawAxes(camera)
 
-		splineIndexByID := buildSplineIndexByID(splines)
+		splineIndexByID := simpkg.BuildSplineIndexByID(splines)
 		for _, route := range routes {
 			if !route.Valid {
 				continue
@@ -1322,7 +1071,7 @@ func main() {
 				PathIDs:       routePanel.PathIDs,
 				StartSplineID: routePanel.StartSplineID,
 				EndSplineID:   routePanel.EndSplineID,
-				Color:         routePaletteColor(routePanel.ColorIndex),
+				Color:         simpkg.RoutePaletteColor(routePanel.ColorIndex),
 				VehicleKind:   routePanel.VehicleKind,
 				BusStops:      routePanel.BusStops,
 				Valid:         true,
@@ -1337,22 +1086,22 @@ func main() {
 			}
 			if i == hoveredSpline {
 				if (mode == ModeEdit && stage == StageIdle) || mode == ModePriority {
-					color = rl.NewColor(242, 153, 74, 255)
+					color = NewColor(242, 153, 74, 255)
 					thickness = pixelsToWorld(camera.Zoom, 5)
 				}
 			}
 
 			drawSpline(spline, thickness, color)
-			drawEndpoint(spline.P0, handleRadius*0.8, rl.NewColor(60, 160, 90, 255))
-			drawEndpoint(spline.P3, handleRadius, rl.NewColor(50, 115, 225, 255))
+			drawEndpoint(spline.P0, handleRadius*0.8, NewColor(60, 160, 90, 255))
+			drawEndpoint(spline.P3, handleRadius, NewColor(50, 115, 225, 255))
 		}
 
 		if mode == ModeEdit {
 			if hoveredEnd.SplineIndex >= 0 && stage == StageIdle {
-				drawEndpoint(hoveredEnd.Point, handleRadius*1.5, rl.NewColor(255, 196, 61, 255))
+				drawEndpoint(hoveredEnd.Point, handleRadius*1.5, NewColor(255, 196, 61, 255))
 			}
 			if hoveredStart.SplineIndex >= 0 && stage == StageSetP3 {
-				drawEndpoint(hoveredStart.Point, handleRadius*1.5, rl.NewColor(163, 92, 255, 255))
+				drawEndpoint(hoveredStart.Point, handleRadius*1.5, NewColor(163, 92, 255, 255))
 			}
 
 			previewMouse := mouseWorld
@@ -1362,15 +1111,15 @@ func main() {
 			preview, hasPreview := buildPreview(stage, draft, previewMouse, hoveredStart, splines)
 			if hasPreview {
 				drawDraft(stage, draft, previewMouse, camera.Zoom)
-				drawSpline(preview, pixelsToWorld(camera.Zoom, 4), rl.NewColor(214, 76, 76, 255))
+				drawSpline(preview, pixelsToWorld(camera.Zoom, 4), NewColor(214, 76, 76, 255))
 			}
 		}
 
 		if mode == ModeRoute {
-			drawRoutePicking(routeStartSplineID, routePanel, hoveredStart, hoveredEnd, splines, vehicleCounts, camera.Zoom)
+			drawRoutePicking(routeStartSplineID, routePanel, hoveredStart, hoveredEnd, splines, baseGraph, camera.Zoom)
 		}
 		if mode == ModeBus {
-			drawRoutePicking(routeStartSplineID, routePanel, hoveredStart, hoveredEnd, splines, vehicleCounts, camera.Zoom)
+			drawRoutePicking(routeStartSplineID, routePanel, hoveredStart, hoveredEnd, splines, baseGraph, camera.Zoom)
 			if routePanel.Open && routePanel.AddingBusStop {
 				drawBusStopPlacementPreview(routePanel, splines, baseGraph, mouseWorld, camera.Zoom)
 			}
@@ -1385,22 +1134,22 @@ func main() {
 		if mode == ModeCut {
 			drawCutMode(stage, cutDraft, splines, mouseWorld, camera.Zoom)
 		}
-		allSplineIndexByID := buildSplineIndexByID(allSplines)
+		allSplineIndexByID := simpkg.BuildSplineIndexByID(allSplines)
 		drawCars(cars, allSplines, allSplineIndexByID, camera.Zoom, debugMode)
 		if hitboxDebugMode {
 			drawCarHitboxes(cars, allSplines, allSplineIndexByID)
 		}
 		if debugMode {
-			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, rl.NewColor(220, 50, 50, 220))
-			drawDebugBlameLinks(holdBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, rl.NewColor(255, 165, 0, 220))
+			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(220, 50, 50, 220))
+			drawDebugBlameLinks(holdBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(255, 165, 0, 220))
 			drawLaneChangeSplines(laneChangeSplines, camera.Zoom)
 		}
 		drawTrafficLights(trafficLights, pendingLights, trafficCycles, editingCycleID, editingPhaseIdx, showPhaseIdx, camera.Zoom)
 		if mode == ModeTrafficLight && (editingCycleID < 0 || editingLights) && editingPhaseIdx < 0 {
 			if _, _, snap, found := findNearestSplinePoint(splines, mouseWorld); found {
 				r := pixelsToWorld(camera.Zoom, 8)
-				rl.DrawCircleV(snap, r, rl.NewColor(255, 200, 0, 180))
-				rl.DrawRing(snap, r*0.6, r, 0, 360, 16, rl.NewColor(220, 160, 0, 220))
+				drawCircleV(snap, r, NewColor(255, 200, 0, 180))
+				drawRing(snap, r*0.6, r, 0, 360, 16, NewColor(220, 160, 0, 220))
 			}
 		}
 		rl.EndMode2D()
@@ -1448,14 +1197,14 @@ func main() {
 	}
 }
 
-func snapToGrid(v rl.Vector2, gridSize float32) rl.Vector2 {
-	return rl.Vector2{
+func snapToGrid(v Vec2, gridSize float32) Vec2 {
+	return Vec2{
 		X: float32(math.Round(float64(v.X)/float64(gridSize))) * gridSize,
 		Y: float32(math.Round(float64(v.Y)/float64(gridSize))) * gridSize,
 	}
 }
 
-func handleEditMode(stage Stage, draft Draft, splines []Spline, hoveredSpline int, hoveredEnd EndHit, hoveredStart EndHit, mouseWorld rl.Vector2, nextSplineID int) (Stage, Draft, []Spline, int, bool) {
+func handleEditMode(stage Stage, draft Draft, splines []Spline, hoveredSpline int, hoveredEnd EndHit, hoveredStart EndHit, mouseWorld Vec2, nextSplineID int) (Stage, Draft, []Spline, int, bool) {
 	topologyChanged := false
 
 	if rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl) {
@@ -1516,7 +1265,7 @@ func handleEditMode(stage Stage, draft Draft, splines []Spline, hoveredSpline in
 				p3 = next.P0
 				p2 = vecSub(vecScale(p3, 2), next.P1)
 			}
-			spline := newSpline(nextSplineID, draft.P0, draft.P1, p2, p3)
+			spline := simpkg.NewSpline(nextSplineID, draft.P0, draft.P1, p2, p3)
 			nextSplineID++
 			splines = append(splines, spline)
 			stage = StageIdle
@@ -1540,7 +1289,7 @@ func handleRouteMode(routeStartSplineID int, routePanel RoutePanel, routes []Rou
 	if routeStartSplineID < 0 {
 		if hoveredStart.SplineID >= 0 {
 			if vehicleKind == VehicleCar {
-				if spline, ok := graph.splineByID(hoveredStart.SplineID); ok && spline.BusOnly {
+				if spline, ok := graph.SplineByID(hoveredStart.SplineID); ok && spline.BusOnly {
 					return routeStartSplineID, routePanel, "Bus-only splines cannot be used for car routes."
 				}
 			}
@@ -1553,7 +1302,7 @@ func handleRouteMode(routeStartSplineID int, routePanel RoutePanel, routes []Rou
 		return routeStartSplineID, routePanel, ""
 	}
 	if vehicleKind == VehicleCar {
-		if spline, ok := graph.splineByID(hoveredEnd.SplineID); ok && spline.BusOnly {
+		if spline, ok := graph.SplineByID(hoveredEnd.SplineID); ok && spline.BusOnly {
 			return routeStartSplineID, routePanel, "Bus-only splines cannot be used for car routes."
 		}
 	}
@@ -1564,7 +1313,7 @@ func handleRouteMode(routeStartSplineID int, routePanel RoutePanel, routes []Rou
 		EndSplineID:     hoveredEnd.SplineID,
 		VehicleKind:     vehicleKind,
 		SpawnPerMinute:  defaultSpawnPerMinute(vehicleKind),
-		ColorIndex:      pickNextColorIndex(routes),
+		ColorIndex:      simpkg.PickNextColorIndex(routes),
 		ExistingRouteID: findRouteID(routes, routeStartSplineID, hoveredEnd.SplineID, vehicleKind),
 	}
 	if panel.ExistingRouteID >= 0 {
@@ -1600,7 +1349,7 @@ func syncRoutePanelPath(panel RoutePanel, graph *RoadGraph) RoutePanel {
 		VehicleKind:   panel.VehicleKind,
 		BusStops:      append([]BusStop(nil), panel.BusStops...),
 	}
-	pathIDs, pathLength, notice, _ := computeRoutePathWithGraph(preview, graph)
+	pathIDs, pathLength, notice, _ := simpkg.ComputeRoutePathWithGraph(preview, graph)
 	panel.PathIDs = pathIDs
 	panel.PathLength = pathLength
 	if notice != "" {
@@ -1611,94 +1360,13 @@ func syncRoutePanelPath(panel RoutePanel, graph *RoadGraph) RoutePanel {
 	return panel
 }
 
-func computeRoutePathWithGraph(route Route, graph *RoadGraph) ([]int, float32, string, bool) {
-	if graph == nil {
-		return nil, 0, "", false
-	}
-	if route.VehicleKind == VehicleCar {
-		if startSpline, ok := graph.splineByID(route.StartSplineID); ok && startSpline.BusOnly {
-			return nil, 0, "Bus-only splines cannot be used for car routes.", false
-		}
-		if endSpline, ok := graph.splineByID(route.EndSplineID); ok && endSpline.BusOnly {
-			return nil, 0, "Bus-only splines cannot be used for car routes.", false
-		}
-	}
-	if route.VehicleKind != VehicleBus || len(route.BusStops) == 0 {
-		pathIDs, pathLength, ok := findShortestPathWeightedWithGraph(graph, route.StartSplineID, route.EndSplineID, route.VehicleKind)
-		if !ok {
-			return nil, 0, "No valid path between the selected start and destination.", false
-		}
-		return pathIDs, pathLength, "", ok
-	}
-
-	waypoints := make([]int, 0, len(route.BusStops)+2)
-	waypoints = append(waypoints, route.StartSplineID)
-	for _, stop := range route.BusStops {
-		waypoints = append(waypoints, stop.SplineID)
-	}
-	waypoints = append(waypoints, route.EndSplineID)
-
-	fullPath := make([]int, 0, 32)
-	totalCost := float32(0)
-	for i := 0; i < len(waypoints)-1; i++ {
-		segPath, segCost, ok := findShortestPathWeightedWithGraph(graph, waypoints[i], waypoints[i+1], route.VehicleKind)
-		if !ok || len(segPath) == 0 {
-			return nil, 0, fmt.Sprintf("Stop %d cannot be reached in sequence.", i+1), false
-		}
-		if len(fullPath) > 0 && fullPath[len(fullPath)-1] == segPath[0] {
-			segPath = segPath[1:]
-			if idx, ok := graph.indexByID[waypoints[i]]; ok {
-				segCost -= graph.segmentCosts[idx]
-			}
-		}
-		fullPath = append(fullPath, segPath...)
-		totalCost += segCost
-	}
-	return fullPath, totalCost, "", len(fullPath) > 0
-}
-
-func currentRouteTarget(route Route, nextBusStopIndex int) int {
-	if route.VehicleKind == VehicleBus && nextBusStopIndex >= 0 && nextBusStopIndex < len(route.BusStops) {
-		return route.BusStops[nextBusStopIndex].SplineID
-	}
-	return route.EndSplineID
-}
-
-func pickBestBusStopSpline(graph *RoadGraph, nodeKey string, fromSplineID, toSplineID int) (BusStop, bool) {
-	if graph == nil {
-		return BusStop{}, false
-	}
-	indices := graph.startsByNode[nodeKey]
-	if len(indices) == 0 {
-		return BusStop{}, false
-	}
-
-	bestCost := float32(math.MaxFloat32)
-	best := BusStop{}
-	found := false
-	for _, idx := range indices {
-		candidate := graph.splines[idx]
-		_, firstCost, okFirst := findShortestPathWeightedWithGraph(graph, fromSplineID, candidate.ID, VehicleBus)
-		_, secondCost, okSecond := findShortestPathWeightedWithGraph(graph, candidate.ID, toSplineID, VehicleBus)
-		if !okFirst || !okSecond {
-			continue
-		}
-		total := firstCost + secondCost - graph.segmentCosts[idx]
-		if !found || total < bestCost {
-			bestCost = total
-			best = BusStop{SplineID: candidate.ID, WorldPos: candidate.P0}
-			found = true
-		}
-	}
-	return best, found
-}
-
-func findBusStopCandidate(panel RoutePanel, splines []Spline, graph *RoadGraph, mouseWorld rl.Vector2, zoom float32) (BusStop, bool) {
+func findBusStopCandidate(panel RoutePanel, splines []Spline, graph *RoadGraph, mouseWorld Vec2, zoom float32) (BusStop, bool) {
 	if panel.VehicleKind != VehicleBus || graph == nil {
 		return BusStop{}, false
 	}
 	threshold := pixelsToWorld(zoom, 16)
 	thresholdSq := threshold * threshold
+	startsByNode := buildStartsByNode(splines)
 	endsByNode := buildEndsByNode(splines)
 
 	fromSplineID := panel.StartSplineID
@@ -1708,12 +1376,12 @@ func findBusStopCandidate(panel RoutePanel, splines []Spline, graph *RoadGraph, 
 
 	bestDist := thresholdSq
 	bestNodeKey := ""
-	bestPoint := rl.Vector2{}
-	for nodeKey, starts := range graph.startsByNode {
+	bestPoint := Vec2{}
+	for nodeKey, starts := range startsByNode {
 		if len(starts) == 0 || len(endsByNode[nodeKey]) == 0 {
 			continue
 		}
-		point := graph.splines[starts[0]].P0
+		point := splines[starts[0]].P0
 		d := distSq(mouseWorld, point)
 		if d <= bestDist {
 			bestDist = d
@@ -1725,7 +1393,7 @@ func findBusStopCandidate(panel RoutePanel, splines []Spline, graph *RoadGraph, 
 		return BusStop{}, false
 	}
 
-	stop, ok := pickBestBusStopSpline(graph, bestNodeKey, fromSplineID, panel.EndSplineID)
+	stop, ok := simpkg.PickBestBusStopSpline(graph, bestNodeKey, fromSplineID, panel.EndSplineID)
 	if !ok {
 		return BusStop{}, false
 	}
@@ -1733,7 +1401,7 @@ func findBusStopCandidate(panel RoutePanel, splines []Spline, graph *RoadGraph, 
 	return stop, true
 }
 
-func handleBusStopPlacement(panel RoutePanel, splines []Spline, graph *RoadGraph, mouseWorld rl.Vector2, zoom float32) (RoutePanel, bool) {
+func handleBusStopPlacement(panel RoutePanel, splines []Spline, graph *RoadGraph, mouseWorld Vec2, zoom float32) (RoutePanel, bool) {
 	if !panel.AddingBusStop {
 		return panel, false
 	}
@@ -1777,14 +1445,23 @@ func buildEndsByNode(splines []Spline) map[string][]int {
 	return endsByNode
 }
 
-func drawBusStopPlacementPreview(panel RoutePanel, splines []Spline, graph *RoadGraph, mouseWorld rl.Vector2, zoom float32) {
+func buildStartsByNode(splines []Spline) map[string][]int {
+	startsByNode := map[string][]int{}
+	for i, spline := range splines {
+		key := pointKey(spline.P0)
+		startsByNode[key] = append(startsByNode[key], i)
+	}
+	return startsByNode
+}
+
+func drawBusStopPlacementPreview(panel RoutePanel, splines []Spline, graph *RoadGraph, mouseWorld Vec2, zoom float32) {
 	stop, ok := findBusStopCandidate(panel, splines, graph, mouseWorld, zoom)
 	if !ok {
 		return
 	}
 	r := pixelsToWorld(zoom, 9)
-	rl.DrawCircleV(stop.WorldPos, r, rl.NewColor(255, 210, 70, 220))
-	rl.DrawRing(stop.WorldPos, r*0.65, r*1.25, 0, 360, 24, rl.NewColor(210, 150, 0, 220))
+	drawCircleV(stop.WorldPos, r, NewColor(255, 210, 70, 220))
+	drawRing(stop.WorldPos, r*0.65, r*1.25, 0, 360, 24, NewColor(210, 150, 0, 220))
 }
 
 func toggleBusOnlySpline(splines []Spline, hoveredSpline int) ([]Spline, string) {
@@ -1832,7 +1509,7 @@ func handlePreferenceMode(splines []Spline, hoveredSpline, lastPref int) ([]Spli
 
 // ---------- traffic light mode handlers ----------
 
-func handleTrafficLightMode(splines []Spline, pending []TrafficLight, mouseWorld rl.Vector2, zoom float32, nextLightID *int) []TrafficLight {
+func handleTrafficLightMode(splines []Spline, pending []TrafficLight, mouseWorld Vec2, zoom float32, nextLightID *int) []TrafficLight {
 	if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 		si, t, point, found := findNearestSplinePoint(splines, mouseWorld)
 		if found {
@@ -1892,98 +1569,6 @@ func doCreateTrafficCycle(pending []TrafficLight, lights []TrafficLight, cycles 
 // effectivePhaseDur returns the duration of effective phase index ei in a cycle.
 // When n > 1, even ei = user phase, odd ei = clearance phase (phase[ei/2].ClearanceDurationSecs).
 // When n == 1, there is only one effective phase (the single user phase).
-func effectivePhaseDur(c *TrafficCycle, ei int) float32 {
-	n := len(c.Phases)
-	if n <= 1 {
-		if n == 0 {
-			return 0.001
-		}
-		return maxf(c.Phases[0].DurationSecs, 0.001)
-	}
-	if ei%2 == 0 {
-		dur := c.Phases[ei/2].DurationSecs
-		if dur <= 0 {
-			dur = 0.001
-		}
-		return dur
-	}
-	clearDur := c.Phases[ei/2].ClearanceDurationSecs
-	if clearDur <= 0 {
-		clearDur = 3.0
-	}
-	return clearDur
-}
-
-func effectivePhaseCount(c *TrafficCycle) int {
-	n := len(c.Phases)
-	if n <= 1 {
-		return n
-	}
-	return 2 * n
-}
-
-func updateTrafficCycles(cycles []TrafficCycle, dt float32) []TrafficCycle {
-	for i := range cycles {
-		if !cycles[i].Enabled || len(cycles[i].Phases) == 0 {
-			continue
-		}
-		total := effectivePhaseCount(&cycles[i])
-		cycles[i].Timer += dt
-		dur := effectivePhaseDur(&cycles[i], cycles[i].PhaseIndex)
-		if cycles[i].Timer >= dur {
-			cycles[i].Timer -= dur
-			cycles[i].PhaseIndex = (cycles[i].PhaseIndex + 1) % total
-		}
-	}
-	return cycles
-}
-
-func phaseHasGreen(phase TrafficPhase, lightID int) bool {
-	for _, id := range phase.GreenLightIDs {
-		if id == lightID {
-			return true
-		}
-	}
-	return false
-}
-
-func trafficLightState(lightID, cycleID int, cycles []TrafficCycle) TrafficState {
-	for _, c := range cycles {
-		if c.ID != cycleID {
-			continue
-		}
-		if !c.Enabled || len(c.Phases) == 0 {
-			return TrafficRed
-		}
-		n := len(c.Phases)
-		ei := c.PhaseIndex
-		if n <= 1 || ei%2 == 0 {
-			// User phase
-			userIdx := ei / 2
-			if userIdx >= n {
-				userIdx = n - 1
-			}
-			if phaseHasGreen(c.Phases[userIdx], lightID) {
-				return TrafficGreen
-			}
-			return TrafficRed
-		}
-		// Transition phase between prevIdx and nextIdx
-		prevIdx := (ei / 2) % n
-		nextIdx := (prevIdx + 1) % n
-		prevGreen := phaseHasGreen(c.Phases[prevIdx], lightID)
-		nextGreen := phaseHasGreen(c.Phases[nextIdx], lightID)
-		if !prevGreen {
-			return TrafficRed
-		}
-		if nextGreen {
-			return TrafficGreen
-		}
-		return TrafficYellow
-	}
-	return TrafficRed
-}
-
 func trafficToggleCycleEnabled(cycles []TrafficCycle, cycleID int) []TrafficCycle {
 	for i := range cycles {
 		if cycles[i].ID != cycleID {
@@ -2088,22 +1673,22 @@ func getPhaseRowBtns(pr rl.Rectangle, idx int) phaseRowBtns {
 	}
 }
 
-func drawSmallBtn(r rl.Rectangle, label string, bg, fg rl.Color) {
+func drawSmallBtn(r rl.Rectangle, label string, bg, fg Color) {
 	rl.DrawRectangleRec(r, bg)
-	rl.DrawRectangleLinesEx(r, 1, rl.NewColor(0, 0, 0, 40))
+	rl.DrawRectangleLinesEx(r, 1, NewColor(0, 0, 0, 40))
 	lw := measureText(label, 12)
 	drawText(label, int32(r.X)+int32(r.Width)/2-lw/2, int32(r.Y)+int32(r.Height)/2-7, 12, fg)
 }
 
 func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles []TrafficCycle,
 	editingCycleID int, editingLights bool, editingPhaseIdx, activeDurInput int, durInputStr string, showPhaseIdx int) {
-	bg := rl.NewColor(248, 248, 250, 245)
-	outline := rl.NewColor(210, 210, 215, 255)
-	dark := rl.NewColor(28, 28, 33, 255)
-	muted := rl.NewColor(100, 100, 110, 255)
-	sep := rl.NewColor(220, 220, 224, 255)
-	disabledFg := rl.NewColor(170, 170, 178, 255)
-	disabledBg := rl.NewColor(220, 220, 224, 255)
+	bg := NewColor(248, 248, 250, 245)
+	outline := NewColor(210, 210, 215, 255)
+	dark := NewColor(28, 28, 33, 255)
+	muted := NewColor(100, 100, 110, 255)
+	sep := NewColor(220, 220, 224, 255)
+	disabledFg := NewColor(170, 170, 178, 255)
+	disabledBg := NewColor(220, 220, 224, 255)
 
 	if editingCycleID < 0 {
 		// ── New-cycle creator ────────────────────────────────────────────
@@ -2111,7 +1696,7 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 		rl.DrawRectangleRec(pr, bg)
 		rl.DrawRectangleLinesEx(pr, 1, outline)
 		drawText("New Traffic Cycle", int32(pr.X)+12, int32(pr.Y)+12, 15, dark)
-		rl.DrawLineEx(rl.NewVector2(pr.X+1, pr.Y+36), rl.NewVector2(pr.X+pr.Width-1, pr.Y+36), 1, sep)
+		drawLineEx(NewVec2(pr.X+1, pr.Y+36), NewVec2(pr.X+pr.Width-1, pr.Y+36), 1, sep)
 
 		y := int32(pr.Y) + 44
 		if len(pending) == 0 {
@@ -2123,12 +1708,12 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 			}
 		}
 		btn := trafficCreateBtnRect(len(pending))
-		btnBg := rl.NewColor(47, 120, 60, 255)
+		btnBg := NewColor(47, 120, 60, 255)
 		if len(pending) == 0 {
-			btnBg = rl.NewColor(160, 160, 165, 255)
+			btnBg = NewColor(160, 160, 165, 255)
 		}
 		rl.DrawRectangleRec(btn, btnBg)
-		rl.DrawRectangleLinesEx(btn, 1, rl.NewColor(0, 0, 0, 40))
+		rl.DrawRectangleLinesEx(btn, 1, NewColor(0, 0, 0, 40))
 		lbl := "Create Traffic Cycle"
 		lw := measureText(lbl, 13)
 		drawText(lbl, int32(btn.X)+int32(btn.Width)/2-lw/2, int32(btn.Y)+9, 13, rl.White)
@@ -2163,41 +1748,41 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 	onOffBtn, elBtn, clBtn := trafficHeaderBtnRects(pr)
 
 	// On/Off toggle — label shows current state
-	onOffBg := rl.NewColor(190, 50, 50, 255)
+	onOffBg := NewColor(190, 50, 50, 255)
 	onOffLbl := "Off"
 	if cycleOn {
-		onOffBg = rl.NewColor(47, 140, 60, 255)
+		onOffBg = NewColor(47, 140, 60, 255)
 		onOffLbl = "On"
 	}
 	drawSmallBtn(onOffBtn, onOffLbl, onOffBg, rl.White)
 
 	// Edit Lights button (disabled when cycle is on)
-	elBg := rl.NewColor(47, 96, 198, 255)
-	elFg := rl.Color(rl.White)
+	elBg := NewColor(47, 96, 198, 255)
+	elFg := Color(rl.White)
 	if cycleOn {
 		elBg = disabledBg
 		elFg = disabledFg
 	} else if editingLights {
-		elBg = rl.NewColor(28, 62, 155, 255)
+		elBg = NewColor(28, 62, 155, 255)
 	}
 	elLbl := "Edit Lights"
 	if editingLights && !cycleOn {
 		elLbl = "Done"
 	}
 	drawSmallBtn(elBtn, elLbl, elBg, elFg)
-	drawSmallBtn(clBtn, "Close", rl.NewColor(200, 60, 60, 255), rl.White)
+	drawSmallBtn(clBtn, "Close", NewColor(200, 60, 60, 255), rl.White)
 
-	rl.DrawLineEx(rl.NewVector2(pr.X+1, pr.Y+38), rl.NewVector2(pr.X+pr.Width-1, pr.Y+38), 1, sep)
+	drawLineEx(NewVec2(pr.X+1, pr.Y+38), NewVec2(pr.X+pr.Width-1, pr.Y+38), 1, sep)
 
 	// "+ Add Phase" button (disabled when cycle is on)
 	addBtn := trafficAddPhaseBtnRect(pr)
 	if cycleOn {
 		drawSmallBtn(addBtn, "+ Add Phase", disabledBg, disabledFg)
 	} else {
-		drawSmallBtn(addBtn, "+ Add Phase", rl.NewColor(70, 140, 80, 255), rl.White)
+		drawSmallBtn(addBtn, "+ Add Phase", NewColor(70, 140, 80, 255), rl.White)
 	}
 
-	rl.DrawLineEx(rl.NewVector2(pr.X+1, pr.Y+74), rl.NewVector2(pr.X+pr.Width-1, pr.Y+74), 1, sep)
+	drawLineEx(NewVec2(pr.X+1, pr.Y+74), NewVec2(pr.X+pr.Width-1, pr.Y+74), 1, sep)
 
 	// Phase rows
 	if len(cycle.Phases) == 0 {
@@ -2219,43 +1804,43 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 
 			if isCurrentPhase {
 				rl.DrawRectangle(int32(pr.X)+2, rowY, int32(pr.Width)-4, 50,
-					rl.NewColor(255, 240, 180, 160))
+					NewColor(255, 240, 180, 160))
 			} else if isLeavingPhase {
 				rl.DrawRectangle(int32(pr.X)+2, rowY, int32(pr.Width)-4, 50,
-					rl.NewColor(255, 210, 100, 100))
+					NewColor(255, 210, 100, 100))
 			} else if isEnteringPhase {
 				rl.DrawRectangle(int32(pr.X)+2, rowY, int32(pr.Width)-4, 50,
-					rl.NewColor(200, 255, 200, 100))
+					NewColor(200, 255, 200, 100))
 			}
 
 			// Phase label (sub-row 1)
 			labelColor := dark
 			phaseLabel := fmt.Sprintf("Phase %d", pi+1)
 			if isCurrentPhase {
-				labelColor = rl.NewColor(140, 90, 0, 255)
+				labelColor = NewColor(140, 90, 0, 255)
 				phaseLabel = fmt.Sprintf("Phase %d  ▶", pi+1)
 			} else if isLeavingPhase {
-				labelColor = rl.NewColor(160, 100, 0, 255)
+				labelColor = NewColor(160, 100, 0, 255)
 				phaseLabel = fmt.Sprintf("Phase %d  →", pi+1)
 			} else if isEnteringPhase {
-				labelColor = rl.NewColor(30, 120, 30, 255)
+				labelColor = NewColor(30, 120, 30, 255)
 				phaseLabel = fmt.Sprintf("Phase %d  ←", pi+1)
 			}
 			drawText(phaseLabel, int32(pr.X)+12, rowY+3, 12, labelColor)
 
-			yellowColor := rl.NewColor(180, 120, 0, 255)
+			yellowColor := NewColor(180, 120, 0, 255)
 
 			// Clearance field (sub-row 1, to the left of the duration field)
 			clrActiveInput := -(pi + 3)
-			clrBg := rl.NewColor(255, 252, 240, 255) // subtle amber tint
+			clrBg := NewColor(255, 252, 240, 255) // subtle amber tint
 			if cycleOn {
-				clrBg = rl.NewColor(235, 235, 238, 255)
+				clrBg = NewColor(235, 235, 238, 255)
 			} else if activeDurInput == clrActiveInput {
-				clrBg = rl.NewColor(255, 248, 220, 255)
+				clrBg = NewColor(255, 248, 220, 255)
 			}
 			drawText("→", int32(row.clearField.X)-16, rowY+3, 12, yellowColor)
 			rl.DrawRectangleRec(row.clearField, clrBg)
-			rl.DrawRectangleLinesEx(row.clearField, 1, rl.NewColor(200, 170, 100, 255))
+			rl.DrawRectangleLinesEx(row.clearField, 1, NewColor(200, 170, 100, 255))
 			clrDur := phase.ClearanceDurationSecs
 			if clrDur <= 0 {
 				clrDur = 3.0
@@ -2276,14 +1861,14 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 			drawText("s", int32(row.clearField.X)+int32(row.clearField.Width)+3, int32(row.clearField.Y)+3, 12, muted)
 
 			// Duration input field (sub-row 1, right side) — disabled when cycle on
-			fieldBg := rl.NewColor(255, 255, 255, 255)
+			fieldBg := NewColor(255, 255, 255, 255)
 			if cycleOn {
-				fieldBg = rl.NewColor(235, 235, 238, 255)
+				fieldBg = NewColor(235, 235, 238, 255)
 			} else if activeDurInput == pi {
-				fieldBg = rl.NewColor(240, 248, 255, 255)
+				fieldBg = NewColor(240, 248, 255, 255)
 			}
 			rl.DrawRectangleRec(row.durField, fieldBg)
-			rl.DrawRectangleLinesEx(row.durField, 1, rl.NewColor(180, 180, 190, 255))
+			rl.DrawRectangleLinesEx(row.durField, 1, NewColor(180, 180, 190, 255))
 			durStr := fmt.Sprintf("%.1f", phase.DurationSecs)
 			if !cycleOn && activeDurInput == pi {
 				durStr = durInputStr
@@ -2307,8 +1892,8 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 				drawSmallBtn(row.editBtn, "Edit", disabledBg, disabledFg)
 				drawSmallBtn(row.delBtn, "Delete", disabledBg, disabledFg)
 			} else {
-				upBg := rl.NewColor(200, 200, 205, 255)
-				downBg := rl.NewColor(200, 200, 205, 255)
+				upBg := NewColor(200, 200, 205, 255)
+				downBg := NewColor(200, 200, 205, 255)
 				if pi == 0 {
 					upBg = disabledBg
 				}
@@ -2319,24 +1904,24 @@ func drawTrafficCyclePanel(pending []TrafficLight, lights []TrafficLight, cycles
 				drawSmallBtn(row.downBtn, "Down", downBg, dark)
 
 				editActive := editingPhaseIdx == pi
-				editBg := rl.NewColor(47, 96, 198, 255)
+				editBg := NewColor(47, 96, 198, 255)
 				editLbl := "Edit"
 				if editActive {
-					editBg = rl.NewColor(28, 62, 155, 255)
+					editBg = NewColor(28, 62, 155, 255)
 					editLbl = "Done"
 				}
 				drawSmallBtn(row.editBtn, editLbl, editBg, rl.White)
-				drawSmallBtn(row.delBtn, "Delete", rl.NewColor(200, 60, 60, 255), rl.White)
+				drawSmallBtn(row.delBtn, "Delete", NewColor(200, 60, 60, 255), rl.White)
 			}
 
 			// Show (cycle off) / Skip (cycle on) button
 			if cycleOn {
-				drawSmallBtn(row.showBtn, "Skip", rl.NewColor(60, 120, 190, 255), rl.White)
+				drawSmallBtn(row.showBtn, "Skip", NewColor(60, 120, 190, 255), rl.White)
 			} else {
 				showActive := showPhaseIdx == pi
-				showBg := rl.NewColor(130, 80, 180, 255)
+				showBg := NewColor(130, 80, 180, 255)
 				if showActive {
-					showBg = rl.NewColor(90, 40, 140, 255)
+					showBg = NewColor(90, 40, 140, 255)
 				}
 				drawSmallBtn(row.showBtn, "Show", showBg, rl.White)
 			}
@@ -2448,9 +2033,9 @@ func drawTrafficLights(lights []TrafficLight, pending []TrafficLight, cycles []T
 	r := pixelsToWorld(zoom, 8)
 	all := append(lights, pending...)
 	for _, l := range all {
-		var fill rl.Color
+		var fill Color
 		if l.CycleID < 0 {
-			fill = rl.NewColor(255, 165, 0, 220) // amber = pending
+			fill = NewColor(255, 165, 0, 220) // amber = pending
 		} else {
 			// Determine which phase index to display, if any override is active
 			displayPhase := -1
@@ -2478,33 +2063,33 @@ func drawTrafficLights(lights []TrafficLight, pending []TrafficLight, cycles []T
 					break
 				}
 				if isGreen {
-					fill = rl.NewColor(40, 180, 60, 240)
+					fill = NewColor(40, 180, 60, 240)
 				} else {
-					fill = rl.NewColor(210, 35, 35, 240)
+					fill = NewColor(210, 35, 35, 240)
 				}
 			} else {
-				switch trafficLightState(l.ID, l.CycleID, cycles) {
+				switch simpkg.TrafficLightState(l.ID, l.CycleID, cycles) {
 				case TrafficRed:
-					fill = rl.NewColor(210, 35, 35, 240)
+					fill = NewColor(210, 35, 35, 240)
 				case TrafficYellow:
-					fill = rl.NewColor(230, 175, 0, 240)
+					fill = NewColor(230, 175, 0, 240)
 				case TrafficGreen:
-					fill = rl.NewColor(40, 180, 60, 240)
+					fill = NewColor(40, 180, 60, 240)
 				}
 			}
 		}
-		rl.DrawCircleV(l.WorldPos, r, rl.NewColor(20, 20, 20, 220))
-		rl.DrawCircleV(l.WorldPos, r*0.7, fill)
+		drawCircleV(l.WorldPos, r, NewColor(20, 20, 20, 220))
+		drawCircleV(l.WorldPos, r*0.7, fill)
 		// White ring around lights belonging to the currently-open cycle
 		if editingCycleID >= 0 && l.CycleID == editingCycleID {
-			rl.DrawRing(l.WorldPos, r*1.1, r*1.45, 0, 360, 24, rl.NewColor(255, 255, 255, 200))
+			drawRing(l.WorldPos, r*1.1, r*1.45, 0, 360, 24, NewColor(255, 255, 255, 200))
 		}
 	}
 }
 
 // trafficLightAt returns the ID of the nearest placed light within click range,
 // or -1 if none.
-func trafficLightAt(lights []TrafficLight, pos rl.Vector2, zoom float32) int {
+func trafficLightAt(lights []TrafficLight, pos Vec2, zoom float32) int {
 	thresh := 15 / zoom
 	threshSq := thresh * thresh
 	for _, l := range lights {
@@ -2527,7 +2112,7 @@ func trafficCycleLightCount(cycleID int, lights []TrafficLight) int {
 }
 
 // handleTrafficLightEdit adds or removes placed lights from an existing cycle.
-func handleTrafficLightEdit(splines []Spline, lights []TrafficLight, cycles []TrafficCycle, cycleID int, mouseWorld rl.Vector2, zoom float32, nextLightID *int) ([]TrafficLight, []TrafficCycle) {
+func handleTrafficLightEdit(splines []Spline, lights []TrafficLight, cycles []TrafficCycle, cycleID int, mouseWorld Vec2, zoom float32, nextLightID *int) ([]TrafficLight, []TrafficCycle) {
 	if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 		si, t, point, found := findNearestSplinePoint(splines, mouseWorld)
 		if found {
@@ -2593,18 +2178,16 @@ func handleSpeedLimitMode(splines []Spline, hoveredSpline, selectedSpeedKmh int)
 		return splines
 	}
 	mousePos := rl.GetMousePosition()
-	if isMouseOverSpeedLimitPanel(mousePos) {
+	if isMouseOverSpeedLimitPanel(fromRLVec2(mousePos)) {
 		return splines
 	}
 	if rl.IsMouseButtonPressed(rl.MouseButtonLeft) {
 		splines[hoveredSpline].SpeedLimitKmh = float32(selectedSpeedKmh)
-		splines[hoveredSpline].CurveSpeedMPS = buildCurveSpeedProfile(&splines[hoveredSpline])
-		splines[hoveredSpline].TravelTimeS = buildSplineTravelTime(&splines[hoveredSpline])
+		simpkg.RebuildSpline(&splines[hoveredSpline])
 	}
 	if rl.IsMouseButtonPressed(rl.MouseButtonRight) {
 		splines[hoveredSpline].SpeedLimitKmh = 0
-		splines[hoveredSpline].CurveSpeedMPS = buildCurveSpeedProfile(&splines[hoveredSpline])
-		splines[hoveredSpline].TravelTimeS = buildSplineTravelTime(&splines[hoveredSpline])
+		simpkg.RebuildSpline(&splines[hoveredSpline])
 	}
 	return splines
 }
@@ -2629,7 +2212,7 @@ func updateSpeedLimitPanel(selectedSpeedKmh int) int {
 	return selectedSpeedKmh
 }
 
-func isMouseOverSpeedLimitPanel(mouse rl.Vector2) bool {
+func isMouseOverSpeedLimitPanel(mouse Vec2) bool {
 	px, _ := speedLimitPanelOrigin()
 	panelW := float32(172)
 	panelH := float32(7*32 + 32)
@@ -2653,7 +2236,7 @@ func drawSpeedLimitWorld(splines []Spline, hoveredSpline int, zoom float32) {
 	if hoveredSpline < 0 {
 		return
 	}
-	drawSpline(splines[hoveredSpline], pixelsToWorld(zoom, 4), rl.NewColor(255, 200, 50, 180))
+	drawSpline(splines[hoveredSpline], pixelsToWorld(zoom, 4), NewColor(255, 200, 50, 180))
 }
 
 // drawSpeedLimitLabels draws speed limit badges on any spline that has a limit,
@@ -2664,28 +2247,28 @@ func drawSpeedLimitLabels(splines []Spline, camera rl.Camera2D) {
 			continue
 		}
 		mid := spline.Samples[simSamples/2]
-		screen := rl.GetWorldToScreen2D(mid, camera)
+		screen := getWorldToScreen2D(mid, camera)
 		label := fmt.Sprintf("%d", int(spline.SpeedLimitKmh))
 		fontSize := int32(14)
 		textW := measureText(label, fontSize)
 		r := int32(14)
 		cx, cy := int32(screen.X), int32(screen.Y)
 		rl.DrawCircle(cx, cy, float32(r), rl.White)
-		rl.DrawCircleLines(cx, cy, float32(r), rl.NewColor(200, 30, 30, 255))
-		drawText(label, cx-textW/2, cy-fontSize/2, fontSize, rl.NewColor(200, 30, 30, 255))
+		rl.DrawCircleLines(cx, cy, float32(r), NewColor(200, 30, 30, 255))
+		drawText(label, cx-textW/2, cy-fontSize/2, fontSize, NewColor(200, 30, 30, 255))
 	}
 }
 
 // drawPreferenceLabels draws preference badges on splines that have a preference assigned,
 // in screen space, so they stay readable at any zoom level.
 func drawPreferenceLabels(splines []Spline, camera rl.Camera2D) {
-	color := rl.NewColor(30, 150, 60, 255)
+	color := NewColor(30, 150, 60, 255)
 	for _, spline := range splines {
 		if spline.LanePreference <= 0 {
 			continue
 		}
 		mid := spline.Samples[simSamples/2]
-		screen := rl.GetWorldToScreen2D(mid, camera)
+		screen := getWorldToScreen2D(mid, camera)
 		label := fmt.Sprintf("%d", spline.LanePreference)
 		fontSize := int32(14)
 		textW := measureText(label, fontSize)
@@ -2711,10 +2294,10 @@ func maxLoadedPreference(splines []Spline) int {
 
 // drawSpeedLimitPanel draws the speed picker UI in screen space.
 func drawSpeedLimitPanel(selectedSpeedKmh int) {
-	bg := rl.NewColor(248, 248, 250, 245)
-	outline := rl.NewColor(210, 210, 215, 255)
-	text := rl.NewColor(30, 30, 35, 255)
-	selBg := rl.NewColor(200, 30, 30, 220)
+	bg := NewColor(248, 248, 250, 245)
+	outline := NewColor(210, 210, 215, 255)
+	text := NewColor(30, 30, 35, 255)
+	selBg := NewColor(200, 30, 30, 220)
 	selText := rl.White
 
 	px, _ := speedLimitPanelOrigin()
@@ -2733,185 +2316,14 @@ func drawSpeedLimitPanel(selectedSpeedKmh int) {
 		label := fmt.Sprintf("%d km/h", kmh)
 		if kmh == selectedSpeedKmh {
 			rl.DrawRectangle(bx, by, 76, 24, selBg)
-			rl.DrawRectangleLines(bx, by, 76, 24, rl.NewColor(150, 20, 20, 255))
+			rl.DrawRectangleLines(bx, by, 76, 24, NewColor(150, 20, 20, 255))
 			drawText(label, bx+6, by+5, 14, selText)
 		} else {
-			rl.DrawRectangle(bx, by, 76, 24, rl.NewColor(235, 236, 240, 255))
+			rl.DrawRectangle(bx, by, 76, 24, NewColor(235, 236, 240, 255))
 			rl.DrawRectangleLines(bx, by, 76, 24, outline)
 			drawText(label, bx+6, by+5, 14, text)
 		}
 	}
-}
-
-// effectiveMaxSpeedMPS returns the fastest a car can ever travel on a spline,
-// taking the global max car speed, the spline's speed factor, and any speed
-// limit into account.
-func effectiveMaxSpeedMPS(spline Spline) float32 {
-	cap := maxCarSpeed
-	if spline.SpeedLimitKmh > 0 {
-		if limitMPS := spline.SpeedLimitKmh / 3.6; limitMPS < cap {
-			cap = limitMPS
-		}
-	}
-	return cap * spline.SpeedFactor
-}
-
-// laneChangeFeasibleAt checks whether a lane change from a specific arc-length
-// distance on src to dst is geometrically possible at the given speed.
-func laneChangeFeasibleAt(src, dst Spline, distance, speed float32) bool {
-	carPos, carHeading := sampleSplineAtDistance(src, distance)
-	halfDist := speed * laneChangeHalfSecs
-	p1 := vecAdd(carPos, vecScale(carHeading, halfDist))
-	_, crossDist := nearestSampleWithDist(dst, p1)
-	if crossDist == 0 || dst.Length-crossDist < halfDist {
-		return false
-	}
-	_, destHeading := sampleSplineAtDistance(dst, crossDist+halfDist)
-	return carHeading.X*destHeading.X+carHeading.Y*destHeading.Y >= laneChangeDirCos
-}
-
-// laneChangeFeasible checks whether a lane change from the very start of src to
-// dst is geometrically possible at the given speed, using the same rules as the
-// runtime lane-change system.
-func laneChangeFeasible(src, dst Spline, speed float32) bool {
-	return laneChangeFeasibleAt(src, dst, 0, speed)
-}
-
-// findForcedLaneChangePath looks for a physically reachable next spline whose
-// hard-coupled partners include one that has a valid path to the destination.
-// Returns the ID of the next spline to enter and the ID of the desired target
-// spline to switch to once on that next spline.
-func findForcedLaneChangePath(splines []Spline, currentSplineID, destSplineID int, vehicleCounts map[int]int) (nextSplineID, desiredSplineID int, ok bool) {
-	return findForcedLaneChangePathWithGraph(newRoadGraph(splines, vehicleCounts), currentSplineID, destSplineID, VehicleCar)
-}
-
-func findForcedLaneChangePathWithGraph(graph *RoadGraph, currentSplineID, destSplineID int, vehicleKind VehicleKind) (nextSplineID, desiredSplineID int, ok bool) {
-	currentSpline, found := graph.splineByID(currentSplineID)
-	if !found {
-		return 0, 0, false
-	}
-	for _, nextIdx := range graph.startsByNode[pointKey(currentSpline.P3)] {
-		nextSpline := graph.splines[nextIdx]
-		if !isSplineUsableForVehicle(nextSpline, vehicleKind) {
-			continue
-		}
-		for _, coupledID := range nextSpline.HardCoupledIDs {
-			if coupledSpline, ok := graph.splineByID(coupledID); ok && !isSplineUsableForVehicle(coupledSpline, vehicleKind) {
-				continue
-			}
-			if _, _, pathOk := findShortestPathWeightedWithGraph(graph, coupledID, destSplineID, vehicleKind); pathOk {
-				return nextSpline.ID, coupledID, true
-			}
-		}
-	}
-	return 0, 0, false
-}
-
-// laneChangeLandingDist computes the arc-length position on destSpline where a
-// lane change from car's current position would land, applying the same geometry
-// rules as buildLaneChangeBridge. Returns (p3Dist, true) when feasible.
-func laneChangeLandingDist(car Car, srcSpline, destSpline Spline) (float32, bool) {
-	if car.Speed < laneChangeMinSpeed {
-		return 0, false
-	}
-	carPos, carHeading := sampleSplineAtDistance(srcSpline, car.DistanceOnSpline)
-	halfDist := car.Speed * laneChangeHalfSecs
-	p1 := vecAdd(carPos, vecScale(carHeading, halfDist))
-	_, crossDist := nearestSampleWithDist(destSpline, p1)
-	if crossDist == 0 || destSpline.Length-crossDist < halfDist {
-		return 0, false
-	}
-	p3Dist := crossDist + halfDist
-	_, destHeading := sampleSplineAtDistance(destSpline, p3Dist)
-	if carHeading.X*destHeading.X+carHeading.Y*destHeading.Y < laneChangeDirCos {
-		return 0, false
-	}
-	return p3Dist, true
-}
-
-// isLaneChangeLandingSafe returns true if landing at p3Dist on destSplineID
-// would not immediately collide with cars already there.
-// Rear cars are given a speed-adjusted gap (2 s of closure distance).
-func isLaneChangeLandingSafe(p3Dist float32, destSplineID int, switchingCar Car, cars []Car) bool {
-	T := 2 * laneChangeHalfSecs // lane change duration in seconds
-	const safetyMargin = 2.0
-	for _, other := range cars {
-		if other.CurrentSplineID != destSplineID {
-			continue
-		}
-		// Predict where each car's front will be when the merge completes.
-		// DistanceOnSpline is now the front position on the spline.
-		otherFrontAtLanding := other.DistanceOnSpline + other.Speed*T
-		gapAtLanding := otherFrontAtLanding - p3Dist // positive = other front is ahead of our landing front
-		if gapAtLanding >= 0 {
-			// Other car will be ahead — gap from our front to their rear must be safe.
-			// bumper gap = gapAtLanding - other.Length
-			if gapAtLanding < other.Length+safetyMargin {
-				return false
-			}
-		} else {
-			// Other car will be behind — gap from their front to our rear must be safe.
-			// bumper gap = -gapAtLanding - switchingCar.Length
-			if -gapAtLanding < switchingCar.Length+safetyMargin {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// buildLaneChangeBridge attempts to build a Bézier bridge from the car's
-// current position to destSplineID. Modifies *car and appends to lcs on
-// success. Returns the updated lcs slice and whether it succeeded.
-// When forced is true the minimum speed check is skipped and a floor of
-// laneChangeMinSpeed is used for halfDist, so slow cars can still switch.
-func buildLaneChangeBridge(car *Car, destSplineID int, splines []Spline, splineIndexByID map[int]int, lcs []Spline, nextID *int, forced bool) ([]Spline, bool) {
-	srcIdx, ok := splineIndexByID[car.CurrentSplineID]
-	if !ok {
-		return lcs, false
-	}
-	destIdx, ok := splineIndexByID[destSplineID]
-	if !ok {
-		return lcs, false
-	}
-	if !forced && car.Speed < laneChangeMinSpeed {
-		return lcs, false
-	}
-
-	srcSpline := splines[srcIdx]
-	destSpline := splines[destIdx]
-	carPos, carHeading := sampleSplineAtDistance(srcSpline, car.DistanceOnSpline)
-	effectiveSpeed := car.Speed
-	if forced && effectiveSpeed < laneChangeMinSpeed {
-		effectiveSpeed = laneChangeMinSpeed
-	}
-	halfDist := effectiveSpeed * laneChangeHalfSecs
-
-	p1 := vecAdd(carPos, vecScale(carHeading, halfDist))
-	_, crossDist := nearestSampleWithDist(destSpline, p1)
-	if crossDist == 0 || destSpline.Length-crossDist < halfDist {
-		return lcs, false
-	}
-	p3Dist := crossDist + halfDist
-	p3, destHeading := sampleSplineAtDistance(destSpline, p3Dist)
-	if carHeading.X*destHeading.X+carHeading.Y*destHeading.Y < laneChangeDirCos {
-		return lcs, false
-	}
-
-	p2 := vecSub(p3, vecScale(destHeading, halfDist))
-	id := *nextID
-	*nextID++
-	lcs = append(lcs, newSpline(id, carPos, p1, p2, p3))
-
-	car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
-	car.PrevSplineIDs[0] = car.CurrentSplineID
-	car.CurrentSplineID = id
-	car.DistanceOnSpline = 0
-	car.LaneChanging = true
-	car.LaneChangeSplineID = id
-	car.AfterSplineID = destSplineID
-	car.AfterSplineDist = p3Dist
-	return lcs, true
 }
 
 func handleCoupleMode(firstID int, splines []Spline, hoveredSpline int) (int, []Spline, string) {
@@ -2944,8 +2356,8 @@ func handleCoupleMode(firstID int, splines []Spline, hoveredSpline int) (int, []
 		if idxA >= 0 && idxB >= 0 {
 			splineA := splines[idxA]
 			splineB := splines[idxB]
-			speedA := effectiveMaxSpeedMPS(splineA)
-			speedB := effectiveMaxSpeedMPS(splineB)
+			speedA := simpkg.EffectiveMaxSpeedMPS(splineA)
+			speedB := simpkg.EffectiveMaxSpeedMPS(splineB)
 			if !laneChangeFeasible(splineA, splineB, speedA) || !laneChangeFeasible(splineB, splineA, speedB) {
 				return -1, splines, "Hard couple rejected: lane change not feasible at max speed from the start of both splines"
 			}
@@ -2955,6 +2367,22 @@ func handleCoupleMode(firstID int, splines []Spline, hoveredSpline int) (int, []
 		splines = toggleSoftCoupling(splines, firstID, clickedID)
 	}
 	return -1, splines, ""
+}
+
+func laneChangeFeasibleAt(src, dst Spline, distance, speed float32) bool {
+	carPos, carHeading := simpkg.SampleSplineAtDistance(src, distance)
+	halfDist := speed * laneChangeHalfSecs
+	p1 := vecAdd(carPos, vecScale(carHeading, halfDist))
+	_, crossDist := nearestSampleWithDist(dst, p1)
+	if crossDist == 0 || dst.Length-crossDist < halfDist {
+		return false
+	}
+	_, destHeading := simpkg.SampleSplineAtDistance(dst, crossDist+halfDist)
+	return carHeading.X*destHeading.X+carHeading.Y*destHeading.Y >= laneChangeDirCos
+}
+
+func laneChangeFeasible(src, dst Spline, speed float32) bool {
+	return laneChangeFeasibleAt(src, dst, 0, speed)
 }
 
 func toggleHardCoupling(splines []Spline, idA, idB int) []Spline {
@@ -3034,7 +2462,7 @@ func removeInt(slice []int, val int) []int {
 
 // nearestSampleOnSpline returns the position of the precomputed sample on spline
 // that is closest (Euclidean) to pos.
-func nearestSampleOnSpline(spline Spline, pos rl.Vector2) rl.Vector2 {
+func nearestSampleOnSpline(spline Spline, pos Vec2) Vec2 {
 	best := spline.Samples[0]
 	bestDSq := distSq(best, pos)
 	for i := 1; i <= simSamples; i++ {
@@ -3049,7 +2477,7 @@ func nearestSampleOnSpline(spline Spline, pos rl.Vector2) rl.Vector2 {
 
 // nearestSampleWithDist returns both the world position and the arc-length
 // distance along the spline for the sample closest to pos.
-func nearestSampleWithDist(spline Spline, pos rl.Vector2) (point rl.Vector2, dist float32) {
+func nearestSampleWithDist(spline Spline, pos Vec2) (point Vec2, dist float32) {
 	point = spline.Samples[0]
 	dist = spline.CumLen[0]
 	bestDSq := distSq(point, pos)
@@ -3064,276 +2492,14 @@ func nearestSampleWithDist(spline Spline, pos rl.Vector2) (point rl.Vector2, dis
 	return
 }
 
-// mergedSplines returns a slice containing all permanent splines followed by
-// all lane-change splines. Returns permanent directly if there are no temporaries.
-func mergedSplines(permanent, temporary []Spline) []Spline {
-	if len(temporary) == 0 {
-		return permanent
-	}
-	all := make([]Spline, 0, len(permanent)+len(temporary))
-	all = append(all, permanent...)
-	all = append(all, temporary...)
-	return all
-}
-
-// gcLaneChangeSplines removes any lane-change splines that no car is currently
-// travelling on, freeing memory and keeping the slice compact.
-func gcLaneChangeSplines(lcs []Spline, cars []Car) []Spline {
-	active := make(map[int]struct{}, len(cars))
-	for _, car := range cars {
-		active[car.LaneChangeSplineID] = struct{}{}
-	}
-	out := lcs[:0]
-	for _, lc := range lcs {
-		if _, ok := active[lc.ID]; ok {
-			out = append(out, lc)
-		}
-	}
-	return out
-}
-
-// computeLaneChanges handles desired-lane switches for each car.
-// Cars with a DesiredLaneSplineID attempt to merge as soon as a safe gap
-// exists; at the deadline the switch is forced regardless of gap.
-// Preference-based switches are attempted at most every preferenceChangeCooldownS seconds.
-func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int, graph *RoadGraph, dt float32) ([]Spline, []Car) {
-	splineIndexByID := graph.indexByID
-	poses := make([]carPose, len(cars))
-	carsBySpline := make(map[int][]int, len(cars))
-	for i, car := range cars {
-		if splineIdx, ok := splineIndexByID[car.CurrentSplineID]; ok {
-			pos, heading := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
-			poses[i] = carPose{pos: pos, heading: heading}
-		}
-		carsBySpline[car.CurrentSplineID] = append(carsBySpline[car.CurrentSplineID], i)
-	}
-
-	for i := range cars {
-		car := &cars[i]
-
-		if car.LaneChanging {
-			continue
-		}
-
-		// Desired lane switch: attempt as soon as a safe gap exists on the
-		// target spline. At the deadline (10 m before end) force it regardless.
-		if car.DesiredLaneSplineID >= 0 {
-			if car.DistanceOnSpline >= car.DesiredLaneDeadline {
-				// Last resort — ignore gap, just switch.
-				if newLcs, ok := buildLaneChangeBridge(car, car.DesiredLaneSplineID, splines, splineIndexByID, lcs, nextID, true); ok {
-					lcs = newLcs
-					car.DesiredLaneSplineID = -1
-					car.DesiredLaneDeadline = 0
-				}
-			} else {
-				// Desired switch: only commit if the landing zone is clear.
-				srcIdx, srcOk := splineIndexByID[car.CurrentSplineID]
-				destIdx, destOk := splineIndexByID[car.DesiredLaneSplineID]
-				if srcOk && destOk {
-					if p3Dist, feasible := laneChangeLandingDist(*car, splines[srcIdx], splines[destIdx]); feasible {
-						if isLaneChangeLandingSafe(p3Dist, car.DesiredLaneSplineID, *car, cars) {
-							if newLcs, ok := buildLaneChangeBridge(car, car.DesiredLaneSplineID, splines, splineIndexByID, lcs, nextID, false); ok {
-								lcs = newLcs
-								car.DesiredLaneSplineID = -1
-								car.DesiredLaneDeadline = 0
-							}
-						}
-					}
-				}
-			}
-			continue
-		}
-
-		// Preference-based lane change: opportunistically move to a coupled lane
-		// with a higher preference (lower number). Gated by a cooldown so the
-		// behaviour is soft — cars drift toward preferred lanes, not snap to them.
-		car.PreferenceCooldown -= dt
-		if car.PreferenceCooldown <= 0 {
-			car.PreferenceCooldown = preferenceChangeCooldownS
-			_, curPrefTime, curPrefTimeOk := findShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
-			for _, destID := range findBetterPreferenceLaneCandidates(*car, splines, splineIndexByID) {
-				_, destTime, pathOk := findShortestPathWeightedWithGraph(graph, destID, car.DestinationSplineID, car.VehicleKind)
-				if !pathOk {
-					continue
-				}
-				if curPrefTimeOk && destTime-curPrefTime > 20.0 {
-					continue
-				}
-				srcIdx, srcOk := splineIndexByID[car.CurrentSplineID]
-				destIdx, destOk := splineIndexByID[destID]
-				if !srcOk || !destOk {
-					continue
-				}
-				p3Dist, feasible := laneChangeLandingDist(*car, splines[srcIdx], splines[destIdx])
-				if !feasible || !isLaneChangeLandingSafe(p3Dist, destID, *car, cars) {
-					continue
-				}
-				if newLcs, ok := buildLaneChangeBridge(car, destID, splines, splineIndexByID, lcs, nextID, false); ok {
-					lcs = newLcs
-					break
-				}
-			}
-		}
-
-		// Overtake: if the car has been held back by a leader long enough, try
-		// moving to an adjacent lane that is exactly one preference step less
-		// preferred (number one higher). Never forced; requires a safe gap and a
-		// valid path to the destination. Resets PreferenceCooldown on success so
-		// the car does not immediately try to return to the preferred lane.
-		car.OvertakeCooldown -= dt
-		leaderSpeed, leaderFound := nearestLeaderSpeed(i, cars, carsBySpline, poses)
-		if car.SlowedTimer > overtakeSlowThresholdS && car.OvertakeCooldown <= 0 &&
-			(!leaderFound || leaderSpeed <= car.Speed) {
-			car.OvertakeCooldown = overtakeCooldownS
-			_, curOvertakeTime, curOvertakeTimeOk := findShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
-			for _, destID := range findOvertakeLaneCandidates(*car, splines, splineIndexByID) {
-				_, destTime, pathOk := findShortestPathWeightedWithGraph(graph, destID, car.DestinationSplineID, car.VehicleKind)
-				if !pathOk {
-					continue
-				}
-				if curOvertakeTimeOk && destTime-curOvertakeTime > 20.0 {
-					continue
-				}
-				srcIdx, srcOk := splineIndexByID[car.CurrentSplineID]
-				destIdx, destOk := splineIndexByID[destID]
-				if !srcOk || !destOk {
-					continue
-				}
-				p3Dist, feasible := laneChangeLandingDist(*car, splines[srcIdx], splines[destIdx])
-				if !feasible || !isLaneChangeLandingSafe(p3Dist, destID, *car, cars) {
-					continue
-				}
-				if newLcs, ok := buildLaneChangeBridge(car, destID, splines, splineIndexByID, lcs, nextID, false); ok {
-					lcs = newLcs
-					car.PreferenceCooldown = preferenceChangeCooldownS
-					car.SlowedTimer = 0
-					break
-				}
-			}
-		}
-	}
-
-	return lcs, cars
-}
-
-// findBetterPreferenceLaneCandidates returns coupled lanes ordered from most to
-// least preferred among lanes that are strictly better than the current one.
-// Lanes with no preference (0) are never considered as targets.
-func findBetterPreferenceLaneCandidates(car Car, splines []Spline, splineIndexByID map[int]int) []int {
-	idx, ok := splineIndexByID[car.CurrentSplineID]
-	if !ok {
-		return nil
-	}
-	currentSpline := splines[idx]
-	currentPref := currentSpline.LanePreference // 0 = no preference assigned
-
-	allCoupled := append(append([]int(nil), currentSpline.HardCoupledIDs...), currentSpline.SoftCoupledIDs...)
-	type candidate struct {
-		id   int
-		pref int
-	}
-	candidates := make([]candidate, 0, len(allCoupled))
-	for _, coupledID := range allCoupled {
-		cIdx, cOk := splineIndexByID[coupledID]
-		if !cOk {
-			continue
-		}
-		coupled := splines[cIdx]
-		if coupled.LanePreference <= 0 {
-			continue // unpreferred lanes are never a target
-		}
-		// Must be strictly better (lower number) than the current lane.
-		// A car on an unpreferred lane (0) considers any preferred lane better.
-		if currentPref != 0 && coupled.LanePreference >= currentPref {
-			continue
-		}
-		candidates = append(candidates, candidate{id: coupledID, pref: coupled.LanePreference})
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return candidates[i].pref < candidates[j].pref
-	})
-	result := make([]int, 0, len(candidates))
-	for _, candidate := range candidates {
-		result = append(result, candidate.id)
-	}
-	return result
-}
-
-// nearestLeaderSpeed returns the speed of the closest car ahead on the same
-// spline as cars[carIdx], and true. Returns 0, false if no such car is found
-// within followLookaheadM.
-func nearestLeaderSpeed(carIdx int, cars []Car, carsBySpline map[int][]int, poses []carPose) (float32, bool) {
-	car := cars[carIdx]
-	if carIdx < 0 || carIdx >= len(poses) {
-		return 0, false
-	}
-	carPos, carHeading := poses[carIdx].pos, poses[carIdx].heading
-
-	bestDist := float32(math.MaxFloat32)
-	bestSpeed := float32(0)
-	found := false
-	for _, j := range carsBySpline[car.CurrentSplineID] {
-		if j == carIdx {
-			continue
-		}
-		other := cars[j]
-		otherPos := poses[j].pos
-		diff := rl.Vector2{X: otherPos.X - carPos.X, Y: otherPos.Y - carPos.Y}
-		proj := diff.X*carHeading.X + diff.Y*carHeading.Y
-		if proj <= 0 {
-			continue // behind us
-		}
-		euclidean := float32(math.Sqrt(float64(diff.X*diff.X + diff.Y*diff.Y)))
-		if euclidean > followLookaheadM {
-			continue
-		}
-		if euclidean < bestDist {
-			bestDist = euclidean
-			bestSpeed = other.Speed
-			found = true
-		}
-	}
-	return bestSpeed, found
-}
-
-// findOvertakeLaneCandidates returns coupled lanes whose LanePreference is
-// exactly currentPref+1 (one step less preferred — the overtaking lane).
-// Only works when the car is on a numbered lane; lanes with no preference are
-// never considered as targets.
-func findOvertakeLaneCandidates(car Car, splines []Spline, splineIndexByID map[int]int) []int {
-	idx, ok := splineIndexByID[car.CurrentSplineID]
-	if !ok {
-		return nil
-	}
-	currentSpline := splines[idx]
-	currentPref := currentSpline.LanePreference
-	if currentPref <= 0 {
-		return nil // can only overtake from a lane that has a preference number
-	}
-	targetPref := currentPref + 1
-
-	allCoupled := append(append([]int(nil), currentSpline.HardCoupledIDs...), currentSpline.SoftCoupledIDs...)
-	candidates := make([]int, 0, len(allCoupled))
-	for _, coupledID := range allCoupled {
-		cIdx, cOk := splineIndexByID[coupledID]
-		if !cOk {
-			continue
-		}
-		if splines[cIdx].LanePreference == targetPref {
-			candidates = append(candidates, coupledID)
-		}
-	}
-	return candidates
-}
-
 // drawLaneChangeSplines renders active lane-change bridge splines in a
 // distinctive magenta colour, visible only when debug mode is on.
 func drawLaneChangeSplines(lcs []Spline, zoom float32) {
 	if len(lcs) == 0 {
 		return
 	}
-	color := rl.NewColor(230, 60, 230, 220)
-	dimColor := rl.NewColor(230, 60, 230, 100)
+	color := NewColor(230, 60, 230, 220)
+	dimColor := NewColor(230, 60, 230, 100)
 	thickness := pixelsToWorld(zoom, 2.5)
 	handleR := pixelsToWorld(zoom, 4)
 	armThick := pixelsToWorld(zoom, 1)
@@ -3341,24 +2507,24 @@ func drawLaneChangeSplines(lcs []Spline, zoom float32) {
 	for _, s := range lcs {
 		drawSpline(s, thickness, color)
 		// Draw the Bézier handles so it's clear where the curve is steered.
-		rl.DrawLineEx(s.P0, s.P1, armThick, dimColor)
-		rl.DrawLineEx(s.P3, s.P2, armThick, dimColor)
-		rl.DrawCircleV(s.P1, handleR, color)
-		rl.DrawCircleV(s.P2, handleR, color)
+		drawLineEx(s.P0, s.P1, armThick, dimColor)
+		drawLineEx(s.P3, s.P2, armThick, dimColor)
+		drawCircleV(s.P1, handleR, color)
+		drawCircleV(s.P2, handleR, color)
 	}
 }
 
 // drawCoupleMode draws coupling relationship lines between coupled splines
 // and highlights the currently selected first spline.
 func drawCoupleMode(splines []Spline, firstSelectedID int, hoveredSpline int, zoom float32) {
-	hardColor := rl.NewColor(80, 180, 255, 180)  // blue — hard coupling
-	softColor := rl.NewColor(180, 120, 255, 180) // purple — soft coupling
-	selectedColor := rl.NewColor(255, 200, 50, 255)
-	hoveredColor := rl.NewColor(255, 140, 30, 200)
+	hardColor := NewColor(80, 180, 255, 180)  // blue — hard coupling
+	softColor := NewColor(180, 120, 255, 180) // purple — soft coupling
+	selectedColor := NewColor(255, 200, 50, 255)
+	hoveredColor := NewColor(255, 140, 30, 200)
 	thickness := pixelsToWorld(zoom, 2)
 	r := pixelsToWorld(zoom, 5)
 
-	drawLinks := func(ids []int, spline Spline, color rl.Color) {
+	drawLinks := func(ids []int, spline Spline, color Color) {
 		midA := spline.Samples[simSamples/2]
 		for _, coupledID := range ids {
 			if coupledID <= spline.ID {
@@ -3369,9 +2535,9 @@ func drawCoupleMode(splines []Spline, firstSelectedID int, hoveredSpline int, zo
 				continue
 			}
 			midB := splines[idx].Samples[simSamples/2]
-			rl.DrawLineEx(midA, midB, thickness, color)
-			rl.DrawCircleV(midA, r, color)
-			rl.DrawCircleV(midB, r, color)
+			drawLineEx(midA, midB, thickness, color)
+			drawCircleV(midA, r, color)
+			drawCircleV(midB, r, color)
 		}
 	}
 
@@ -3384,7 +2550,7 @@ func drawCoupleMode(splines []Spline, firstSelectedID int, hoveredSpline int, zo
 	// Highlight the hovered spline.
 	if hoveredSpline >= 0 {
 		mid := splines[hoveredSpline].Samples[simSamples/2]
-		rl.DrawCircleV(mid, pixelsToWorld(zoom, 8), hoveredColor)
+		drawCircleV(mid, pixelsToWorld(zoom, 8), hoveredColor)
 	}
 
 	// Highlight the first selected spline.
@@ -3392,7 +2558,7 @@ func drawCoupleMode(splines []Spline, firstSelectedID int, hoveredSpline int, zo
 		idx := findSplineIndexByID(splines, firstSelectedID)
 		if idx >= 0 {
 			mid := splines[idx].Samples[simSamples/2]
-			rl.DrawCircleV(mid, pixelsToWorld(zoom, 10), selectedColor)
+			drawCircleV(mid, pixelsToWorld(zoom, 10), selectedColor)
 		}
 	}
 }
@@ -3403,9 +2569,9 @@ func newCutDraft() CutDraft {
 
 // splitBezierAt splits a cubic Bézier at parameter t using de Casteljau's algorithm.
 // Returns control points for the left (t=0..t) and right (t..1) sub-curves.
-func splitBezierAt(p0, p1, p2, p3 rl.Vector2, t float32) ([4]rl.Vector2, [4]rl.Vector2) {
-	lerp2 := func(a, b rl.Vector2, t float32) rl.Vector2 {
-		return rl.Vector2{X: a.X + (b.X-a.X)*t, Y: a.Y + (b.Y-a.Y)*t}
+func splitBezierAt(p0, p1, p2, p3 Vec2, t float32) ([4]Vec2, [4]Vec2) {
+	lerp2 := func(a, b Vec2, t float32) Vec2 {
+		return Vec2{X: a.X + (b.X-a.X)*t, Y: a.Y + (b.Y-a.Y)*t}
 	}
 	a1 := lerp2(p0, p1, t)
 	a2 := lerp2(p1, p2, t)
@@ -3413,14 +2579,14 @@ func splitBezierAt(p0, p1, p2, p3 rl.Vector2, t float32) ([4]rl.Vector2, [4]rl.V
 	b1 := lerp2(a1, a2, t)
 	b2 := lerp2(a2, a3, t)
 	cut := lerp2(b1, b2, t)
-	left := [4]rl.Vector2{p0, a1, b1, cut}
-	right := [4]rl.Vector2{cut, b2, a3, p3}
+	left := [4]Vec2{p0, a1, b1, cut}
+	right := [4]Vec2{cut, b2, a3, p3}
 	return left, right
 }
 
 // findNearestSplinePoint searches all precomputed samples across all splines and
 // returns the one closest to pos. Returns splineIndex, sample t (0..1), world position.
-func findNearestSplinePoint(splines []Spline, pos rl.Vector2) (splineIndex int, t float32, point rl.Vector2, found bool) {
+func findNearestSplinePoint(splines []Spline, pos Vec2) (splineIndex int, t float32, point Vec2, found bool) {
 	bestDSq := float32(math.MaxFloat32)
 	for si, spline := range splines {
 		for i := 0; i <= simSamples; i++ {
@@ -3437,7 +2603,7 @@ func findNearestSplinePoint(splines []Spline, pos rl.Vector2) (splineIndex int, 
 	return
 }
 
-func handleCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld rl.Vector2, nextSplineID int) (Stage, CutDraft, []Spline, int, bool) {
+func handleCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld Vec2, nextSplineID int) (Stage, CutDraft, []Spline, int, bool) {
 	if rl.IsKeyPressed(rl.KeyEscape) || rl.IsMouseButtonPressed(rl.MouseButtonRight) {
 		return StageIdle, newCutDraft(), splines, nextSplineID, false
 	}
@@ -3467,14 +2633,14 @@ func handleCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld rl.Vec
 			break
 		}
 		H := mouseWorld
-		mirror := rl.Vector2{X: 2*cd.CutPoint.X - H.X, Y: 2*cd.CutPoint.Y - H.Y}
+		mirror := Vec2{X: 2*cd.CutPoint.X - H.X, Y: 2*cd.CutPoint.Y - H.Y}
 
 		// Build the two final splines. Left keeps its P0/P1, gets new P2=mirror.
 		// Right gets new P1=H, keeps its P2/P3.
-		newLeft := newSpline(nextSplineID, cd.LeftP[0], cd.LeftP[1], mirror, cd.LeftP[3])
+		newLeft := simpkg.NewSpline(nextSplineID, cd.LeftP[0], cd.LeftP[1], mirror, cd.LeftP[3])
 		newLeft.Priority = cd.OriginalSplinePriority
 		nextSplineID++
-		newRight := newSpline(nextSplineID, cd.RightP[0], H, cd.RightP[2], cd.RightP[3])
+		newRight := simpkg.NewSpline(nextSplineID, cd.RightP[0], H, cd.RightP[2], cd.RightP[3])
 		newRight.Priority = cd.OriginalSplinePriority
 		nextSplineID++
 
@@ -3492,11 +2658,11 @@ func handleCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld rl.Vec
 	return stage, cd, splines, nextSplineID, false
 }
 
-func drawCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld rl.Vector2, zoom float32) {
-	snapColor := rl.NewColor(255, 180, 0, 255)
-	handleColor := rl.NewColor(255, 220, 60, 220)
-	leftColor := rl.NewColor(80, 210, 120, 255)
-	rightColor := rl.NewColor(80, 140, 230, 255)
+func drawCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld Vec2, zoom float32) {
+	snapColor := NewColor(255, 180, 0, 255)
+	handleColor := NewColor(255, 220, 60, 220)
+	leftColor := NewColor(80, 210, 120, 255)
+	rightColor := NewColor(80, 140, 230, 255)
 	thickness := pixelsToWorld(zoom, 3)
 	handleR := pixelsToWorld(zoom, 5)
 	snapR := pixelsToWorld(zoom, 8)
@@ -3506,33 +2672,33 @@ func drawCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld rl.Vecto
 		// Snap dot follows the nearest point on any spline.
 		_, _, point, found := findNearestSplinePoint(splines, mouseWorld)
 		if found {
-			rl.DrawCircleV(point, snapR, snapColor)
+			drawCircleV(point, snapR, snapColor)
 			// Small crosshair lines.
 			arm := pixelsToWorld(zoom, 10)
-			rl.DrawLineEx(rl.Vector2{X: point.X - arm, Y: point.Y}, rl.Vector2{X: point.X + arm, Y: point.Y}, pixelsToWorld(zoom, 1.5), snapColor)
-			rl.DrawLineEx(rl.Vector2{X: point.X, Y: point.Y - arm}, rl.Vector2{X: point.X, Y: point.Y + arm}, pixelsToWorld(zoom, 1.5), snapColor)
+			drawLineEx(Vec2{X: point.X - arm, Y: point.Y}, Vec2{X: point.X + arm, Y: point.Y}, pixelsToWorld(zoom, 1.5), snapColor)
+			drawLineEx(Vec2{X: point.X, Y: point.Y - arm}, Vec2{X: point.X, Y: point.Y + arm}, pixelsToWorld(zoom, 1.5), snapColor)
 		}
 
 	case StageSetP1:
 		H := mouseWorld
-		mirror := rl.Vector2{X: 2*cd.CutPoint.X - H.X, Y: 2*cd.CutPoint.Y - H.Y}
+		mirror := Vec2{X: 2*cd.CutPoint.X - H.X, Y: 2*cd.CutPoint.Y - H.Y}
 
 		// Preview left spline (green): original P0/P1, new P2=mirror, cut point.
-		previewLeft := newSpline(0, cd.LeftP[0], cd.LeftP[1], mirror, cd.LeftP[3])
+		previewLeft := simpkg.NewSpline(0, cd.LeftP[0], cd.LeftP[1], mirror, cd.LeftP[3])
 		// Preview right spline (blue): cut point, H, original P2, original P3.
-		previewRight := newSpline(0, cd.RightP[0], H, cd.RightP[2], cd.RightP[3])
+		previewRight := simpkg.NewSpline(0, cd.RightP[0], H, cd.RightP[2], cd.RightP[3])
 
 		drawSpline(previewLeft, thickness, leftColor)
 		drawSpline(previewRight, thickness, rightColor)
 
 		// Handle lines from cut point to both control handles.
-		rl.DrawLineEx(cd.CutPoint, H, pixelsToWorld(zoom, 1.5), handleColor)
-		rl.DrawLineEx(cd.CutPoint, mirror, pixelsToWorld(zoom, 1.5), handleColor)
-		rl.DrawCircleV(H, handleR, rightColor)
-		rl.DrawCircleV(mirror, handleR, leftColor)
+		drawLineEx(cd.CutPoint, H, pixelsToWorld(zoom, 1.5), handleColor)
+		drawLineEx(cd.CutPoint, mirror, pixelsToWorld(zoom, 1.5), handleColor)
+		drawCircleV(H, handleR, rightColor)
+		drawCircleV(mirror, handleR, leftColor)
 
 		// Cut point marker.
-		rl.DrawCircleV(cd.CutPoint, snapR, snapColor)
+		drawCircleV(cd.CutPoint, snapR, snapColor)
 	}
 }
 
@@ -3573,7 +2739,7 @@ func routePanelCancelRect(panel RoutePanel) rl.Rectangle {
 	return rl.NewRectangle(pr.X+202, pr.Y+pr.Height-54, 120, 32)
 }
 
-func updateRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *int, graph *RoadGraph, splines []Spline, mouse rl.Vector2) (RoutePanel, []Route, []Car, bool) {
+func updateRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *int, graph *RoadGraph, splines []Spline, mouse Vec2) (RoutePanel, []Route, []Car, bool) {
 	panelRect := routePanelRect(panel)
 	sliderRect := routePanelSliderRect(panel)
 	applyRect := routePanelApplyRect(panel)
@@ -3669,7 +2835,7 @@ func applyRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *
 			routes[idx].PathLength = panel.PathLength
 			routes[idx].Valid = len(panel.PathIDs) > 0
 			routes[idx].ColorIndex = panel.ColorIndex
-			routes[idx].Color = routePaletteColor(panel.ColorIndex)
+			routes[idx].Color = simpkg.RoutePaletteColor(panel.ColorIndex)
 			routes[idx].VehicleKind = panel.VehicleKind
 			routes[idx].BusStops = append([]BusStop(nil), panel.BusStops...)
 			if routes[idx].NextSpawnIn <= 0 {
@@ -3694,7 +2860,7 @@ func applyRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *
 		NextSpawnIn:    randomizedSpawnDelay(spawn),
 		Valid:          len(panel.PathIDs) > 0,
 		ColorIndex:     panel.ColorIndex,
-		Color:          routePaletteColor(panel.ColorIndex),
+		Color:          simpkg.RoutePaletteColor(panel.ColorIndex),
 		VehicleKind:    panel.VehicleKind,
 		BusStops:       append([]BusStop(nil), panel.BusStops...),
 	}
@@ -3707,1259 +2873,8 @@ func refreshRoutes(routes []Route, splines []Spline) []Route {
 }
 
 func updateRouteVisuals(routes []Route, splines []Spline, vehicleCounts map[int]int) []Route {
-	graph := newRoadGraph(splines, vehicleCounts)
-	return updateRouteVisualsWithGraph(routes, graph)
-}
-
-func updateRouteVisualsWithGraph(routes []Route, graph *RoadGraph) []Route {
-	for i := range routes {
-		pathIDs, pathLength, _, ok := computeRoutePathWithGraph(routes[i], graph)
-		routes[i].PathIDs = pathIDs
-		routes[i].PathLength = pathLength
-		routes[i].Valid = ok && len(pathIDs) > 0
-		if routes[i].SpawnPerMinute > 0 && routes[i].NextSpawnIn <= 0 {
-			routes[i].NextSpawnIn = randomizedSpawnDelay(routes[i].SpawnPerMinute)
-		}
-	}
-	return routes
-}
-
-func updateRouteSpawning(routes []Route, cars []Car, splines []Spline, dt float32) ([]Route, []Car) {
-	for i := range routes {
-		if !routes[i].Valid || routes[i].SpawnPerMinute <= 0 {
-			continue
-		}
-		routes[i].NextSpawnIn -= dt
-		if routes[i].NextSpawnIn > 0 {
-			continue
-		}
-		candidate := spawnVehicle(routes[i], splines)
-		if !spawnBlocked(candidate, cars, splines) {
-			cars = append(cars, candidate)
-			routes[i].NextSpawnIn = randomizedSpawnDelay(routes[i].SpawnPerMinute)
-		}
-		// If blocked, NextSpawnIn stays ≤ 0 so we retry next frame.
-	}
-	return routes, cars
-}
-
-// spawnBlocked returns true if placing candidate at its spawn point would
-// immediately overlap with any existing car using the circle hitbox chain.
-func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
-	spline, ok := findSplineByID(splines, candidate.CurrentSplineID)
-	if !ok {
-		return false
-	}
-	frontPos, _ := sampleSplineAtDistance(spline, 0)
-	cCenter := vecScale(vecAdd(frontPos, candidate.RearPosition), 0.5)
-	cHeading := normalize(vecSub(frontPos, candidate.RearPosition))
-	rC := collisionRadius(candidate)
-	candidateOffsets := collisionCircleOffsets(candidate)
-
-	for _, other := range cars {
-		if other.CurrentSplineID != candidate.CurrentSplineID {
-			continue // only cars on the same spline can overlap with a fresh spawn
-		}
-		otherSpline, ok := findSplineByID(splines, other.CurrentSplineID)
-		if !ok {
-			continue
-		}
-		otherFront, _ := sampleSplineAtDistance(otherSpline, other.DistanceOnSpline)
-		oCenter := vecScale(vecAdd(otherFront, other.RearPosition), 0.5)
-		oHeading := normalize(vecSub(otherFront, other.RearPosition))
-		rO := collisionRadius(other)
-		thresh := rC + rO
-		threshSq := thresh * thresh
-		otherOffsets := collisionCircleOffsets(other)
-
-		for _, offC := range candidateOffsets {
-			cCircle := vecAdd(cCenter, vecScale(cHeading, offC))
-			for _, offO := range otherOffsets {
-				oCircle := vecAdd(oCenter, vecScale(oHeading, offO))
-				if distSq(cCircle, oCircle) <= threshSq {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-func spawnVehicle(route Route, splines []Spline) Car {
-	length := randRange(4.0, 4.8) / metersPerUnit
-	width := randRange(1.8, 2.0) / metersPerUnit
-	maxSpeed := randRange(22.2, 36.1)
-	accel := randRange(2.5, 4.5)
-	curveSpeedMultiplier := randRange(0.8, 1.2)
-	if route.VehicleKind == VehicleBus {
-		length = randRange(9.5, 13.0) / metersPerUnit
-		width = randRange(2.45, 2.65) / metersPerUnit
-		maxSpeed = randRange(13.9, 20.0)
-		accel = randRange(1.2, 2.0)
-		curveSpeedMultiplier = randRange(0.9, 1.05)
-	}
-
-	car := Car{
-		RouteID:              route.ID,
-		CurrentSplineID:      route.StartSplineID,
-		DestinationSplineID:  currentRouteTarget(route, 0),
-		PrevSplineIDs:        [2]int{-1, -1},
-		DistanceOnSpline:     0,
-		Speed:                randRange(0, 2),
-		MaxSpeed:             maxSpeed,
-		Accel:                accel,
-		Length:               length,
-		Width:                width,
-		CurveSpeedMultiplier: curveSpeedMultiplier,
-		Color:                route.Color,
-		Braking:              false,
-		LaneChangeSplineID:   -1,
-		AfterSplineID:        -1,
-		DesiredLaneSplineID:  -1,
-		PreferenceCooldown:   rand.Float32() * preferenceChangeCooldownS,
-		OvertakeCooldown:     rand.Float32() * overtakeCooldownS,
-		VehicleKind:          route.VehicleKind,
-	}
-	// Initialise rear pivot behind the front pivot along the spawn spline tangent.
-	if spline, ok := findSplineByID(splines, route.StartSplineID); ok {
-		frontPos, tangent := sampleSplineAtDistance(spline, 0)
-		car.RearPosition = vecSub(frontPos, vecScale(tangent, car.Length*wheelbaseFrac))
-
-		// 20% chance of spawning with a cargo trailer.
-		if route.VehicleKind == VehicleCar && rand.Float32() < 0.20 {
-			tLen := randRange(7.0, 10.0)
-			tWid := randRange(2.0, 2.4)
-			// Trailer rear pivot starts behind the cab's rear pivot by the trailer wheelbase.
-			trailerRear := vecSub(car.RearPosition, vecScale(tangent, tLen*wheelbaseFrac))
-			r, g, b := car.Color.R, car.Color.G, car.Color.B
-			car.Trailer = Trailer{
-				HasTrailer:   true,
-				Length:       tLen,
-				Width:        tWid,
-				Color:        rl.NewColor(r/2+20, g/2+20, b/2+20, 255),
-				RearPosition: trailerRear,
-			}
-		}
-	}
-	return car
-}
-
-func beginBusStopDwell(route Route, car *Car) bool {
-	if route.VehicleKind != VehicleBus || car.NextBusStopIndex >= len(route.BusStops) {
-		return false
-	}
-	stop := route.BusStops[car.NextBusStopIndex]
-	car.Speed = 0
-	car.BusStopDuration = randRange(busStopMinDwellSeconds, busStopMaxDwellSeconds)
-	car.BusStopTimer = car.BusStopDuration
-	car.NextBusStopIndex++
-	if car.CurrentSplineID == stop.SplineID {
-		car.DestinationSplineID = currentRouteTarget(route, car.NextBusStopIndex)
-	} else {
-		// Hold the current stop spline as the immediate target until the bus
-		// physically enters it after the dwell.
-		car.DestinationSplineID = stop.SplineID
-	}
-	return true
-}
-
-func resumeBusRouteAfterStop(route Route, car *Car) {
-	if route.VehicleKind != VehicleBus || car.NextBusStopIndex <= 0 || car.NextBusStopIndex > len(route.BusStops) {
-		return
-	}
-	prevStopSplineID := route.BusStops[car.NextBusStopIndex-1].SplineID
-	if car.CurrentSplineID == prevStopSplineID {
-		car.DestinationSplineID = currentRouteTarget(route, car.NextBusStopIndex)
-	}
-}
-
-func computeBusStopSpeedCap(car Car, route Route, currentSpline Spline, graph *RoadGraph) float32 {
-	if route.VehicleKind != VehicleBus || car.NextBusStopIndex >= len(route.BusStops) {
-		return float32(math.MaxFloat32)
-	}
-	stopSplineID := route.BusStops[car.NextBusStopIndex].SplineID
-	decel := car.Accel * 1.5
-
-	checkStop := func(rawDistAhead float32) float32 {
-		adj := rawDistAhead - stopFrontGapM
-		if adj <= 0 {
-			return 0
-		}
-		return float32(math.Sqrt(float64(2 * decel * adj)))
-	}
-
-	if currentSpline.ID == stopSplineID {
-		if car.DistanceOnSpline <= stopFrontGapM {
-			return 0
-		}
-		return float32(math.MaxFloat32)
-	}
-
-	nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, stopSplineID, car.VehicleKind)
-	if !ok {
-		forcedNext, _, forcedOK := findForcedLaneChangePathWithGraph(graph, currentSpline.ID, stopSplineID, car.VehicleKind)
-		if !forcedOK {
-			return float32(math.MaxFloat32)
-		}
-		nextID = forcedNext
-	}
-	if nextID != stopSplineID {
-		return float32(math.MaxFloat32)
-	}
-	return checkStop(currentSpline.Length - car.DistanceOnSpline)
-}
-
-func shouldBeginBusStopDwell(car Car, route Route, currentSpline Spline, graph *RoadGraph) bool {
-	if route.VehicleKind != VehicleBus || car.BusStopTimer > 0 || car.NextBusStopIndex >= len(route.BusStops) {
-		return false
-	}
-	stopSplineID := route.BusStops[car.NextBusStopIndex].SplineID
-	const stopSpeedThreshold = 0.35
-	if car.Speed > stopSpeedThreshold {
-		return false
-	}
-
-	stopSlack := stopFrontGapM + 0.5
-	if currentSpline.ID == stopSplineID {
-		return car.DistanceOnSpline <= stopSlack
-	}
-
-	nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, stopSplineID, car.VehicleKind)
-	if !ok {
-		forcedNext, _, forcedOK := findForcedLaneChangePathWithGraph(graph, currentSpline.ID, stopSplineID, car.VehicleKind)
-		if !forcedOK {
-			return false
-		}
-		nextID = forcedNext
-	}
-	if nextID != stopSplineID {
-		return false
-	}
-	remaining := currentSpline.Length - car.DistanceOnSpline
-	return remaining <= stopSlack
-}
-
-// recentlyLeft returns true if the car was on splineID within its last two transitions.
-// Used to suppress false blame when a car exits a priority lane onto a normal lane.
-func recentlyLeft(car Car, splineID int) bool {
-	return splineID >= 0 && (car.PrevSplineIDs[0] == splineID || car.PrevSplineIDs[1] == splineID)
-}
-
-func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []DebugBlameLink, []DebugBlameLink) {
-	flags := make([]bool, len(cars))
-	holdSpeed := make([]bool, len(cars))
-	initialBlame := make([]bool, len(cars))
-	tentativeLinks := make([]DebugBlameLink, 0)
-	holdLinks := make([]DebugBlameLink, 0)
-	if len(cars) < 2 {
-		return flags, holdSpeed, tentativeLinks, holdLinks
-	}
-
-	predictions := make([][]TrajectorySample, len(cars))
-	stationaryPredictions := make([][]TrajectorySample, len(cars)) // lazily populated on first blame check
-	poses := make([]carPose, len(cars))
-	reach := make([]float32, len(cars))
-	for i, car := range cars {
-		if spline, ok := graph.splineByID(car.CurrentSplineID); ok {
-			pos, heading := sampleSplineAtDistance(spline, car.DistanceOnSpline)
-			poses[i] = carPose{pos: pos, heading: heading}
-		}
-		physicalSize := maxf(car.Length, car.Width)
-		if car.Trailer.HasTrailer {
-			physicalSize = car.Length + car.Trailer.Length
-		}
-		reach[i] = maxf(car.Speed, 0)*predictionHorizonSeconds + 0.5*car.Accel*predictionHorizonSeconds*predictionHorizonSeconds +
-			physicalSize + collisionBroadPhaseSlackM
-		predictions[i] = predictCarTrajectory(car, graph, predictionHorizonSeconds, predictionStepSeconds)
-	}
-
-	for i := 0; i < len(cars); i++ {
-		if len(predictions[i]) == 0 {
-			continue
-		}
-		for j := i + 1; j < len(cars); j++ {
-			if len(predictions[j]) == 0 {
-				continue
-			}
-			broadPhaseDist := reach[i] + reach[j]
-			if distSq(poses[i].pos, poses[j].pos) > broadPhaseDist*broadPhaseDist {
-				continue
-			}
-			collision, ok := predictCollision(predictions[i], predictions[j], cars[i], cars[j])
-			if !ok {
-				continue
-			}
-			blameI, blameJ := determineBlame(collision, cars[i], cars[j], graph.splines)
-			alreadyCollided := collision.AlreadyCollided
-			// Suppress blame if the blamed car recently left the other car's current spline —
-			// it has already cleared that segment and the other car is following behind.
-			if blameI && recentlyLeft(cars[i], cars[j].CurrentSplineID) {
-				blameI = false
-			}
-			if blameJ && recentlyLeft(cars[j], cars[i].CurrentSplineID) {
-				blameJ = false
-			}
-			// Suppress blame if the conflict would happen even when the blamed car is
-			// standing still — braking can never resolve such a conflict.
-			if blameI && !alreadyCollided {
-				if stationaryPredictions[i] == nil {
-					sc := cars[i]
-					sc.Speed = 0
-					stationaryPredictions[i] = predictCarTrajectory(sc, graph, predictionHorizonSeconds, predictionStepSeconds)
-				}
-				if _, still := predictCollision(stationaryPredictions[i], predictions[j], cars[i], cars[j]); still {
-					blameI = false
-				}
-			}
-			if blameJ && !alreadyCollided {
-				if stationaryPredictions[j] == nil {
-					sc := cars[j]
-					sc.Speed = 0
-					stationaryPredictions[j] = predictCarTrajectory(sc, graph, predictionHorizonSeconds, predictionStepSeconds)
-				}
-				if _, still := predictCollision(stationaryPredictions[j], predictions[i], cars[j], cars[i]); still {
-					blameJ = false
-				}
-			}
-			if blameI {
-				initialBlame[i] = true
-				tentativeLinks = append(tentativeLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
-			}
-			if blameJ {
-				initialBlame[j] = true
-				tentativeLinks = append(tentativeLinks, DebugBlameLink{FromCarIndex: j, ToCarIndex: i})
-			}
-		}
-	}
-
-	for i := range cars {
-		if !initialBlame[i] {
-			continue
-		}
-		if shouldBrakeForBlamedConflicts(i, cars, graph, predictions) {
-			flags[i] = true
-		}
-	}
-
-	// For cars that are not braking, check whether they would be blamed for a
-	// collision if travelling slightly faster (current speed + 0.25s of acceleration).
-	// If so, hold the current speed rather than accelerating into the conflict.
-	for i, car := range cars {
-		if flags[i] || len(predictions[i]) == 0 {
-			continue
-		}
-		fasterCar := car
-		fasterCar.Speed += 0.25 * fasterCar.Accel
-		if fasterCar.Speed <= car.Speed+1e-4 {
-			continue // already at or near max — nothing to hold back
-		}
-		fasterPred := predictCarTrajectory(fasterCar, graph, predictionHorizonSeconds, predictionStepSeconds)
-		if len(fasterPred) == 0 {
-			continue
-		}
-		for j := range cars {
-			if i == j || len(predictions[j]) == 0 {
-				continue
-			}
-			broadPhaseDist := reach[i] + reach[j]
-			if distSq(poses[i].pos, poses[j].pos) > broadPhaseDist*broadPhaseDist {
-				continue
-			}
-			collision, ok := predictCollision(fasterPred, predictions[j], fasterCar, cars[j])
-			if !ok {
-				continue
-			}
-			blameI, _ := determineBlame(collision, fasterCar, cars[j], graph.splines)
-			if blameI && !recentlyLeft(fasterCar, cars[j].CurrentSplineID) {
-				if collision.AlreadyCollided {
-					holdSpeed[i] = true
-					holdLinks = append(holdLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
-					break
-				}
-				// Suppress if the collision is unavoidable even when standing still —
-				// consistent with how braking blame is suppressed above.
-				if stationaryPredictions[i] == nil {
-					sc := cars[i]
-					sc.Speed = 0
-					stationaryPredictions[i] = predictCarTrajectory(sc, graph, predictionHorizonSeconds, predictionStepSeconds)
-				}
-				if _, still := predictCollision(stationaryPredictions[i], predictions[j], cars[i], cars[j]); !still {
-					holdSpeed[i] = true
-					holdLinks = append(holdLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
-					break
-				}
-			}
-		}
-	}
-
-	// Deadlock detection: break cycles of up to 4 hops in the actual
-	// frame-level yield graph. A yield edge can come from either braking
-	// blame or "hold speed instead of accelerating" blame.
-	released := detectDeadlockReleases(len(cars), tentativeLinks, holdLinks, flags, holdSpeed)
-	for i := range released {
-		if !released[i] {
-			continue
-		}
-		flags[i] = false
-		holdSpeed[i] = false
-	}
-
-	debugLinks := make([]DebugBlameLink, 0, len(tentativeLinks))
-	for _, link := range tentativeLinks {
-		if link.FromCarIndex >= 0 && link.FromCarIndex < len(flags) && flags[link.FromCarIndex] {
-			debugLinks = append(debugLinks, link)
-		}
-	}
-	activeHoldLinks := make([]DebugBlameLink, 0, len(holdLinks))
-	for _, link := range holdLinks {
-		if link.FromCarIndex >= 0 && link.FromCarIndex < len(holdSpeed) && holdSpeed[link.FromCarIndex] {
-			activeHoldLinks = append(activeHoldLinks, link)
-		}
-	}
-
-	return flags, holdSpeed, debugLinks, activeHoldLinks
-}
-
-func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, graph *RoadGraph, predictions [][]TrajectorySample) bool {
-	if carIndex < 0 || carIndex >= len(cars) {
-		return false
-	}
-
-	car := cars[carIndex]
-	currentSpline, ok := graph.splineByID(car.CurrentSplineID)
-	if !ok {
-		return true
-	}
-
-	targetSpeed := car.MaxSpeed * currentSpline.SpeedFactor
-	if car.Speed >= targetSpeed-accelEscapeLookaheadSecs*car.Accel {
-		return true
-	}
-
-	for _, seconds := range []float32{
-		accelEscapeTestShortSecs,
-		accelEscapeTestMediumSecs,
-	} {
-		testCar := car
-		testCar.Speed = minf(targetSpeed, car.Speed+car.Accel*seconds)
-		if testCar.Speed <= car.Speed+1e-4 {
-			return true
-		}
-
-		testPrediction := predictCarTrajectory(testCar, graph, predictionHorizonSeconds, predictionStepSeconds)
-		if len(testPrediction) == 0 {
-			return true
-		}
-		if hasBlamedConflictWithPrediction(carIndex, testCar, testPrediction, cars, graph, predictions) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction []TrajectorySample, cars []Car, graph *RoadGraph, predictions [][]TrajectorySample) bool {
-	for otherIndex, otherCar := range cars {
-		if otherIndex == carIndex || otherIndex >= len(predictions) || len(predictions[otherIndex]) == 0 {
-			continue
-		}
-		if recentlyLeft(testCar, otherCar.CurrentSplineID) {
-			continue
-		}
-
-		collision, ok := predictCollision(testPrediction, predictions[otherIndex], testCar, otherCar)
-		if !ok {
-			continue
-		}
-
-		blameTestCar, _ := determineBlame(collision, testCar, otherCar, graph.splines)
-		if blameTestCar {
-			return true
-		}
-	}
-	return false
-}
-
-func detectDeadlockReleases(numCars int, brakeLinks, holdLinks []DebugBlameLink, braking []bool, holdSpeed []bool) []bool {
-	if numCars <= 1 {
-		return nil
-	}
-
-	outgoing := make([][]int, numCars)
-	addActiveLinks := func(links []DebugBlameLink, active []bool) {
-		for _, link := range links {
-			if link.FromCarIndex < 0 || link.FromCarIndex >= numCars || link.ToCarIndex < 0 || link.ToCarIndex >= numCars {
-				continue
-			}
-			if link.FromCarIndex >= len(active) || !active[link.FromCarIndex] {
-				continue
-			}
-			outgoing[link.FromCarIndex] = append(outgoing[link.FromCarIndex], link.ToCarIndex)
-		}
-	}
-	addActiveLinks(brakeLinks, braking)
-	addActiveLinks(holdLinks, holdSpeed)
-
-	released := make([]bool, numCars)
-	path := make([]int, 4)
-	for start := 0; start < numCars; start++ {
-		if len(outgoing[start]) == 0 {
-			continue
-		}
-		path[0] = start
-		var search func(pathLen int)
-		search = func(pathLen int) {
-			cur := path[pathLen-1]
-			for _, next := range outgoing[cur] {
-				if next == start {
-					minIdx := path[0]
-					for i := 1; i < pathLen; i++ {
-						if path[i] < minIdx {
-							minIdx = path[i]
-						}
-					}
-					released[minIdx] = true
-					continue
-				}
-				if pathLen >= len(path) {
-					continue
-				}
-				repeated := false
-				for i := 0; i < pathLen; i++ {
-					if path[i] == next {
-						repeated = true
-						break
-					}
-				}
-				if repeated {
-					continue
-				}
-				path[pathLen] = next
-				search(pathLen + 1)
-			}
-		}
-		search(1)
-	}
-
-	return released
-}
-
-func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []TrajectorySample {
-	if len(graph.splines) == 0 || car.CurrentSplineID < 0 {
-		return nil
-	}
-
-	steps := int(math.Ceil(float64(horizon / step)))
-	samples := make([]TrajectorySample, 0, steps+1)
-	simCar := car
-	simRearPos := car.RearPosition
-	simTrailerRearPos := car.Trailer.RearPosition
-	speed := maxf(car.Speed, 0)
-	active := true
-
-	for stepIndex := 0; stepIndex <= steps; stepIndex++ {
-		spline, ok := graph.splineByID(simCar.CurrentSplineID)
-		if !ok {
-			break
-		}
-		splinePos, splineTangent := sampleSplineAtDistance(spline, simCar.DistanceOnSpline)
-		// Advance lateral offset toward curvature-compensation target.
-		κ := signedCurvatureAtArcLen(&spline, simCar.DistanceOnSpline)
-		wb := simCar.Length * wheelbaseFrac
-		targetOffset := κ * wb * wb / 6
-		if simCar.Trailer.HasTrailer {
-			trailerWb := simCar.Trailer.Length * wheelbaseFrac
-			targetOffset = κ * (wb*wb + trailerWb*trailerWb) / 6
-		}
-		lerpRate := speed / (2 * (wb + 0.01))
-		simCar.LateralOffset += (targetOffset - simCar.LateralOffset) * clampf(lerpRate*step, 0, 1)
-		rightNormal := rl.Vector2{X: splineTangent.Y, Y: -splineTangent.X}
-		frontPos := vecAdd(splinePos, vecScale(rightNormal, simCar.LateralOffset))
-		// Pull simulated rear pivot toward front pivot maintaining wheelbase length.
-		rearToFront := vecSub(frontPos, simRearPos)
-		if vectorLengthSq(rearToFront) > 1e-9 {
-			simRearPos = vecSub(frontPos, vecScale(normalize(rearToFront), simCar.Length*wheelbaseFrac))
-		} else {
-			simRearPos = vecSub(frontPos, vecScale(splineTangent, simCar.Length*wheelbaseFrac))
-		}
-		center := vecScale(vecAdd(frontPos, simRearPos), 0.5)
-		bodyHeading := normalize(vecSub(frontPos, simRearPos))
-
-		sample := TrajectorySample{
-			Time:     float32(stepIndex) * step,
-			Position: center,
-			Heading:  bodyHeading,
-			Priority: spline.Priority,
-			SplineID: spline.ID,
-		}
-
-		// Pull trailer rear pivot toward hitch (cab rear pivot), populate sample.
-		if simCar.Trailer.HasTrailer {
-			hitchPos := simRearPos
-			trailerRearToHitch := vecSub(hitchPos, simTrailerRearPos)
-			if vectorLengthSq(trailerRearToHitch) > 1e-9 {
-				simTrailerRearPos = vecSub(hitchPos, vecScale(normalize(trailerRearToHitch), simCar.Trailer.Length*wheelbaseFrac))
-			} else {
-				simTrailerRearPos = vecSub(hitchPos, vecScale(splineTangent, simCar.Trailer.Length*wheelbaseFrac))
-			}
-			trailerCenter := vecScale(vecAdd(hitchPos, simTrailerRearPos), 0.5)
-			trailerHeading := normalize(vecSub(hitchPos, simTrailerRearPos))
-			sample.HasTrailer = true
-			sample.TrailerPosition = trailerCenter
-			sample.TrailerHeading = trailerHeading
-		}
-
-		samples = append(samples, sample)
-
-		if !active {
-			break
-		}
-		if stepIndex == steps || speed <= 0.01 {
-			continue
-		}
-
-		move := speed * step
-		for move > 0 && active {
-			currentSpline, ok := graph.splineByID(simCar.CurrentSplineID)
-			if !ok {
-				active = false
-				break
-			}
-			remaining := currentSpline.Length - simCar.DistanceOnSpline
-			if move <= remaining {
-				simCar.DistanceOnSpline += move
-				move = 0
-				break
-			}
-
-			overshoot := move - remaining
-			move = overshoot
-
-			if simCar.CurrentSplineID == simCar.DestinationSplineID {
-				// Clamp the final predicted position to the end of the destination
-				// spline. Resetting to 0 here makes the car appear back at the start
-				// of the destination lane, which creates false entry collisions.
-				simCar.DistanceOnSpline = currentSpline.Length
-				active = false
-				break
-			}
-
-			simCar.DistanceOnSpline = 0
-
-			// Lane-change bridge completed in trajectory sim.
-			if simCar.LaneChanging && simCar.CurrentSplineID == simCar.LaneChangeSplineID {
-				simCar.PrevSplineIDs[1] = simCar.PrevSplineIDs[0]
-				simCar.PrevSplineIDs[0] = simCar.CurrentSplineID
-				simCar.CurrentSplineID = simCar.AfterSplineID
-				simCar.DistanceOnSpline = simCar.AfterSplineDist
-				simCar.LaneChanging = false
-				simCar.LaneChangeSplineID = -1
-				continue
-			}
-
-			nextSplineID, ok := chooseNextSplineOnBestPathWithGraph(graph, simCar.CurrentSplineID, simCar.DestinationSplineID, simCar.VehicleKind)
-			if !ok {
-				forcedNext, _, forcedOk := findForcedLaneChangePathWithGraph(graph, simCar.CurrentSplineID, simCar.DestinationSplineID, simCar.VehicleKind)
-				if !forcedOk {
-					active = false
-					break
-				}
-				nextSplineID = forcedNext
-			}
-			simCar.CurrentSplineID = nextSplineID
-		}
-	}
-
-	return samples
-}
-
-func predictCollision(aSamples, bSamples []TrajectorySample, carA, carB Car) (CollisionPrediction, bool) {
-	count := len(aSamples)
-	if len(bSamples) < count {
-		count = len(bSamples)
-	}
-	if count == 0 {
-		return CollisionPrediction{}, false
-	}
-
-	rA := collisionRadius(carA)
-	rB := collisionRadius(carB)
-	offsetsA := collisionCircleOffsets(carA)
-	offsetsB := collisionCircleOffsets(carB)
-
-	// Precompute trailer hitbox data (empty slices/zero radius when no trailer).
-	var rTA, rTB float32
-	var trailerOffsetsA, trailerOffsetsB []float32
-	if carA.Trailer.HasTrailer {
-		rTA = hitboxRadius(carA.Trailer.Width)
-		trailerOffsetsA = hitboxCircleOffsets(carA.Trailer.Length, carA.Trailer.Width)
-	}
-	if carB.Trailer.HasTrailer {
-		rTB = hitboxRadius(carB.Trailer.Width)
-		trailerOffsetsB = hitboxCircleOffsets(carB.Trailer.Length, carB.Trailer.Width)
-	}
-
-	// checkCircleGroups returns true if any circle from group A overlaps any from group B.
-	checkCircleGroups := func(cenA, hA rl.Vector2, offsA []float32, rA float32,
-		cenB, hB rl.Vector2, offsB []float32, rB float32) bool {
-		threshSq := (rA + rB) * (rA + rB)
-		for _, offA := range offsA {
-			cA := vecAdd(cenA, vecScale(hA, offA))
-			for _, offB := range offsB {
-				if distSq(cA, vecAdd(cenB, vecScale(hB, offB))) <= threshSq {
-					return true
-				}
-			}
-		}
-		return false
-	}
-
-	// Coarse reject: bounding circle centred on cab, expanded to cover trailer.
-	coarseRA := carA.Length/2 + 1.0
-	if carA.Trailer.HasTrailer {
-		coarseRA += carA.Trailer.Length + 1.0
-	}
-	coarseRB := carB.Length/2 + 1.0
-	if carB.Trailer.HasTrailer {
-		coarseRB += carB.Trailer.Length + 1.0
-	}
-	coarseDistSq := (coarseRA + coarseRB) * (coarseRA + coarseRB)
-
-	for i := 0; i < count; i++ {
-		pA, hA := aSamples[i].Position, aSamples[i].Heading
-		pB, hB := bSamples[i].Position, bSamples[i].Heading
-		if distSq(pA, pB) > coarseDistSq {
-			continue
-		}
-
-		// Check all four cab/trailer combinations.
-		collides := checkCircleGroups(pA, hA, offsetsA, rA, pB, hB, offsetsB, rB)
-
-		if !collides && aSamples[i].HasTrailer {
-			collides = checkCircleGroups(aSamples[i].TrailerPosition, aSamples[i].TrailerHeading, trailerOffsetsA, rTA,
-				pB, hB, offsetsB, rB)
-		}
-		if !collides && bSamples[i].HasTrailer {
-			collides = checkCircleGroups(pA, hA, offsetsA, rA,
-				bSamples[i].TrailerPosition, bSamples[i].TrailerHeading, trailerOffsetsB, rTB)
-		}
-		if !collides && aSamples[i].HasTrailer && bSamples[i].HasTrailer {
-			collides = checkCircleGroups(aSamples[i].TrailerPosition, aSamples[i].TrailerHeading, trailerOffsetsA, rTA,
-				bSamples[i].TrailerPosition, bSamples[i].TrailerHeading, trailerOffsetsB, rTB)
-		}
-
-		if !collides {
-			continue
-		}
-		prevIndex := i - 1
-		if prevIndex < 0 {
-			prevIndex = 0
-		}
-		return CollisionPrediction{
-			Time:            aSamples[i].Time,
-			PosA:            pA,
-			PosB:            pB,
-			PrevPosA:        aSamples[prevIndex].Position,
-			PrevPosB:        bSamples[prevIndex].Position,
-			HeadingA:        hA,
-			HeadingB:        hB,
-			AlreadyCollided: i == 0,
-			PriorityA:       aSamples[i].Priority,
-			PriorityB:       bSamples[i].Priority,
-			SplineAID:       aSamples[i].SplineID,
-			SplineBID:       bSamples[i].SplineID,
-		}, true
-	}
-
-	return CollisionPrediction{}, false
-}
-
-func determineBlame(collision CollisionPrediction, carA, carB Car, splines []Spline) (bool, bool) {
-	if collision.AlreadyCollided {
-		if headingAngleDegrees(collision.HeadingA, collision.HeadingB) >= 60 {
-			return false, false
-		}
-		return blameRearCar(collision, carA, carB)
-	}
-	if collision.PriorityA != collision.PriorityB {
-		if collision.PriorityA {
-			if normalCarOccupiesPriorityCollisionSpline(carB, collision.SplineAID, splines) {
-				return true, false
-			}
-			return false, true
-		}
-		if normalCarOccupiesPriorityCollisionSpline(carA, collision.SplineBID, splines) {
-			return false, true
-		}
-		return true, false
-	}
-
-	angleDeg := headingAngleDegrees(collision.HeadingA, collision.HeadingB)
-	if angleDeg < blameAngleThresholdDeg {
-		return blameRearCar(collision, carA, carB)
-	}
-	return blameLeftCar(collision, carA, carB)
-}
-
-func blameRearCar(collision CollisionPrediction, carA, carB Car) (bool, bool) {
-	referenceHeading := normalize(vecAdd(collision.HeadingA, collision.HeadingB))
-	if vectorLengthSq(referenceHeading) <= 1e-6 {
-		referenceHeading = normalize(collision.HeadingA)
-	}
-
-	relPrev := vecSub(collision.PrevPosA, collision.PrevPosB)
-	projection := dot(relPrev, referenceHeading)
-	if absf(projection) < 1e-4 {
-		projection = dot(vecSub(collision.PosA, collision.PosB), referenceHeading)
-	}
-	if absf(projection) < 1e-4 {
-		if carA.Speed > carB.Speed {
-			return true, false
-		}
-		if carB.Speed > carA.Speed {
-			return false, true
-		}
-		if carA.RouteID <= carB.RouteID {
-			return true, false
-		}
-		return false, true
-	}
-
-	if projection < 0 {
-		return true, false
-	}
-	return false, true
-}
-
-func blameLeftCar(collision CollisionPrediction, carA, carB Car) (bool, bool) {
-	relToBFromA := vecSub(collision.PrevPosB, collision.PrevPosA)
-	relToAFromB := vecSub(collision.PrevPosA, collision.PrevPosB)
-	if vectorLengthSq(relToBFromA) <= 1e-6 || vectorLengthSq(relToAFromB) <= 1e-6 {
-		relToBFromA = vecSub(collision.PosB, collision.PosA)
-		relToAFromB = vecSub(collision.PosA, collision.PosB)
-	}
-
-	bearingToBFromA := signedAngleDegrees(collision.HeadingA, relToBFromA)
-	bearingToAFromB := signedAngleDegrees(collision.HeadingB, relToAFromB)
-	const sideEps float32 = 1.0
-
-	if bearingToBFromA < -sideEps && bearingToAFromB > sideEps {
-		return false, true
-	}
-	if bearingToAFromB < -sideEps && bearingToBFromA > sideEps {
-		return true, false
-	}
-
-	crossHeading := cross2D(collision.HeadingA, collision.HeadingB)
-	if crossHeading < 0 {
-		return true, false
-	}
-	if crossHeading > 0 {
-		return false, true
-	}
-
-	if carA.RouteID <= carB.RouteID {
-		return false, true
-	}
-	return true, false
-}
-
-func normalCarOccupiesPriorityCollisionSpline(car Car, prioritySplineID int, splines []Spline) bool {
-	if prioritySplineID < 0 {
-		return false
-	}
-	prioritySpline, ok := findSplineByID(splines, prioritySplineID)
-	if !ok || !prioritySpline.Priority {
-		return false
-	}
-	return carHitboxTouchesSpline(car, prioritySpline, splines)
-}
-
-func carHitboxTouchesSpline(car Car, targetSpline Spline, splines []Spline) bool {
-	currentSpline, ok := findSplineByID(splines, car.CurrentSplineID)
-	if !ok {
-		return false
-	}
-	splinePos3, splineTangent := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
-	rightNormal3 := rl.Vector2{X: splineTangent.Y, Y: -splineTangent.X}
-	frontPos := vecAdd(splinePos3, vecScale(rightNormal3, car.LateralOffset))
-	bodyHeading := normalize(vecSub(frontPos, car.RearPosition))
-	if vectorLengthSq(vecSub(frontPos, car.RearPosition)) <= 1e-9 {
-		bodyHeading = splineTangent
-	}
-	center := vecScale(vecAdd(frontPos, car.RearPosition), 0.5)
-	radius := collisionRadius(car)
-	radiusSq := radius * radius
-	for _, offset := range collisionCircleOffsets(car) {
-		circle := vecAdd(center, vecScale(bodyHeading, offset))
-		nearest := nearestSampleOnSpline(targetSpline, circle)
-		if distSq(circle, nearest) <= radiusSq {
-			return true
-		}
-	}
-	return false
-}
-
-func buildLookaheadSplineSets(cars []Car, graph *RoadGraph, lookahead float32) []map[int]bool {
-	pathSets := make([]map[int]bool, len(cars))
-	for i, car := range cars {
-		set := map[int]bool{car.CurrentSplineID: true}
-		currentSpline, ok := graph.splineByID(car.CurrentSplineID)
-		if !ok {
-			pathSets[i] = set
-			continue
-		}
-		covered := currentSpline.Length - car.DistanceOnSpline
-		curID := car.CurrentSplineID
-		for steps := 0; covered < lookahead && steps < len(graph.splines); steps++ {
-			nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, curID, car.DestinationSplineID, car.VehicleKind)
-			if !ok {
-				break
-			}
-			set[nextID] = true
-			nextSpline, ok := graph.splineByID(nextID)
-			if !ok {
-				break
-			}
-			covered += nextSpline.Length
-			curID = nextID
-		}
-		pathSets[i] = set
-	}
-	return pathSets
-}
-
-// computeFollowingSpeedCaps returns, for each car, the maximum speed it should
-// target due to a leading car ahead on the same path. The cap equals the
-// leader's current speed. Returns math.MaxFloat32 (no cap) when no leader is
-// found within followLookaheadM or the car is already braking.
-func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
-	caps := make([]float32, len(cars))
-	for i := range caps {
-		caps[i] = math.MaxFloat32
-	}
-
-	// Pre-compute world positions and headings for all cars.
-	poses := make([]carPose, len(cars))
-	for i, car := range cars {
-		splineIdx, ok := graph.indexByID[car.CurrentSplineID]
-		if !ok {
-			continue
-		}
-		p, h := sampleSplineAtDistance(graph.splines[splineIdx], car.DistanceOnSpline)
-		poses[i] = carPose{p, h}
-	}
-
-	// Pre-compute the set of spline IDs each car will traverse within followLookaheadM.
-	pathSets := buildLookaheadSplineSets(cars, graph, followLookaheadM)
-
-	for i, car := range cars {
-		hI := poses[i].heading
-		pI := poses[i].pos
-		desiredGap := followMinGapM + car.Speed*followTimeHeadwaySecs
-
-		bestDist := float32(math.MaxFloat32)
-		bestSpeed := float32(math.MaxFloat32)
-
-		for j, other := range cars {
-			if i == j {
-				continue
-			}
-			// Other car must be on this car's predicted path.
-			if !pathSets[i][other.CurrentSplineID] {
-				continue
-			}
-			// Must be going in roughly the same direction.
-			hJ := poses[j].heading
-			dot := hI.X*hJ.X + hI.Y*hJ.Y
-			if dot < followHeadingCos {
-				continue
-			}
-			// Other car must be ahead (positive projection along our heading).
-			diff := rl.Vector2{X: poses[j].pos.X - pI.X, Y: poses[j].pos.Y - pI.Y}
-			proj := diff.X*hI.X + diff.Y*hI.Y
-			if proj <= 0 {
-				continue
-			}
-			// Within lookahead range.
-			euclidean := float32(math.Sqrt(float64(diff.X*diff.X + diff.Y*diff.Y)))
-			if euclidean > followLookaheadM {
-				continue
-			}
-			// Gap = distance from my front to the leader's rearmost point
-			// (trailer rear if it has one, cab rear pivot otherwise).
-			leaderRear := other.RearPosition
-			if other.Trailer.HasTrailer {
-				leaderRear = other.Trailer.RearPosition
-			}
-			rearDiff := vecSub(leaderRear, pI)
-			gap := float32(math.Sqrt(float64(rearDiff.X*rearDiff.X + rearDiff.Y*rearDiff.Y)))
-			if gap > desiredGap {
-				continue
-			}
-			// Pick the closest leader.
-			if euclidean < bestDist {
-				bestDist = euclidean
-				bestSpeed = other.Speed
-			}
-		}
-		caps[i] = bestSpeed
-		_ = bestDist
-	}
-	return caps
-}
-
-func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions []bool, holdSpeedDecisions []bool, followCaps []float32, lights []TrafficLight, cycles []TrafficCycle, dt float32) []Car {
-	if len(cars) == 0 {
-		return cars
-	}
-
-	routeIndexByID := map[int]int{}
-	for i, route := range routes {
-		routeIndexByID[route.ID] = i
-	}
-
-	alive := cars[:0]
-	for i, car := range cars {
-		routeIdx, ok := routeIndexByID[car.RouteID]
-		if !ok || !routes[routeIdx].Valid {
-			continue
-		}
-		route := routes[routeIdx]
-		if route.VehicleKind == VehicleBus && car.DestinationSplineID <= 0 {
-			car.DestinationSplineID = currentRouteTarget(route, car.NextBusStopIndex)
-		}
-
-		if route.VehicleKind == VehicleBus && car.BusStopTimer > 0 {
-			car.BusStopTimer -= dt
-			if car.BusStopTimer < 0 {
-				car.BusStopTimer = 0
-			}
-			car.Speed = 0
-			car.Braking = false
-			car.SoftSlowing = false
-			alive = append(alive, car)
-			continue
-		}
-
-		shouldBrake := i < len(brakingDecisions) && brakingDecisions[i]
-		shouldHoldSpeed := !shouldBrake && i < len(holdSpeedDecisions) && holdSpeedDecisions[i]
-		car.Braking = shouldBrake
-
-		followCap := float32(math.MaxFloat32)
-		if i < len(followCaps) {
-			followCap = followCaps[i]
-		}
-		car.SoftSlowing = !shouldBrake && followCap < float32(math.MaxFloat32)
-
-		// Accumulate frustration time: only counts when a leader is present AND
-		// the car is at least 10 km/h below its preferred speed on this spline.
-		const frustrateThreshMPS = 10.0 / 3.6
-		if !shouldBrake && followCap < float32(math.MaxFloat32) {
-			frustrated := false
-			if spline, ok := graph.splineByID(car.CurrentSplineID); ok {
-				preferredSpeed := car.MaxSpeed * spline.SpeedFactor
-				if spline.SpeedLimitKmh > 0 {
-					if limitMPS := spline.SpeedLimitKmh / 3.6; limitMPS < preferredSpeed {
-						preferredSpeed = limitMPS
-					}
-				}
-				if cs := lookupCurveSpeed(spline, car.DistanceOnSpline) * car.CurveSpeedMultiplier; cs < preferredSpeed {
-					preferredSpeed = cs
-				}
-				frustrated = preferredSpeed-car.Speed >= frustrateThreshMPS
-			}
-			if frustrated {
-				car.SlowedTimer += dt
-			} else {
-				car.SlowedTimer = 0
-			}
-		} else {
-			car.SlowedTimer = 0
-		}
-
-		for {
-			currentSpline, ok := graph.splineByID(car.CurrentSplineID)
-			if !ok {
-				break
-			}
-			if shouldBeginBusStopDwell(car, route, currentSpline, graph) {
-				beginBusStopDwell(route, &car)
-				alive = append(alive, car)
-				break
-			}
-
-			targetSpeed := car.MaxSpeed * currentSpline.SpeedFactor
-			if currentSpline.SpeedLimitKmh > 0 {
-				if limitMPS := currentSpline.SpeedLimitKmh / 3.6; limitMPS < targetSpeed {
-					targetSpeed = limitMPS
-				}
-			}
-			if cs := lookupCurveSpeed(currentSpline, car.DistanceOnSpline) * car.CurveSpeedMultiplier; cs < targetSpeed {
-				targetSpeed = cs
-			}
-			if at := computeAnticipatoryTargetSpeed(car, currentSpline, graph); at < targetSpeed {
-				targetSpeed = at
-			}
-			if tl := computeTrafficLightSpeedCap(car, currentSpline, graph, lights, cycles); tl < targetSpeed {
-				targetSpeed = tl
-			}
-			if bs := computeBusStopSpeedCap(car, route, currentSpline, graph); bs < targetSpeed {
-				targetSpeed = bs
-			}
-			// If a forced lane switch is pending, begin decelerating to
-			// laneChangeForcedSpeedMPS in time to reach the deadline position.
-			if car.DesiredLaneSplineID >= 0 {
-				remaining := car.DesiredLaneDeadline - car.DistanceOnSpline
-				if remaining >= 0 && car.Speed > laneChangeForcedSpeedMPS {
-					// Use the normal coast-down deceleration (accel * 1.5), not the
-					// emergency-brake multiplier, since that's what actually applies
-					// here. A small safety factor (0.9) ensures we start a little early.
-					normalDecel := car.Accel * 1.5 * 0.9
-					brakingDist := (car.Speed*car.Speed - laneChangeForcedSpeedMPS*laneChangeForcedSpeedMPS) /
-						(2 * normalDecel)
-					if remaining <= brakingDist && targetSpeed > laneChangeForcedSpeedMPS {
-						targetSpeed = laneChangeForcedSpeedMPS
-					}
-				}
-			}
-			if car.Braking {
-				targetSpeed = 0
-			} else if followCap < targetSpeed {
-				// Following distance: don't accelerate beyond leader's speed.
-				targetSpeed = followCap
-			}
-			if shouldHoldSpeed && targetSpeed > car.Speed {
-				targetSpeed = car.Speed
-			}
-
-			if car.Speed < targetSpeed {
-				car.Speed += car.Accel * dt
-				if car.Speed > targetSpeed {
-					car.Speed = targetSpeed
-				}
-			} else {
-				decel := car.Accel * 1.5
-				if car.Braking {
-					decel = car.Accel * brakeDecelMultiplier
-				}
-				car.Speed -= decel * dt
-				if car.Speed < targetSpeed {
-					car.Speed = targetSpeed
-				}
-				if car.Speed < 0 {
-					car.Speed = 0
-				}
-			}
-
-			car.DistanceOnSpline += car.Speed * dt
-			if car.DistanceOnSpline <= currentSpline.Length {
-				// Drive lateral offset toward the curvature-compensation target.
-				// Target = κ·W²/2 (right of travel when curving left), so the body
-				// centre stays over the spline as the rear cuts the inside of the bend.
-				κ := signedCurvatureAtArcLen(&currentSpline, car.DistanceOnSpline)
-				wb := car.Length * wheelbaseFrac
-				targetOffset := κ * wb * wb / 6
-				if car.Trailer.HasTrailer {
-					trailerWb := car.Trailer.Length * wheelbaseFrac
-					targetOffset = κ * (wb*wb + trailerWb*trailerWb) / 6
-				}
-				lerpRate := car.Speed / (2 * (wb + 0.01)) // converge in ~2*wheelbase/speed s; zero at standstill
-				car.LateralOffset += (targetOffset - car.LateralOffset) * clampf(lerpRate*dt, 0, 1)
-
-				// Pull cab rear pivot toward the offset front pivot.
-				splinePos, tangent := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
-				rightNormal := rl.Vector2{X: tangent.Y, Y: -tangent.X}
-				frontPos := vecAdd(splinePos, vecScale(rightNormal, car.LateralOffset))
-				rearToFront := vecSub(frontPos, car.RearPosition)
-				if vectorLengthSq(rearToFront) > 1e-9 {
-					car.RearPosition = vecSub(frontPos, vecScale(normalize(rearToFront), car.Length*wheelbaseFrac))
-				}
-				// Pull trailer rear pivot toward cab rear pivot (hitch), maintaining trailer wheelbase.
-				if car.Trailer.HasTrailer {
-					hitchPos := car.RearPosition
-					trailerRearToHitch := vecSub(hitchPos, car.Trailer.RearPosition)
-					if vectorLengthSq(trailerRearToHitch) > 1e-9 {
-						car.Trailer.RearPosition = vecSub(hitchPos, vecScale(normalize(trailerRearToHitch), car.Trailer.Length*wheelbaseFrac))
-					}
-				}
-				if shouldBeginBusStopDwell(car, route, currentSpline, graph) {
-					beginBusStopDwell(route, &car)
-				}
-				alive = append(alive, car)
-				break
-			}
-
-			overshoot := car.DistanceOnSpline - currentSpline.Length
-			car.DistanceOnSpline = overshoot
-			if car.CurrentSplineID == car.DestinationSplineID {
-				break
-			}
-
-			// Lane-change bridge completed: resume on the destination lane.
-			if car.LaneChanging && car.CurrentSplineID == car.LaneChangeSplineID {
-				car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
-				car.PrevSplineIDs[0] = car.CurrentSplineID
-				car.CurrentSplineID = car.AfterSplineID
-				car.DistanceOnSpline = car.AfterSplineDist + overshoot
-				car.LaneChanging = false
-				car.LaneChangeSplineID = -1
-				// If the car arrived on its desired lane, clear the forced-switch state.
-				if car.CurrentSplineID == car.DesiredLaneSplineID {
-					car.DesiredLaneSplineID = -1
-					car.DesiredLaneDeadline = 0
-				}
-				continue
-			}
-
-			nextSplineID, ok := chooseNextSplineOnBestPathWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
-			if ok {
-				// Normal path found — any pending forced-switch is no longer needed.
-				if car.DesiredLaneSplineID >= 0 {
-					car.DesiredLaneSplineID = -1
-					car.DesiredLaneDeadline = 0
-				}
-			} else {
-				// No direct path: check whether entering a physical next spline whose
-				// hard-coupled partner has a path can rescue the car.
-				forcedNext, desiredLane, forcedOk := findForcedLaneChangePathWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
-				if !forcedOk {
-					break
-				}
-				nextSplineID = forcedNext
-				car.DesiredLaneSplineID = desiredLane
-				// Deadline: 10 m before the end of the forced spline.
-				if src, srcOk := graph.splineByID(forcedNext); srcOk {
-					car.DesiredLaneDeadline = maxf(src.Length-laneChangeForcedDistEnd, 0)
-				}
-			}
-			car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
-			car.PrevSplineIDs[0] = car.CurrentSplineID
-			car.CurrentSplineID = nextSplineID
-			resumeBusRouteAfterStop(route, &car)
-
-			// Opportunistic lane change: check whether a hard-coupled parallel lane
-			// offers a significantly faster route to the destination.  If so, treat it
-			// as a desired lane so the last-resort mechanism will switch into it.
-			// Only runs when no forced-switch is already pending.
-			if car.DesiredLaneSplineID < 0 && car.CurrentSplineID != car.DestinationSplineID {
-				if newSpline, scOk := graph.splineByID(car.CurrentSplineID); scOk && len(newSpline.HardCoupledIDs) > 0 {
-					_, curTime, curOk := findShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
-					if curOk {
-						for _, cid := range newSpline.HardCoupledIDs {
-							_, coupledTime, coupledOk := findShortestPathWeightedWithGraph(graph, cid, car.DestinationSplineID, car.VehicleKind)
-							if coupledOk && curTime-coupledTime >= 20.0 {
-								car.DesiredLaneSplineID = cid
-								car.DesiredLaneDeadline = maxf(newSpline.Length-laneChangeForcedDistEnd, 0)
-								break
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-	return alive
+	graph := simpkg.NewRoadGraph(splines, vehicleCounts)
+	return simpkg.UpdateRouteVisualsWithGraph(routes, graph)
 }
 
 func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32, debugMode bool) {
@@ -4971,8 +2886,8 @@ func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom fl
 		if !ok {
 			continue
 		}
-		splinePos, splineTangent := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
-		rightNormal := rl.Vector2{X: splineTangent.Y, Y: -splineTangent.X}
+		splinePos, splineTangent := simpkg.SampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+		rightNormal := Vec2{X: splineTangent.Y, Y: -splineTangent.X}
 		frontPos := vecAdd(splinePos, vecScale(rightNormal, car.LateralOffset))
 		bodyHeading := normalize(vecSub(frontPos, car.RearPosition))
 		if vectorLengthSq(vecSub(frontPos, car.RearPosition)) <= 1e-9 {
@@ -4981,7 +2896,7 @@ func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom fl
 		center := vecScale(vecAdd(frontPos, car.RearPosition), 0.5)
 		angle := float32(math.Atan2(float64(bodyHeading.Y), float64(bodyHeading.X)) * 180 / math.Pi)
 		rect := rl.NewRectangle(center.X, center.Y, car.Length, car.Width)
-		origin := rl.NewVector2(car.Length/2, car.Width/2)
+		origin := NewVec2(car.Length/2, car.Width/2)
 		// Draw trailer first so the cab renders on top at the hitch point.
 		if car.Trailer.HasTrailer {
 			hitchPos := car.RearPosition
@@ -4992,42 +2907,42 @@ func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom fl
 			trailerCenter := vecScale(vecAdd(hitchPos, car.Trailer.RearPosition), 0.5)
 			trailerAngle := float32(math.Atan2(float64(trailerHeading.Y), float64(trailerHeading.X)) * 180 / math.Pi)
 			trailerRect := rl.NewRectangle(trailerCenter.X, trailerCenter.Y, car.Trailer.Length, car.Trailer.Width)
-			trailerOrigin := rl.NewVector2(car.Trailer.Length/2, car.Trailer.Width/2)
-			rl.DrawRectanglePro(trailerRect, trailerOrigin, trailerAngle, car.Trailer.Color)
+			trailerOrigin := NewVec2(car.Trailer.Length/2, car.Trailer.Width/2)
+			drawRectanglePro(trailerRect, trailerOrigin, trailerAngle, car.Trailer.Color)
 		}
-		rl.DrawRectanglePro(rect, origin, angle, car.Color)
+		drawRectanglePro(rect, origin, angle, car.Color)
 		if car.VehicleKind == VehicleBus {
-			windowColor := rl.NewColor(235, 243, 250, 220)
+			windowColor := NewColor(235, 243, 250, 220)
 			windowRect := rl.NewRectangle(center.X, center.Y, car.Length*0.72, car.Width*0.42)
-			windowOrigin := rl.NewVector2(windowRect.Width/2, windowRect.Height/2)
-			rl.DrawRectanglePro(windowRect, windowOrigin, angle, windowColor)
+			windowOrigin := NewVec2(windowRect.Width/2, windowRect.Height/2)
+			drawRectanglePro(windowRect, windowOrigin, angle, windowColor)
 			frontRect := rl.NewRectangle(center.X+bodyHeading.X*car.Length*0.28, center.Y+bodyHeading.Y*car.Length*0.28, car.Length*0.12, car.Width*0.78)
-			frontOrigin := rl.NewVector2(frontRect.Width/2, frontRect.Height/2)
-			rl.DrawRectanglePro(frontRect, frontOrigin, angle, rl.NewColor(30, 30, 35, 90))
+			frontOrigin := NewVec2(frontRect.Width/2, frontRect.Height/2)
+			drawRectanglePro(frontRect, frontOrigin, angle, NewColor(30, 30, 35, 90))
 		}
 		if car.Braking {
-			rl.DrawCircleV(center, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), rl.NewColor(220, 50, 50, 255))
+			drawCircleV(center, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), NewColor(220, 50, 50, 255))
 		} else if debugMode && car.SoftSlowing {
-			rl.DrawCircleV(center, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), rl.NewColor(60, 120, 220, 255))
+			drawCircleV(center, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), NewColor(60, 120, 220, 255))
 		}
 		if car.VehicleKind == VehicleBus && car.BusStopTimer > 0 {
-			rl.DrawCircleV(center, maxf(car.Width*0.24, pixelsToWorld(zoom, 2.5)), rl.NewColor(255, 200, 40, 255))
+			drawCircleV(center, maxf(car.Width*0.24, pixelsToWorld(zoom, 2.5)), NewColor(255, 200, 40, 255))
 		}
 	}
 }
 
 // drawCarHitboxes renders the multi-circle collision hitbox of every car.
 func drawCarHitboxes(cars []Car, splines []Spline, splineIndexByID map[int]int) {
-	fill := rl.NewColor(255, 80, 255, 50)
-	outline := rl.NewColor(255, 80, 255, 200)
-	pivotColor := rl.NewColor(255, 220, 0, 220)
+	fill := NewColor(255, 80, 255, 50)
+	outline := NewColor(255, 80, 255, 200)
+	pivotColor := NewColor(255, 220, 0, 220)
 	for _, car := range cars {
 		splineIdx, ok := splineIndexByID[car.CurrentSplineID]
 		if !ok {
 			continue
 		}
-		splinePos2, splineTangent := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
-		rightNormal2 := rl.Vector2{X: splineTangent.Y, Y: -splineTangent.X}
+		splinePos2, splineTangent := simpkg.SampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+		rightNormal2 := Vec2{X: splineTangent.Y, Y: -splineTangent.X}
 		frontPos := vecAdd(splinePos2, vecScale(rightNormal2, car.LateralOffset))
 		bodyHeading := normalize(vecSub(frontPos, car.RearPosition))
 		if vectorLengthSq(vecSub(frontPos, car.RearPosition)) <= 1e-9 {
@@ -5037,12 +2952,12 @@ func drawCarHitboxes(cars []Car, splines []Spline, splineIndexByID map[int]int) 
 		r := collisionRadius(car)
 		for _, offset := range collisionCircleOffsets(car) {
 			circlePos := vecAdd(center, vecScale(bodyHeading, offset))
-			rl.DrawCircleV(circlePos, r, fill)
-			rl.DrawCircleLinesV(circlePos, r, outline)
+			drawCircleV(circlePos, r, fill)
+			drawCircleLinesV(circlePos, r, outline)
 		}
 		// Mark front and rear pivots.
-		rl.DrawCircleV(frontPos, r*0.25, pivotColor)
-		rl.DrawCircleV(car.RearPosition, r*0.25, pivotColor)
+		drawCircleV(frontPos, r*0.25, pivotColor)
+		drawCircleV(car.RearPosition, r*0.25, pivotColor)
 
 		if car.Trailer.HasTrailer {
 			hitchPos := car.RearPosition
@@ -5054,11 +2969,11 @@ func drawCarHitboxes(cars []Car, splines []Spline, splineIndexByID map[int]int) 
 			rT := hitboxRadius(car.Trailer.Width)
 			for _, offset := range hitboxCircleOffsets(car.Trailer.Length, car.Trailer.Width) {
 				circlePos := vecAdd(trailerCenter, vecScale(trailerHeading, offset))
-				rl.DrawCircleV(circlePos, rT, fill)
-				rl.DrawCircleLinesV(circlePos, rT, outline)
+				drawCircleV(circlePos, rT, fill)
+				drawCircleLinesV(circlePos, rT, outline)
 			}
 			// Trailer rear pivot (hitch is already marked as cab rear pivot above).
-			rl.DrawCircleV(car.Trailer.RearPosition, rT*0.25, pivotColor)
+			drawCircleV(car.Trailer.RearPosition, rT*0.25, pivotColor)
 		}
 	}
 }
@@ -5072,16 +2987,16 @@ func drawCarSpeedLabels(cars []Car, splines []Spline, splineIndexByID map[int]in
 		if !ok {
 			continue
 		}
-		frontPos, _ := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+		frontPos, _ := simpkg.SampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
 		center := vecScale(vecAdd(frontPos, car.RearPosition), 0.5)
-		screen := rl.GetWorldToScreen2D(center, camera)
+		screen := getWorldToScreen2D(center, camera)
 		label := fmt.Sprintf("%d", int(car.Speed*3.6))
 		textW := measureText(label, fontSize)
 		drawText(label, int32(screen.X)-textW/2, int32(screen.Y)-18, fontSize, rl.Black)
 	}
 }
 
-func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32, lineColor rl.Color) {
+func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32, lineColor Color) {
 	if len(links) == 0 || len(cars) == 0 {
 		return
 	}
@@ -5099,17 +3014,17 @@ func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, s
 			continue
 		}
 
-		fromFront, _ := sampleSplineAtDistance(splines[fromSplineIdx], cars[link.FromCarIndex].DistanceOnSpline)
-		toFront, _ := sampleSplineAtDistance(splines[toSplineIdx], cars[link.ToCarIndex].DistanceOnSpline)
+		fromFront, _ := simpkg.SampleSplineAtDistance(splines[fromSplineIdx], cars[link.FromCarIndex].DistanceOnSpline)
+		toFront, _ := simpkg.SampleSplineAtDistance(splines[toSplineIdx], cars[link.ToCarIndex].DistanceOnSpline)
 		fromPos := vecScale(vecAdd(fromFront, cars[link.FromCarIndex].RearPosition), 0.5)
 		toPos := vecScale(vecAdd(toFront, cars[link.ToCarIndex].RearPosition), 0.5)
-		rl.DrawLineEx(fromPos, toPos, lineThickness, lineColor)
-		rl.DrawCircleV(fromPos, pixelsToWorld(zoom, 3.5), lineColor)
+		drawLineEx(fromPos, toPos, lineThickness, lineColor)
+		drawCircleV(fromPos, pixelsToWorld(zoom, 3.5), lineColor)
 	}
 }
 
 func drawRouteWithIndex(route Route, splines []Spline, indexByID map[int]int, thickness float32, zoom float32) {
-	color := rl.NewColor(route.Color.R, route.Color.G, route.Color.B, 90)
+	color := NewColor(route.Color.R, route.Color.G, route.Color.B, 90)
 	for _, pathID := range route.PathIDs {
 		idx, ok := indexByID[pathID]
 		if !ok {
@@ -5119,40 +3034,45 @@ func drawRouteWithIndex(route Route, splines []Spline, indexByID map[int]int, th
 	}
 	spawnR := pixelsToWorld(zoom, 10)
 	destR := pixelsToWorld(zoom, 10)
-	if start, ok := findSplineByID(splines, route.StartSplineID); ok {
+	if start, ok := simpkg.FindSplineByID(splines, route.StartSplineID); ok {
 		drawEndpoint(start.P0, spawnR, route.Color)
 	}
-	if end, ok := findSplineByID(splines, route.EndSplineID); ok {
+	if end, ok := simpkg.FindSplineByID(splines, route.EndSplineID); ok {
 		drawEndpoint(end.P3, destR, color)
 	}
 	if route.VehicleKind == VehicleBus {
-		stopFill := rl.NewColor(route.Color.R, route.Color.G, route.Color.B, 220)
-		stopOuter := rl.NewColor(20, 20, 25, 220)
+		stopFill := NewColor(route.Color.R, route.Color.G, route.Color.B, 220)
+		stopOuter := NewColor(20, 20, 25, 220)
 		stopR := pixelsToWorld(zoom, 7)
 		for _, stop := range route.BusStops {
-			rl.DrawCircleV(stop.WorldPos, stopR, stopOuter)
-			rl.DrawCircleV(stop.WorldPos, stopR*0.72, stopFill)
+			drawCircleV(stop.WorldPos, stopR, stopOuter)
+			drawCircleV(stop.WorldPos, stopR*0.72, stopFill)
 		}
 	}
 }
 
 func drawRoute(route Route, splines []Spline, thickness float32, zoom float32) {
-	drawRouteWithIndex(route, splines, buildSplineIndexByID(splines), thickness, zoom)
+	drawRouteWithIndex(route, splines, simpkg.BuildSplineIndexByID(splines), thickness, zoom)
 }
 
-func drawRoutePicking(routeStartSplineID int, routePanel RoutePanel, hoveredStart EndHit, hoveredEnd EndHit, splines []Spline, vehicleCounts map[int]int, zoom float32) {
+func drawRoutePicking(routeStartSplineID int, routePanel RoutePanel, hoveredStart EndHit, hoveredEnd EndHit, splines []Spline, graph *RoadGraph, zoom float32) {
 	handleRadius := pixelsToWorld(zoom, handlePixels)
 	if hoveredStart.SplineIndex >= 0 && routeStartSplineID < 0 {
-		drawEndpoint(hoveredStart.Point, handleRadius*1.6, rl.NewColor(255, 196, 61, 255))
+		drawEndpoint(hoveredStart.Point, handleRadius*1.6, NewColor(255, 196, 61, 255))
 	}
 	if routeStartSplineID >= 0 {
-		if startSpline, ok := findSplineByID(splines, routeStartSplineID); ok {
-			drawEndpoint(startSpline.P0, handleRadius*1.8, rl.NewColor(214, 76, 76, 255))
+		if startSpline, ok := simpkg.FindSplineByID(splines, routeStartSplineID); ok {
+			drawEndpoint(startSpline.P0, handleRadius*1.8, NewColor(214, 76, 76, 255))
 		}
 		if hoveredEnd.SplineIndex >= 0 {
-			drawEndpoint(hoveredEnd.Point, handleRadius*1.5, rl.NewColor(35, 85, 175, 255))
-			if pathIDs, _, ok := findShortestPathWeighted(splines, routeStartSplineID, hoveredEnd.SplineID, vehicleCounts, routePanel.VehicleKind); ok {
-				previewRoute := Route{PathIDs: pathIDs, Color: routePaletteColor(routePanel.ColorIndex), Valid: true}
+			drawEndpoint(hoveredEnd.Point, handleRadius*1.5, NewColor(35, 85, 175, 255))
+			preview := Route{
+				StartSplineID: routeStartSplineID,
+				EndSplineID:   hoveredEnd.SplineID,
+				VehicleKind:   routePanel.VehicleKind,
+			}
+			if pathIDs, _, _, ok := simpkg.ComputeRoutePathWithGraph(preview, graph); ok {
+				previewRoute := Route{PathIDs: pathIDs, Color: simpkg.RoutePaletteColor(routePanel.ColorIndex), Valid: true}
 				drawRoute(previewRoute, splines, pixelsToWorld(zoom, 4), zoom)
 			}
 		}
@@ -5165,13 +3085,13 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 	applyRect := routePanelApplyRect(panel)
 	cancelRect := routePanelCancelRect(panel)
 
-	bg := rl.NewColor(248, 248, 250, 245)
-	outline := rl.NewColor(210, 210, 215, 255)
-	textCol := rl.NewColor(30, 30, 35, 255)
-	muted := rl.NewColor(90, 90, 100, 255)
-	accent := rl.NewColor(70, 110, 220, 255)
-	button := rl.NewColor(235, 236, 240, 255)
-	danger := rl.NewColor(200, 60, 60, 255)
+	bg := NewColor(248, 248, 250, 245)
+	outline := NewColor(210, 210, 215, 255)
+	textCol := NewColor(30, 30, 35, 255)
+	muted := NewColor(90, 90, 100, 255)
+	accent := NewColor(70, 110, 220, 255)
+	button := NewColor(235, 236, 240, 255)
+	danger := NewColor(200, 60, 60, 255)
 
 	rl.DrawRectangle(int32(panelRect.X), int32(panelRect.Y), int32(panelRect.Width), int32(panelRect.Height), bg)
 	rl.DrawRectangleLines(int32(panelRect.X), int32(panelRect.Y), int32(panelRect.Width), int32(panelRect.Height), outline)
@@ -5196,7 +3116,7 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 	}
 	drawText(fmt.Sprintf("Average spawn frequency: %.1f %s/min  (mean %.1fs)", panel.SpawnPerMinute, unitLabel, meanSeconds), int32(panelRect.X+18), int32(panelRect.Y+64), 18, textCol)
 
-	rl.DrawRectangle(int32(sliderRect.X), int32(sliderRect.Y), int32(sliderRect.Width), int32(sliderRect.Height), rl.NewColor(229, 229, 234, 255))
+	rl.DrawRectangle(int32(sliderRect.X), int32(sliderRect.Y), int32(sliderRect.Width), int32(sliderRect.Height), NewColor(229, 229, 234, 255))
 	fillWidth := sliderRect.Width * clampf(panel.SpawnPerMinute/spawnSliderMaxPerMinute, 0, 1)
 	if fillWidth > 0 {
 		fillRect := rl.NewRectangle(sliderRect.X, sliderRect.Y, fillWidth, sliderRect.Height)
@@ -5220,23 +3140,23 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 		rl.DrawRectangleRec(sr, col)
 		if i == panel.ColorIndex {
 			rl.DrawRectangleLinesEx(sr, 2, rl.White)
-			rl.DrawRectangleLinesEx(rl.NewRectangle(sx-1, sy-1, swatchSize+2, swatchSize+2), 1, rl.NewColor(40, 40, 40, 200))
+			rl.DrawRectangleLinesEx(rl.NewRectangle(sx-1, sy-1, swatchSize+2, swatchSize+2), 1, NewColor(40, 40, 40, 200))
 		} else {
-			rl.DrawRectangleLinesEx(sr, 1, rl.NewColor(0, 0, 0, 40))
+			rl.DrawRectangleLinesEx(sr, 1, NewColor(0, 0, 0, 40))
 		}
 	}
 
 	if panel.VehicleKind == VehicleBus {
 		addRect := routePanelBusAddRect(panel)
 		addLabel := "Add bus stop"
-		addColor := rl.NewColor(47, 120, 60, 255)
+		addColor := NewColor(47, 120, 60, 255)
 		if panel.AddingBusStop {
 			addLabel = "Pick in map..."
-			addColor = rl.NewColor(210, 150, 20, 255)
+			addColor = NewColor(210, 150, 20, 255)
 		}
 		drawText("Bus stops:", int32(panelRect.X+18), int32(panelRect.Y+166), 14, muted)
 		rl.DrawRectangleRec(addRect, addColor)
-		rl.DrawRectangleLinesEx(addRect, 1, rl.NewColor(0, 0, 0, 40))
+		rl.DrawRectangleLinesEx(addRect, 1, NewColor(0, 0, 0, 40))
 		addW := measureText(addLabel, 14)
 		drawText(addLabel, int32(addRect.X)+int32(addRect.Width)/2-addW/2, int32(addRect.Y)+7, 14, rl.White)
 
@@ -5245,12 +3165,12 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 		} else {
 			for i, stop := range panel.BusStops {
 				rowRect := routePanelBusStopRowRect(panel, i)
-				rl.DrawRectangleRec(rowRect, rl.NewColor(242, 243, 246, 255))
+				rl.DrawRectangleRec(rowRect, NewColor(242, 243, 246, 255))
 				rl.DrawRectangleLinesEx(rowRect, 1, outline)
 				drawText(fmt.Sprintf("%d. stop on spline #%d", i+1, stop.SplineID), int32(rowRect.X)+8, int32(rowRect.Y)+5, 13, textCol)
 				delRect := rl.NewRectangle(rowRect.X+rowRect.Width-58, rowRect.Y+2, 54, rowRect.Height-4)
 				rl.DrawRectangleRec(delRect, danger)
-				rl.DrawRectangleLinesEx(delRect, 1, rl.NewColor(0, 0, 0, 40))
+				rl.DrawRectangleLinesEx(delRect, 1, NewColor(0, 0, 0, 40))
 				drawText("Remove", int32(delRect.X)+7, int32(delRect.Y)+4, 12, rl.White)
 			}
 		}
@@ -5286,7 +3206,7 @@ func drawNotice(text string) {
 	width := measureText(text, 18) + 28
 	x := int32((int32(rl.GetScreenWidth()) - width) / 2)
 	y := int32(rl.GetScreenHeight() - 54)
-	bg := rl.NewColor(40, 44, 52, 230)
+	bg := NewColor(40, 44, 52, 230)
 	rl.DrawRectangle(x, y, width, 34, bg)
 	drawText(text, x+14, y+8, 18, rl.White)
 }
@@ -5330,13 +3250,13 @@ func modeStatusText(mode EditorMode, stage Stage, draft Draft, routeStartSplineI
 func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, routeStartSplineID int, coupleModeFirstID int, debugMode bool, hitboxDebugMode bool, zoom float32, splineCount, routeCount, carCount int) {
 	mouse := rl.GetMousePosition()
 
-	bgNormal := rl.NewColor(245, 245, 248, 245)
-	bgActive := rl.NewColor(47, 96, 198, 255)
-	bgHover := rl.NewColor(218, 224, 238, 245)
-	outNormal := rl.NewColor(200, 200, 206, 255)
-	outActive := rl.NewColor(28, 62, 155, 255)
-	txtDark := rl.NewColor(28, 28, 33, 255)
-	txtMuted := rl.NewColor(100, 100, 110, 255)
+	bgNormal := NewColor(245, 245, 248, 245)
+	bgActive := NewColor(47, 96, 198, 255)
+	bgHover := NewColor(218, 224, 238, 245)
+	outNormal := NewColor(200, 200, 206, 255)
+	outActive := NewColor(28, 62, 155, 255)
+	txtDark := NewColor(28, 28, 33, 255)
+	txtMuted := NewColor(100, 100, 110, 255)
 
 	for i, item := range toolbarItems {
 		r := toolbarBtnRect(i)
@@ -5373,11 +3293,11 @@ func drawHud(mode EditorMode, stage Stage, draft Draft, hoveredSpline int, route
 }
 
 func drawProfilerOverlay(prof profiler) {
-	bg := rl.NewColor(18, 22, 31, 225)
-	border := rl.NewColor(60, 76, 112, 255)
-	title := rl.NewColor(236, 239, 244, 255)
-	text := rl.NewColor(206, 214, 228, 255)
-	muted := rl.NewColor(150, 162, 184, 255)
+	bg := NewColor(18, 22, 31, 225)
+	border := NewColor(60, 76, 112, 255)
+	title := NewColor(236, 239, 244, 255)
+	text := NewColor(206, 214, 228, 255)
+	muted := NewColor(150, 162, 184, 255)
 
 	rect := rl.NewRectangle(float32(rl.GetScreenWidth())-320, 42, 300, 214)
 	rl.DrawRectangleRec(rect, bg)
@@ -5428,396 +3348,76 @@ func newDraft() Draft {
 	return Draft{ContinuationFrom: -1}
 }
 
-func newSpline(id int, p0, p1, p2, p3 rl.Vector2) Spline {
-	s := Spline{ID: id, P0: p0, P1: p1, P2: p2, P3: p3}
-	cacheSpline(&s)
-	return s
-}
-
-func splineDrawColor(s Spline) rl.Color {
+func splineDrawColor(s Spline) Color {
 	if s.Priority && s.BusOnly {
-		return rl.NewColor(95, 125, 195, 255)
+		return NewColor(95, 125, 195, 255)
 	}
 	if s.Priority {
-		return rl.NewColor(130, 75, 215, 255)
+		return NewColor(130, 75, 215, 255)
 	}
 	if s.BusOnly {
-		return rl.NewColor(28, 145, 125, 255)
+		return NewColor(28, 145, 125, 255)
 	}
-	return rl.NewColor(35, 85, 175, 255)
+	return NewColor(35, 85, 175, 255)
 }
 
-func cacheSpline(s *Spline) {
-	s.Samples[0] = s.P0
-	s.CumLen[0] = 0
-	total := float32(0)
-	prev := s.P0
-	for i := 1; i <= simSamples; i++ {
-		t := float32(i) / float32(simSamples)
-		pt := rl.GetSplinePointBezierCubic(s.P0, s.P1, s.P2, s.P3, t)
-		total += float32(math.Sqrt(float64(distSq(prev, pt))))
-		s.Samples[i] = pt
-		s.CumLen[i] = total
-		prev = pt
-	}
-	s.Length = total
-	s.SpeedFactor = 1.0
-	s.CurveSpeedMPS = buildCurveSpeedProfile(s)
-	s.TravelTimeS = buildSplineTravelTime(s)
-}
-
-// buildCurveSpeedProfile computes the maximum speed at every curveSpeedIntervalM
-// metres along the spline. Speed is derived from local curvature and capped by
-// the spline's SpeedLimitKmh (if set), so anticipatory braking applies to speed
-// limits the same way it applies to curves.
-func buildCurveSpeedProfile(s *Spline) []float32 {
-	if s.Length <= 0 {
-		return nil
-	}
-	limitMPS := float32(math.MaxFloat32)
-	if s.SpeedLimitKmh > 0 {
-		limitMPS = s.SpeedLimitKmh / 3.6
-	}
-	count := int(s.Length/curveSpeedIntervalM) + 1
-	profile := make([]float32, count)
-	for i := range profile {
-		d := float32(i) * curveSpeedIntervalM
-		v := curveSpeedAtArcLen(s, d)
-		if v > limitMPS {
-			v = limitMPS
-		}
-		profile[i] = v
-	}
-	return profile
-}
-
-func buildSplineTravelTime(s *Spline) float32 {
-	if s.Length <= 0 {
-		return 0
-	}
-	if len(s.CurveSpeedMPS) == 0 {
-		speed := maxCarSpeed * s.SpeedFactor
-		if speed <= 1e-3 {
-			return float32(math.MaxFloat32)
-		}
-		return s.Length / speed
-	}
-
-	totalTime := float32(0)
-	remaining := s.Length
-	for _, fragSpeed := range s.CurveSpeedMPS {
-		if remaining <= 0 {
-			break
-		}
-		fragLen := minf(curveSpeedIntervalM, remaining)
-		speed := fragSpeed * s.SpeedFactor
-		if speed <= 1e-3 {
-			return float32(math.MaxFloat32)
-		}
-		totalTime += fragLen / speed
-		remaining -= fragLen
-	}
-	if remaining > 0 {
-		speed := s.CurveSpeedMPS[len(s.CurveSpeedMPS)-1] * s.SpeedFactor
-		if speed <= 1e-3 {
-			return float32(math.MaxFloat32)
-		}
-		totalTime += remaining / speed
-	}
-	return totalTime
-}
-
-// curveSpeedAtArcLen returns the maximum speed at arc-length d based on local
-// curvature. Uses the circumradius of three neighbouring samples to estimate
-// the radius of curvature, then applies v = sqrt(maxLateralAccelMPS2 * r).
-func curveSpeedAtArcLen(s *Spline, d float32) float32 {
-	// Find sample index nearest to arc-length d.
-	idx := 0
-	for idx < simSamples && s.CumLen[idx+1] < d {
-		idx++
-	}
-	// Choose three consecutive samples, clamped to valid range.
-	i0, i1, i2 := idx-1, idx, idx+1
-	if i0 < 0 {
-		i0, i1, i2 = 0, 1, 2
-	}
-	if i2 > simSamples {
-		i0, i1, i2 = simSamples-2, simSamples-1, simSamples
-	}
-
-	A, B, C := s.Samples[i0], s.Samples[i1], s.Samples[i2]
-
-	ab := float32(math.Sqrt(float64(distSq(A, B))))
-	bc := float32(math.Sqrt(float64(distSq(B, C))))
-	ca := float32(math.Sqrt(float64(distSq(C, A))))
-
-	// |cross| = 2 * triangle area; circumradius r = (ab*bc*ca) / (2*|cross|)
-	cross := absf((B.X-A.X)*(C.Y-A.Y) - (B.Y-A.Y)*(C.X-A.X))
-	if cross < 1e-6 {
-		return maxCarSpeed // essentially straight
-	}
-	r := ab * bc * ca / (2 * cross)
-	v := float32(math.Sqrt(float64(maxLateralAccelMPS2 * r)))
-	if v > maxCarSpeed {
-		return maxCarSpeed
-	}
-	return v
-}
-
-// signedCurvatureAtArcLen returns the signed curvature (1/radius) at arc-length d.
-// Positive = turning left (CCW), negative = turning right (CW).
-// Uses the same three-sample circumradius approach as curveSpeedAtArcLen.
-func signedCurvatureAtArcLen(s *Spline, d float32) float32 {
-	idx := 0
-	for idx < simSamples && s.CumLen[idx+1] < d {
-		idx++
-	}
-	i0, i1, i2 := idx-1, idx, idx+1
-	if i0 < 0 {
-		i0, i1, i2 = 0, 1, 2
-	}
-	if i2 > simSamples {
-		i0, i1, i2 = simSamples-2, simSamples-1, simSamples
-	}
-	A, B, C := s.Samples[i0], s.Samples[i1], s.Samples[i2]
-	ab := float32(math.Sqrt(float64(distSq(A, B))))
-	bc := float32(math.Sqrt(float64(distSq(B, C))))
-	ca := float32(math.Sqrt(float64(distSq(C, A))))
-	denom := ab * bc * ca
-	if denom < 1e-6 {
-		return 0
-	}
-	// Signed cross(AB, AC): positive = CCW (left turn).
-	cross := (B.X-A.X)*(C.Y-A.Y) - (B.Y-A.Y)*(C.X-A.X)
-	return 2 * cross / denom
-}
-
-// lookupCurveSpeed returns the precomputed curvature speed limit at the given
-// arc-length on the spline. Returns maxCarSpeed if no profile is available.
-func lookupCurveSpeed(spline Spline, dist float32) float32 {
-	if len(spline.CurveSpeedMPS) == 0 {
-		return maxCarSpeed
-	}
-	idx := int(dist / curveSpeedIntervalM)
-	if idx >= len(spline.CurveSpeedMPS) {
-		idx = len(spline.CurveSpeedMPS) - 1
-	}
-	return spline.CurveSpeedMPS[idx]
-}
-
-// trafficLightShouldStop returns true when the light is part of an enabled cycle
-// that is currently showing red or yellow — i.e. the car should try to stop.
-func trafficLightShouldStop(l TrafficLight, cycles []TrafficCycle) bool {
-	if l.CycleID < 0 {
-		return false
-	}
-	for _, c := range cycles {
-		if c.ID != l.CycleID {
-			continue
-		}
-		if !c.Enabled {
-			return false
-		}
-		state := trafficLightState(l.ID, l.CycleID, cycles)
-		return state == TrafficRed || state == TrafficYellow
-	}
-	return false
-}
-
-// computeTrafficLightSpeedCap looks ahead on the car's path and returns the
-// maximum speed the car should be doing now so it can decelerate to a stop at
-// each upcoming red/yellow light.  Uses the same kinematic formula as
-// computeAnticipatoryTargetSpeed (reqSpeed=0 case): allowed = sqrt(2·decel·d).
-// If physics genuinely can't stop the car in time (light just turned red very
-// close ahead) the car will still decelerate as hard as it can and coast
-// through — that is the natural "run the light" edge case.
-func computeTrafficLightSpeedCap(car Car, currentSpline Spline, graph *RoadGraph,
-	lights []TrafficLight, cycles []TrafficCycle) float32 {
-
-	decel := car.Accel * 1.5
-	result := float32(math.MaxFloat32)
-	remaining := currentSpline.Length - car.DistanceOnSpline
-
-	// Lookahead: stopping distance from current speed + small buffer, capped at 200 m.
-	lookahead := car.Speed*car.Speed/(2*decel) + 20
-	if lookahead > 200 {
-		lookahead = 200
-	}
-
-	checkLight := func(rawDistAhead float32) {
-		// Hold a fixed 5 m gap between the vehicle's front and the light.
-		adj := rawDistAhead - stopFrontGapM
-		if adj <= 0 {
-			// Already inside the target gap — stop immediately and hold.
-			result = 0
-			return
-		}
-		allowed := float32(math.Sqrt(float64(2 * decel * adj)))
-		if allowed < result {
-			result = allowed
-		}
-	}
-
-	for _, l := range lights {
-		if l.SplineID != currentSpline.ID {
-			continue
-		}
-		if l.DistOnSpline <= car.DistanceOnSpline {
-			continue // already passed
-		}
-		if !trafficLightShouldStop(l, cycles) {
-			continue
-		}
-		checkLight(l.DistOnSpline - car.DistanceOnSpline)
-	}
-
-	// Also check lights on the next spline if the lookahead extends past the end.
-	if remaining < lookahead {
-		nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, car.DestinationSplineID, car.VehicleKind)
-		if ok {
-			if _, ok2 := graph.splineByID(nextID); ok2 {
-				for _, l := range lights {
-					if l.SplineID != nextID {
-						continue
-					}
-					if !trafficLightShouldStop(l, cycles) {
-						continue
-					}
-					checkLight(remaining + l.DistOnSpline)
-				}
-			}
-		}
-	}
-
-	return result
-}
-
-// computeAnticipatoryTargetSpeed looks ahead along the car's path and returns
-// the maximum speed the car should target NOW so that it can decelerate in time
-// for every upcoming speed constraint within lookahead range.
-//
-// For each constraint at distance d ahead with required speed v_req:
-//
-//	allowed_now = sqrt(v_req² + 2·decel·d)
-//
-// The minimum across all checked points is returned.
-// Lookahead extends from the car's position to at most 150 m (or the braking
-// distance from current speed, whichever is smaller). If the lookahead reaches
-// the end of the current spline, the next most-likely spline is scanned too.
-func computeAnticipatoryTargetSpeed(car Car, currentSpline Spline, graph *RoadGraph) float32 {
-	decel := car.Accel * 1.5
-	// Look far enough to brake from the current speed, plus a couple of extra
-	// fragments as buffer. Cap at 150 m.
-	lookahead := car.Speed*car.Speed/(2*decel) + 2*curveSpeedIntervalM
-	if lookahead > 150 {
-		lookahead = 150
-	}
-
-	result := float32(math.MaxFloat32)
-	remaining := currentSpline.Length - car.DistanceOnSpline
-
-	checkConstraint := func(reqSpeed, distAhead float32) {
-		allowed := float32(math.Sqrt(float64(reqSpeed*reqSpeed + 2*decel*distAhead)))
-		if allowed < result {
-			result = allowed
-		}
-	}
-
-	splineReqSpeed := func(s Spline, pos float32) float32 {
-		spd := lookupCurveSpeed(s, pos) * car.CurveSpeedMultiplier
-		if s.SpeedLimitKmh > 0 {
-			if lim := s.SpeedLimitKmh / 3.6; lim < spd {
-				spd = lim
-			}
-		}
-		return spd
-	}
-
-	// Scan ahead on the current spline in curveSpeedIntervalM steps.
-	for d := curveSpeedIntervalM; d <= lookahead; d += curveSpeedIntervalM {
-		if d > remaining {
-			break
-		}
-		checkConstraint(splineReqSpeed(currentSpline, car.DistanceOnSpline+d), d)
-	}
-
-	// If the lookahead extends past the end of the current spline, scan the
-	// next most-likely spline from its beginning.
-	if remaining < lookahead {
-		nextID, ok := chooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, car.DestinationSplineID, car.VehicleKind)
-		if ok {
-			if nextSpline, ok2 := graph.splineByID(nextID); ok2 {
-				budget := lookahead - remaining
-				for pos := float32(0); pos <= minf(nextSpline.Length, budget); pos += curveSpeedIntervalM {
-					checkConstraint(splineReqSpeed(nextSpline, pos), remaining+pos)
-				}
-			}
-		}
-	}
-
-	if result == float32(math.MaxFloat32) {
-		return maxCarSpeed
-	}
-	return result
-}
-
-func buildPreview(stage Stage, draft Draft, mouse rl.Vector2, snapStart EndHit, splines []Spline) (Spline, bool) {
+func buildPreview(stage Stage, draft Draft, mouse Vec2, snapStart EndHit, splines []Spline) (Spline, bool) {
 	switch stage {
 	case StageSetP1:
 		if draft.LockP1 {
-			return newSpline(-1, draft.P0, draft.P1, mouse, mouse), true
+			return simpkg.NewSpline(-1, draft.P0, draft.P1, mouse, mouse), true
 		}
-		return newSpline(-1, draft.P0, mouse, mouse, mouse), true
+		return simpkg.NewSpline(-1, draft.P0, mouse, mouse, mouse), true
 	case StageSetP2:
-		return newSpline(-1, draft.P0, draft.P1, mouse, mouse), true
+		return simpkg.NewSpline(-1, draft.P0, draft.P1, mouse, mouse), true
 	case StageSetP3:
 		if snapStart.SplineIndex >= 0 {
 			next := splines[snapStart.SplineIndex]
 			p3 := next.P0
 			p2 := vecSub(vecScale(p3, 2), next.P1)
-			return newSpline(-1, draft.P0, draft.P1, p2, p3), true
+			return simpkg.NewSpline(-1, draft.P0, draft.P1, p2, p3), true
 		}
-		return newSpline(-1, draft.P0, draft.P1, draft.P2, mouse), true
+		return simpkg.NewSpline(-1, draft.P0, draft.P1, draft.P2, mouse), true
 	default:
 		return Spline{}, false
 	}
 }
 
-func drawDraft(stage Stage, draft Draft, mouse rl.Vector2, zoom float32) {
+func drawDraft(stage Stage, draft Draft, mouse Vec2, zoom float32) {
 	lineThickness := pixelsToWorld(zoom, 1.5)
 	handleRadius := pixelsToWorld(zoom, handlePixels)
-	guide := rl.NewColor(140, 140, 140, 255)
-	locked := rl.NewColor(130, 75, 215, 255)
+	guide := NewColor(140, 140, 140, 255)
+	locked := NewColor(130, 75, 215, 255)
 
-	drawEndpoint(draft.P0, handleRadius, rl.NewColor(215, 67, 67, 255))
+	drawEndpoint(draft.P0, handleRadius, NewColor(215, 67, 67, 255))
 
 	switch stage {
 	case StageSetP1:
 		if draft.LockP1 {
-			rl.DrawLineEx(draft.P0, draft.P1, lineThickness, locked)
+			drawLineEx(draft.P0, draft.P1, lineThickness, locked)
 			drawEndpoint(draft.P1, handleRadius, locked)
 		} else {
-			rl.DrawLineEx(draft.P0, mouse, lineThickness, guide)
+			drawLineEx(draft.P0, mouse, lineThickness, guide)
 			drawEndpoint(mouse, handleRadius, guide)
 		}
 	case StageSetP2:
-		rl.DrawLineEx(draft.P0, draft.P1, lineThickness, guide)
-		rl.DrawLineEx(draft.P1, mouse, lineThickness, guide)
+		drawLineEx(draft.P0, draft.P1, lineThickness, guide)
+		drawLineEx(draft.P1, mouse, lineThickness, guide)
 		drawEndpoint(draft.P1, handleRadius, mapBoolColor(draft.LockP1, locked, guide))
 		drawEndpoint(mouse, handleRadius, guide)
 	case StageSetP3:
-		rl.DrawLineEx(draft.P0, draft.P1, lineThickness, guide)
-		rl.DrawLineEx(draft.P1, draft.P2, lineThickness, guide)
-		rl.DrawLineEx(draft.P2, mouse, lineThickness, guide)
+		drawLineEx(draft.P0, draft.P1, lineThickness, guide)
+		drawLineEx(draft.P1, draft.P2, lineThickness, guide)
+		drawLineEx(draft.P2, mouse, lineThickness, guide)
 		drawEndpoint(draft.P1, handleRadius, mapBoolColor(draft.LockP1, locked, guide))
 		drawEndpoint(draft.P2, handleRadius, guide)
-		drawEndpoint(mouse, handleRadius, rl.NewColor(35, 85, 175, 255))
+		drawEndpoint(mouse, handleRadius, NewColor(35, 85, 175, 255))
 	}
 }
 
 // segmentAngleDeg returns the clockwise angle from East for the vector from→to,
 // normalised to [0, 360). Screen Y is down, so this matches screen intuition.
-func segmentAngleDeg(from, to rl.Vector2) float32 {
+func segmentAngleDeg(from, to Vec2) float32 {
 	dx := to.X - from.X
 	dy := to.Y - from.Y
 	a := float32(math.Atan2(float64(dy), float64(dx)) * 180 / math.Pi)
@@ -5829,10 +3429,10 @@ func segmentAngleDeg(from, to rl.Vector2) float32 {
 
 // drawSegmentLabel draws a length + angle label at the midpoint of a segment,
 // offset perpendicular to the segment so it doesn't overlap the line.
-func drawSegmentLabel(from, to rl.Vector2, camera rl.Camera2D) {
+func drawSegmentLabel(from, to Vec2, camera rl.Camera2D) {
 	mx := (from.X + to.X) / 2
 	my := (from.Y + to.Y) / 2
-	mid := rl.GetWorldToScreen2D(rl.NewVector2(mx, my), camera)
+	mid := getWorldToScreen2D(NewVec2(mx, my), camera)
 
 	dx := to.X - from.X
 	dy := to.Y - from.Y
@@ -5840,8 +3440,8 @@ func drawSegmentLabel(from, to rl.Vector2, camera rl.Camera2D) {
 	angle := segmentAngleDeg(from, to)
 
 	// Perpendicular offset in screen space (rotate segment dir 90° left).
-	segScreenFrom := rl.GetWorldToScreen2D(from, camera)
-	segScreenTo := rl.GetWorldToScreen2D(to, camera)
+	segScreenFrom := getWorldToScreen2D(from, camera)
+	segScreenTo := getWorldToScreen2D(to, camera)
 	sdx := segScreenTo.X - segScreenFrom.X
 	sdy := segScreenTo.Y - segScreenFrom.Y
 	slen := float32(math.Sqrt(float64(sdx*sdx + sdy*sdy)))
@@ -5859,7 +3459,7 @@ func drawSegmentLabel(from, to rl.Vector2, camera rl.Camera2D) {
 	tx := int32(mid.X+ox) - tw/2
 	ty := int32(mid.Y+oy) - 9
 
-	rl.DrawRectangle(tx-2, ty-2, tw+4, 20, rl.NewColor(30, 30, 35, 180))
+	rl.DrawRectangle(tx-2, ty-2, tw+4, 20, NewColor(30, 30, 35, 180))
 	drawText(text, tx+3, ty+1, 14, rl.White)
 }
 
@@ -5868,8 +3468,8 @@ func drawArcLabel(preview Spline, camera rl.Camera2D) {
 	if preview.Length <= 0 {
 		return
 	}
-	midPos, tangent := sampleSplineAtDistance(preview, preview.Length/2)
-	screen := rl.GetWorldToScreen2D(midPos, camera)
+	midPos, tangent := simpkg.SampleSplineAtDistance(preview, preview.Length/2)
+	screen := getWorldToScreen2D(midPos, camera)
 
 	// Offset perpendicular to tangent so the label doesn't sit on the curve.
 	px := -tangent.Y
@@ -5882,12 +3482,12 @@ func drawArcLabel(preview Spline, camera rl.Camera2D) {
 	tx := int32(screen.X+ox) - tw/2
 	ty := int32(screen.Y+oy) - 9
 
-	rl.DrawRectangle(tx-2, ty-2, tw+4, 20, rl.NewColor(20, 80, 160, 200))
-	drawText(text, tx+3, ty+1, 14, rl.NewColor(180, 220, 255, 255))
+	rl.DrawRectangle(tx-2, ty-2, tw+4, 20, NewColor(20, 80, 160, 200))
+	drawText(text, tx+3, ty+1, 14, NewColor(180, 220, 255, 255))
 }
 
 // drawDraftInfo draws measurement labels directly on the draft segments and arc.
-func drawDraftInfo(stage Stage, draft Draft, mouseWorld rl.Vector2, preview Spline, camera rl.Camera2D) {
+func drawDraftInfo(stage Stage, draft Draft, mouseWorld Vec2, preview Spline, camera rl.Camera2D) {
 	switch stage {
 	case StageSetP1:
 		if draft.LockP1 {
@@ -5905,7 +3505,7 @@ func drawDraftInfo(stage Stage, draft Draft, mouseWorld rl.Vector2, preview Spli
 	}
 }
 
-func mapBoolColor(condition bool, whenTrue, whenFalse rl.Color) rl.Color {
+func mapBoolColor(condition bool, whenTrue, whenFalse Color) Color {
 	if condition {
 		return whenTrue
 	}
@@ -5923,7 +3523,7 @@ func drawGrid(camera rl.Camera2D) {
 
 	type level struct {
 		spacing float32
-		color   rl.Color
+		color   Color
 		pxThick float32 // constant screen-pixel thickness
 		showMin float32 // only show when zoom >= showMin (0 = no minimum)
 		showMax float32 // only show when zoom <= showMax (0 = no maximum)
@@ -5931,9 +3531,9 @@ func drawGrid(camera rl.Camera2D) {
 
 	// Draw thinnest first so thicker lines paint on top.
 	levels := []level{
-		{4, rl.NewColor(220, 220, 226, 255), 1.0, 6.0, 0},
-		{20, rl.NewColor(185, 185, 196, 255), 1.5, 0.8, 0},
-		{100, rl.NewColor(148, 148, 162, 255), 2.0, 0, 0},
+		{4, NewColor(220, 220, 226, 255), 1.0, 6.0, 0},
+		{20, NewColor(185, 185, 196, 255), 1.5, 0.8, 0},
+		{100, NewColor(148, 148, 162, 255), 2.0, 0, 0},
 	}
 
 	for _, lvl := range levels {
@@ -5946,10 +3546,10 @@ func drawGrid(camera rl.Camera2D) {
 		thick := pixelsToWorld(zoom, lvl.pxThick)
 		sp := lvl.spacing
 		for x := float32(math.Floor(float64(minX/sp))) * sp; x <= maxX; x += sp {
-			rl.DrawLineEx(rl.NewVector2(x, minY), rl.NewVector2(x, maxY), thick, lvl.color)
+			drawLineEx(NewVec2(x, minY), NewVec2(x, maxY), thick, lvl.color)
 		}
 		for y := float32(math.Floor(float64(minY/sp))) * sp; y <= maxY; y += sp {
-			rl.DrawLineEx(rl.NewVector2(minX, y), rl.NewVector2(maxX, y), thick, lvl.color)
+			drawLineEx(NewVec2(minX, y), NewVec2(maxX, y), thick, lvl.color)
 		}
 	}
 }
@@ -5962,9 +3562,9 @@ func drawAxes(camera rl.Camera2D) {
 	minY := minf(topLeft.Y, bottomRight.Y)
 	maxY := maxf(topLeft.Y, bottomRight.Y)
 
-	axis := rl.NewColor(180, 180, 185, 255)
-	rl.DrawLineV(rl.NewVector2(0, minY), rl.NewVector2(0, maxY), axis)
-	rl.DrawLineV(rl.NewVector2(minX, 0), rl.NewVector2(maxX, 0), axis)
+	axis := NewColor(180, 180, 185, 255)
+	drawLineV(NewVec2(0, minY), NewVec2(0, maxY), axis)
+	drawLineV(NewVec2(minX, 0), NewVec2(maxX, 0), axis)
 }
 
 // formatDistance formats a distance in metres to a human-readable string.
@@ -5991,12 +3591,12 @@ func drawScaleBar(zoom float32) {
 	barX := margin
 
 	label := formatDistance(major)
-	barColor := rl.NewColor(50, 50, 55, 220)
+	barColor := NewColor(50, 50, 55, 220)
 
 	// Horizontal bar with end ticks
-	rl.DrawLineEx(rl.NewVector2(barX, barY), rl.NewVector2(barX+barPx, barY), 2, barColor)
-	rl.DrawLineEx(rl.NewVector2(barX, barY-5), rl.NewVector2(barX, barY+5), 2, barColor)
-	rl.DrawLineEx(rl.NewVector2(barX+barPx, barY-5), rl.NewVector2(barX+barPx, barY+5), 2, barColor)
+	drawLineEx(NewVec2(barX, barY), NewVec2(barX+barPx, barY), 2, barColor)
+	drawLineEx(NewVec2(barX, barY-5), NewVec2(barX, barY+5), 2, barColor)
+	drawLineEx(NewVec2(barX+barPx, barY-5), NewVec2(barX+barPx, barY+5), 2, barColor)
 
 	labelW := measureText(label, 16)
 	drawText(label, int32(barX+barPx/2)-labelW/2, int32(barY-20), 16, barColor)
@@ -6022,24 +3622,24 @@ func zoomCameraToMouse(camera *rl.Camera2D, wheel float32) {
 	camera.Zoom = clampf(camera.Zoom*factor, minZoom, maxZoom)
 
 	after := rl.GetScreenToWorld2D(mouse, *camera)
-	camera.Target = vecAdd(camera.Target, vecSub(before, after))
+	camera.Target = toRLVec2(vecAdd(fromRLVec2(camera.Target), vecSub(fromRLVec2(before), fromRLVec2(after))))
 }
 
-func drawSpline(s Spline, thickness float32, color rl.Color) {
+func drawSpline(s Spline, thickness float32, color Color) {
 	prev := s.P0
 	for i := 1; i <= curveSamples; i++ {
 		t := float32(i) / float32(curveSamples)
-		curr := rl.GetSplinePointBezierCubic(s.P0, s.P1, s.P2, s.P3, t)
-		rl.DrawLineEx(prev, curr, thickness, color)
+		curr := bezierPoint(s.P0, s.P1, s.P2, s.P3, t)
+		drawLineEx(prev, curr, thickness, color)
 		prev = curr
 	}
 }
 
-func drawEndpoint(p rl.Vector2, radius float32, color rl.Color) {
-	rl.DrawCircleV(p, radius, color)
+func drawEndpoint(p Vec2, radius float32, color Color) {
+	drawCircleV(p, radius, color)
 }
 
-func findNearbyEnd(splines []Spline, point rl.Vector2, radius float32) EndHit {
+func findNearbyEnd(splines []Spline, point Vec2, radius float32) EndHit {
 	best := EndHit{SplineIndex: -1, SplineID: -1, Kind: EndNone}
 	bestDistSq := radius * radius
 	for i, spline := range splines {
@@ -6052,7 +3652,7 @@ func findNearbyEnd(splines []Spline, point rl.Vector2, radius float32) EndHit {
 	return best
 }
 
-func findNearbyStart(splines []Spline, point rl.Vector2, radius float32) EndHit {
+func findNearbyStart(splines []Spline, point Vec2, radius float32) EndHit {
 	best := EndHit{SplineIndex: -1, SplineID: -1, Kind: EndNone}
 	bestDistSq := radius * radius
 	for i, spline := range splines {
@@ -6065,7 +3665,7 @@ func findNearbyStart(splines []Spline, point rl.Vector2, radius float32) EndHit 
 	return best
 }
 
-func findHoveredSpline(splines []Spline, point rl.Vector2, radius float32) int {
+func findHoveredSpline(splines []Spline, point Vec2, radius float32) int {
 	bestIndex := -1
 	bestDistSq := radius * radius
 	for i, spline := range splines {
@@ -6078,12 +3678,12 @@ func findHoveredSpline(splines []Spline, point rl.Vector2, radius float32) int {
 	return bestIndex
 }
 
-func splineDistanceSq(s Spline, point rl.Vector2) float32 {
+func splineDistanceSq(s Spline, point Vec2) float32 {
 	best := float32(math.MaxFloat32)
 	prev := s.P0
 	for i := 1; i <= hoverSamples; i++ {
 		t := float32(i) / float32(hoverSamples)
-		curr := rl.GetSplinePointBezierCubic(s.P0, s.P1, s.P2, s.P3, t)
+		curr := bezierPoint(s.P0, s.P1, s.P2, s.P3, t)
 		d := pointSegmentDistanceSq(point, prev, curr)
 		if d < best {
 			best = d
@@ -6093,7 +3693,7 @@ func splineDistanceSq(s Spline, point rl.Vector2) float32 {
 	return best
 }
 
-func pointSegmentDistanceSq(p, a, b rl.Vector2) float32 {
+func pointSegmentDistanceSq(p, a, b Vec2) float32 {
 	ab := vecSub(b, a)
 	ap := vecSub(p, a)
 	denom := dot(ab, ab)
@@ -6103,217 +3703,6 @@ func pointSegmentDistanceSq(p, a, b rl.Vector2) float32 {
 	t := clampf(dot(ap, ab)/denom, 0, 1)
 	closest := vecAdd(a, vecScale(ab, t))
 	return distSq(p, closest)
-}
-
-func buildVehicleCounts(cars []Car) map[int]int {
-	counts := make(map[int]int)
-	for _, car := range cars {
-		counts[car.CurrentSplineID]++
-	}
-	return counts
-}
-
-func isSplineUsableForVehicle(s Spline, vehicleKind VehicleKind) bool {
-	return vehicleKind == VehicleBus || !s.BusOnly
-}
-
-func findShortestPathWeighted(splines []Spline, startSplineID, endSplineID int, vehicleCounts map[int]int, vehicleKind VehicleKind) ([]int, float32, bool) {
-	return findShortestPathWeightedWithGraph(newRoadGraph(splines, vehicleCounts), startSplineID, endSplineID, vehicleKind)
-}
-
-func findShortestPathWeightedWithGraph(graph *RoadGraph, startSplineID, endSplineID int, vehicleKind VehicleKind) ([]int, float32, bool) {
-	if graph == nil || len(graph.splines) == 0 {
-		return nil, 0, false
-	}
-	key := pathCacheKey{StartID: startSplineID, EndID: endSplineID, VehicleKind: vehicleKind}
-	if cached, ok := graph.pathCache[key]; ok {
-		graph.pathCacheHits++
-		return append([]int(nil), cached.PathIDs...), cached.Cost, cached.OK
-	}
-	graph.pathCacheMisses++
-	startIdx, okStart := graph.indexByID[startSplineID]
-	endIdx, okEnd := graph.indexByID[endSplineID]
-	if !okStart || !okEnd {
-		graph.pathCache[key] = pathCacheEntry{OK: false}
-		return nil, 0, false
-	}
-	if vehicleKind == VehicleCar && startIdx != endIdx && graph.splines[endIdx].BusOnly {
-		graph.pathCache[key] = pathCacheEntry{OK: false}
-		return nil, 0, false
-	}
-
-	const inf = float32(1e30)
-	dist := make([]float32, len(graph.splines))
-	prev := make([]int, len(graph.splines))
-	for i := range dist {
-		dist[i] = inf
-		prev[i] = -1
-	}
-	dist[startIdx] = graph.segmentCosts[startIdx]
-	pq := dijkstraHeap{{idx: startIdx, dist: dist[startIdx]}}
-	heap.Init(&pq)
-
-	for pq.Len() > 0 {
-		item := heap.Pop(&pq).(dijkstraItem)
-		if item.dist != dist[item.idx] {
-			continue
-		}
-		if item.idx == endIdx {
-			break
-		}
-		for _, nextIdx := range graph.routeNeighbors[item.idx] {
-			if vehicleKind == VehicleCar && graph.splines[nextIdx].BusOnly {
-				continue
-			}
-			alt := item.dist + graph.segmentCosts[nextIdx]
-			if alt < dist[nextIdx] {
-				dist[nextIdx] = alt
-				prev[nextIdx] = item.idx
-				heap.Push(&pq, dijkstraItem{idx: nextIdx, dist: alt})
-			}
-		}
-	}
-
-	if dist[endIdx] >= inf/2 {
-		graph.pathCache[key] = pathCacheEntry{OK: false}
-		return nil, 0, false
-	}
-
-	pathIndices := make([]int, 0, 16)
-	for at := endIdx; at >= 0; at = prev[at] {
-		pathIndices = append(pathIndices, at)
-	}
-	for i, j := 0, len(pathIndices)-1; i < j; i, j = i+1, j-1 {
-		pathIndices[i], pathIndices[j] = pathIndices[j], pathIndices[i]
-	}
-	pathIDs := make([]int, 0, len(pathIndices))
-	for _, idx := range pathIndices {
-		pathIDs = append(pathIDs, graph.splines[idx].ID)
-	}
-	graph.pathCache[key] = pathCacheEntry{
-		PathIDs: append([]int(nil), pathIDs...),
-		Cost:    dist[endIdx],
-		OK:      true,
-	}
-	return pathIDs, dist[endIdx], true
-}
-
-func chooseNextSplineOnBestPath(splines []Spline, currentSplineID, destinationSplineID int, vehicleCounts map[int]int, vehicleKind VehicleKind) (int, bool) {
-	return chooseNextSplineOnBestPathWithGraph(newRoadGraph(splines, vehicleCounts), currentSplineID, destinationSplineID, vehicleKind)
-}
-
-func chooseNextSplineOnBestPathWithGraph(graph *RoadGraph, currentSplineID, destinationSplineID int, vehicleKind VehicleKind) (int, bool) {
-	currentSpline, ok := graph.splineByID(currentSplineID)
-	if !ok {
-		return 0, false
-	}
-	candidateIndices := graph.startsByNode[pointKey(currentSpline.P3)]
-	if len(candidateIndices) == 0 {
-		return 0, false
-	}
-
-	bestSplineID := 0
-	bestCost := float32(1e30)
-	found := false
-	for _, idx := range candidateIndices {
-		candidate := graph.splines[idx]
-		if !isSplineUsableForVehicle(candidate, vehicleKind) {
-			continue
-		}
-		_, cost, ok := findShortestPathWeightedWithGraph(graph, candidate.ID, destinationSplineID, vehicleKind)
-		if !ok {
-			continue
-		}
-		if !found || cost < bestCost {
-			bestCost = cost
-			bestSplineID = candidate.ID
-			found = true
-		}
-	}
-	return bestSplineID, found
-}
-
-// expandWithCoupledNeighbors takes a slice of spline indices (direct neighbours
-// reachable by a physical P3→P0 connection) and appends the indices of any
-// splines that are coupled with those direct neighbours, without cascading
-// further (i.e. only one level of coupling is added).
-func expandWithCoupledNeighbors(indices []int, splines []Spline, indexByID map[int]int) []int {
-	seen := make(map[int]bool, len(indices)*2)
-	result := make([]int, 0, len(indices)*2)
-	for _, idx := range indices {
-		if !seen[idx] {
-			seen[idx] = true
-			result = append(result, idx)
-		}
-		for _, coupledID := range splines[idx].HardCoupledIDs {
-			if coupledIdx, ok := indexByID[coupledID]; ok && !seen[coupledIdx] {
-				seen[coupledIdx] = true
-				result = append(result, coupledIdx)
-			}
-		}
-	}
-	return result
-}
-
-func buildStartsByNode(splines []Spline) map[string][]int {
-	startsByNode := map[string][]int{}
-	for i, spline := range splines {
-		key := pointKey(spline.P0)
-		startsByNode[key] = append(startsByNode[key], i)
-	}
-	return startsByNode
-}
-
-func segmentTravelCost(s Spline, vehicleCounts map[int]int) float32 {
-	return s.TravelTimeS + float32(vehicleCounts[s.ID])*2.0
-}
-
-func sampleSplineAtDistance(s Spline, distance float32) (rl.Vector2, rl.Vector2) {
-	if s.Length <= 0 {
-		return s.P0, rl.NewVector2(1, 0)
-	}
-	distance = clampf(distance, 0, s.Length)
-	for i := 1; i <= simSamples; i++ {
-		if distance <= s.CumLen[i] {
-			span := s.CumLen[i] - s.CumLen[i-1]
-			alpha := float32(0)
-			if span > 0 {
-				alpha = (distance - s.CumLen[i-1]) / span
-			}
-			t0 := float32(i-1) / float32(simSamples)
-			t1 := float32(i) / float32(simSamples)
-			t := t0 + (t1-t0)*alpha
-			pos := rl.GetSplinePointBezierCubic(s.P0, s.P1, s.P2, s.P3, t)
-			tangent := bezierDerivative(s, t)
-			return pos, normalize(tangent)
-		}
-	}
-	return s.P3, normalize(vecSub(s.P3, s.P2))
-}
-
-func bezierDerivative(s Spline, t float32) rl.Vector2 {
-	u := 1 - t
-	term0 := vecScale(vecSub(s.P1, s.P0), 3*u*u)
-	term1 := vecScale(vecSub(s.P2, s.P1), 6*u*t)
-	term2 := vecScale(vecSub(s.P3, s.P2), 3*t*t)
-	return vecAdd(vecAdd(term0, term1), term2)
-}
-
-func buildSplineIndexByID(splines []Spline) map[int]int {
-	m := make(map[int]int, len(splines))
-	for i, s := range splines {
-		m[s.ID] = i
-	}
-	return m
-}
-
-func findSplineByID(splines []Spline, id int) (Spline, bool) {
-	for _, s := range splines {
-		if s.ID == id {
-			return s, true
-		}
-	}
-	return Spline{}, false
 }
 
 func findRouteID(routes []Route, startSplineID, endSplineID int, vehicleKind VehicleKind) int {
@@ -6446,277 +3835,17 @@ func normalizePickedPath(path string, save bool) string {
 	return path
 }
 
-func saveSplineFile(splines []Spline, routes []Route, cars []Car, lights []TrafficLight, cycles []TrafficCycle, path string) error {
-	saved := SavedSplineFile{
-		Splines:       make([]SavedSpline, 0, len(splines)),
-		Routes:        make([]SavedRoute, 0, len(routes)),
-		Cars:          make([]SavedCar, 0, len(cars)),
-		TrafficLights: make([]SavedTrafficLight, 0, len(lights)),
-		TrafficCycles: make([]SavedTrafficCycle, 0, len(cycles)),
-	}
-	for _, spline := range splines {
-		saved.Splines = append(saved.Splines, SavedSpline{
-			ID:             spline.ID,
-			Priority:       spline.Priority,
-			BusOnly:        spline.BusOnly,
-			P0:             spline.P0,
-			P1:             spline.P1,
-			P2:             spline.P2,
-			P3:             spline.P3,
-			HardCoupledIDs: append([]int(nil), spline.HardCoupledIDs...),
-			SoftCoupledIDs: append([]int(nil), spline.SoftCoupledIDs...),
-			SpeedLimitKmh:  spline.SpeedLimitKmh,
-			LanePreference: spline.LanePreference,
-		})
-	}
-	for _, route := range routes {
-		savedStops := make([]SavedBusStop, 0, len(route.BusStops))
-		for _, stop := range route.BusStops {
-			savedStops = append(savedStops, SavedBusStop{
-				SplineID:  stop.SplineID,
-				WorldPosX: stop.WorldPos.X,
-				WorldPosY: stop.WorldPos.Y,
-			})
-		}
-		saved.Routes = append(saved.Routes, SavedRoute{
-			ID:             route.ID,
-			StartSplineID:  route.StartSplineID,
-			EndSplineID:    route.EndSplineID,
-			PathIDs:        route.PathIDs,
-			SpawnPerMinute: route.SpawnPerMinute,
-			ColorIndex:     route.ColorIndex,
-			VehicleKind:    vehicleKindString(route.VehicleKind),
-			BusStops:       savedStops,
-		})
-	}
-	for _, car := range cars {
-		saved.Cars = append(saved.Cars, SavedCar{
-			RouteID:              car.RouteID,
-			CurrentSplineID:      car.CurrentSplineID,
-			DestinationSplineID:  car.DestinationSplineID,
-			DistanceOnSpline:     car.DistanceOnSpline,
-			Speed:                car.Speed,
-			MaxSpeed:             car.MaxSpeed,
-			Accel:                car.Accel,
-			Length:               car.Length,
-			Width:                car.Width,
-			CurveSpeedMultiplier: car.CurveSpeedMultiplier,
-			VehicleKind:          vehicleKindString(car.VehicleKind),
-			NextBusStopIndex:     car.NextBusStopIndex,
-			BusStopTimer:         car.BusStopTimer,
-			BusStopDuration:      car.BusStopDuration,
-		})
-	}
-
-	for _, l := range lights {
-		saved.TrafficLights = append(saved.TrafficLights, SavedTrafficLight{
-			ID:           l.ID,
-			SplineID:     l.SplineID,
-			DistOnSpline: l.DistOnSpline,
-			WorldPosX:    l.WorldPos.X,
-			WorldPosY:    l.WorldPos.Y,
-			CycleID:      l.CycleID,
-		})
-	}
-	for _, c := range cycles {
-		phases := make([]SavedTrafficPhase, len(c.Phases))
-		for i, p := range c.Phases {
-			phases[i] = SavedTrafficPhase{
-				DurationSecs:          p.DurationSecs,
-				ClearanceDurationSecs: p.ClearanceDurationSecs,
-				GreenLightIDs:         append([]int(nil), p.GreenLightIDs...),
-			}
-		}
-		saved.TrafficCycles = append(saved.TrafficCycles, SavedTrafficCycle{
-			ID:      c.ID,
-			Enabled: c.Enabled,
-			Phases:  phases,
-		})
-	}
-
-	data, err := json.MarshalIndent(saved, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0644)
-}
-
-func loadSplineFile(path string) ([]Spline, []Route, []Car, []TrafficLight, []TrafficCycle, int, int, int, int, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, nil, nil, nil, nil, 1, 1, 1, 1, err
-	}
-
-	var saved SavedSplineFile
-	if err := json.Unmarshal(data, &saved); err != nil {
-		return nil, nil, nil, nil, nil, 1, 1, 1, 1, err
-	}
-
-	loadedSplines := make([]Spline, 0, len(saved.Splines))
-	maxSplineID := 0
-	for _, entry := range saved.Splines {
-		spline := newSpline(entry.ID, entry.P0, entry.P1, entry.P2, entry.P3)
-		spline.Priority = entry.Priority
-		spline.BusOnly = entry.BusOnly
-		spline.HardCoupledIDs = append([]int(nil), entry.HardCoupledIDs...)
-		spline.SoftCoupledIDs = append([]int(nil), entry.SoftCoupledIDs...)
-		spline.SpeedLimitKmh = entry.SpeedLimitKmh
-		spline.LanePreference = entry.LanePreference
-		spline.CurveSpeedMPS = buildCurveSpeedProfile(&spline)
-		spline.TravelTimeS = buildSplineTravelTime(&spline)
-		loadedSplines = append(loadedSplines, spline)
-		if entry.ID > maxSplineID {
-			maxSplineID = entry.ID
-		}
-	}
-
-	loadedRoutes := make([]Route, 0, len(saved.Routes))
-	maxRouteID := 0
-	for _, entry := range saved.Routes {
-		stops := make([]BusStop, 0, len(entry.BusStops))
-		for _, savedStop := range entry.BusStops {
-			stops = append(stops, BusStop{
-				SplineID: savedStop.SplineID,
-				WorldPos: rl.NewVector2(savedStop.WorldPosX, savedStop.WorldPosY),
-			})
-		}
-		vehicleKind := vehicleKindFromString(entry.VehicleKind)
-		route := Route{
-			ID:             entry.ID,
-			StartSplineID:  entry.StartSplineID,
-			EndSplineID:    entry.EndSplineID,
-			PathIDs:        entry.PathIDs,
-			SpawnPerMinute: entry.SpawnPerMinute,
-			ColorIndex:     entry.ColorIndex,
-			Color:          routePaletteColor(entry.ColorIndex),
-			VehicleKind:    vehicleKind,
-			BusStops:       stops,
-		}
-		if entry.ID > maxRouteID {
-			maxRouteID = entry.ID
-		}
-		loadedRoutes = append(loadedRoutes, route)
-	}
-
-	loadedCars := make([]Car, 0, len(saved.Cars))
-	routeColorByID := make(map[int]rl.Color, len(loadedRoutes))
-	for _, r := range loadedRoutes {
-		routeColorByID[r.ID] = r.Color
-	}
-	for _, entry := range saved.Cars {
-		vehicleKind := vehicleKindFromString(entry.VehicleKind)
-		car := Car{
-			RouteID:              entry.RouteID,
-			CurrentSplineID:      entry.CurrentSplineID,
-			DestinationSplineID:  entry.DestinationSplineID,
-			PrevSplineIDs:        [2]int{-1, -1},
-			DistanceOnSpline:     entry.DistanceOnSpline,
-			Speed:                entry.Speed,
-			MaxSpeed:             entry.MaxSpeed,
-			Accel:                entry.Accel,
-			Length:               entry.Length,
-			Width:                entry.Width,
-			CurveSpeedMultiplier: entry.CurveSpeedMultiplier,
-			Color:                routeColorByID[entry.RouteID],
-			Braking:              false,
-			LaneChangeSplineID:   -1,
-			AfterSplineID:        -1,
-			DesiredLaneSplineID:  -1,
-			PreferenceCooldown:   rand.Float32() * preferenceChangeCooldownS,
-			VehicleKind:          vehicleKind,
-			NextBusStopIndex:     entry.NextBusStopIndex,
-			BusStopTimer:         entry.BusStopTimer,
-			BusStopDuration:      entry.BusStopDuration,
-		}
-		if car.CurveSpeedMultiplier == 0 {
-			car.CurveSpeedMultiplier = randRange(0.8, 1.2)
-		}
-		if car.VehicleKind == VehicleBus {
-			for _, route := range loadedRoutes {
-				if route.ID == car.RouteID {
-					car.DestinationSplineID = currentRouteTarget(route, car.NextBusStopIndex)
-					break
-				}
-			}
-		}
-		loadedCars = append(loadedCars, car)
-	}
-
-	loadedLights := make([]TrafficLight, 0, len(saved.TrafficLights))
-	maxLightID := 0
-	for _, entry := range saved.TrafficLights {
-		loadedLights = append(loadedLights, TrafficLight{
-			ID:           entry.ID,
-			SplineID:     entry.SplineID,
-			DistOnSpline: entry.DistOnSpline,
-			WorldPos:     rl.NewVector2(entry.WorldPosX, entry.WorldPosY),
-			CycleID:      entry.CycleID,
-		})
-		if entry.ID > maxLightID {
-			maxLightID = entry.ID
-		}
-	}
-
-	loadedCycles := make([]TrafficCycle, 0, len(saved.TrafficCycles))
-	maxCycleID := 0
-	for _, entry := range saved.TrafficCycles {
-		phases := make([]TrafficPhase, len(entry.Phases))
-		for i, p := range entry.Phases {
-			clrDur := p.ClearanceDurationSecs
-			if clrDur <= 0 {
-				// backward compat: fall back to cycle-level yellow_duration_secs if present
-				if entry.YellowDurationSecs > 0 {
-					clrDur = entry.YellowDurationSecs
-				} else {
-					clrDur = 3.0
-				}
-			}
-			phases[i] = TrafficPhase{
-				DurationSecs:          p.DurationSecs,
-				ClearanceDurationSecs: clrDur,
-				GreenLightIDs:         append([]int(nil), p.GreenLightIDs...),
-			}
-		}
-		loadedCycles = append(loadedCycles, TrafficCycle{
-			ID:         entry.ID,
-			LightIDs:   nil, // not saved; rebuilt from lights
-			Phases:     phases,
-			Timer:      0,
-			PhaseIndex: 0,
-			Enabled:    entry.Enabled,
-		})
-		if entry.ID > maxCycleID {
-			maxCycleID = entry.ID
-		}
-	}
-	// Rebuild LightIDs from the loaded lights
-	cycleIdx := make(map[int]int, len(loadedCycles))
-	for i, c := range loadedCycles {
-		cycleIdx[c.ID] = i
-	}
-	for _, l := range loadedLights {
-		if l.CycleID >= 0 {
-			if i, ok := cycleIdx[l.CycleID]; ok {
-				loadedCycles[i].LightIDs = append(loadedCycles[i].LightIDs, l.ID)
-			}
-		}
-	}
-
-	return loadedSplines, loadedRoutes, loadedCars, loadedLights, loadedCycles,
-		maxSplineID + 1, maxRouteID + 1, maxLightID + 1, maxCycleID + 1, nil
-}
-
 func isCtrlDown() bool {
 	return rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)
 }
 
-func pointKey(v rl.Vector2) string {
+func pointKey(v Vec2) string {
 	qx := int(math.Round(float64(v.X * 100)))
 	qy := int(math.Round(float64(v.Y * 100)))
 	return fmt.Sprintf("%d:%d", qx, qy)
 }
 
-func pointInRect(p rl.Vector2, r rl.Rectangle) bool {
+func pointInRect(p Vec2, r rl.Rectangle) bool {
 	return p.X >= r.X && p.X <= r.X+r.Width && p.Y >= r.Y && p.Y <= r.Y+r.Height
 }
 
@@ -6735,60 +3864,22 @@ func randomizedSpawnDelay(spawnPerMinute float32) float32 {
 	return float32(-math.Log(u) / lambda)
 }
 
-func vehicleKindString(kind VehicleKind) string {
-	if kind == VehicleBus {
-		return "bus"
-	}
-	return "car"
-}
-
-func vehicleKindFromString(s string) VehicleKind {
-	if strings.EqualFold(s, "bus") {
-		return VehicleBus
-	}
-	return VehicleCar
-}
-
-var routePalette = []rl.Color{
-	rl.NewColor(224, 94, 94, 255),   // Red
-	rl.NewColor(76, 150, 230, 255),  // Blue
-	rl.NewColor(99, 190, 123, 255),  // Green
-	rl.NewColor(225, 169, 76, 255),  // Orange
-	rl.NewColor(154, 108, 224, 255), // Purple
-	rl.NewColor(76, 191, 188, 255),  // Cyan
-	rl.NewColor(213, 104, 171, 255), // Pink
-	rl.NewColor(218, 205, 60, 255),  // Yellow
-	rl.NewColor(140, 205, 70, 255),  // Lime
-	rl.NewColor(98, 118, 228, 255),  // Indigo
-	rl.NewColor(230, 112, 82, 255),  // Coral
-	rl.NewColor(62, 178, 152, 255),  // Teal
-	rl.NewColor(178, 132, 228, 255), // Lavender
-	rl.NewColor(225, 82, 128, 255),  // Rose
-	rl.NewColor(228, 158, 48, 255),  // Amber
-}
-
-func routePaletteColor(idx int) rl.Color {
-	n := len(routePalette)
-	if n == 0 {
-		return rl.NewColor(90, 90, 90, 255)
-	}
-	return routePalette[((idx%n)+n)%n]
-}
-
-func pickNextColorIndex(routes []Route) int {
-	counts := make([]int, len(routePalette))
-	for _, r := range routes {
-		if r.ColorIndex >= 0 && r.ColorIndex < len(routePalette) {
-			counts[r.ColorIndex]++
-		}
-	}
-	minIdx := 0
-	for i, c := range counts {
-		if c < counts[minIdx] {
-			minIdx = i
-		}
-	}
-	return minIdx
+var routePalette = []Color{
+	NewColor(224, 94, 94, 255),   // Red
+	NewColor(76, 150, 230, 255),  // Blue
+	NewColor(99, 190, 123, 255),  // Green
+	NewColor(225, 169, 76, 255),  // Orange
+	NewColor(154, 108, 224, 255), // Purple
+	NewColor(76, 191, 188, 255),  // Cyan
+	NewColor(213, 104, 171, 255), // Pink
+	NewColor(218, 205, 60, 255),  // Yellow
+	NewColor(140, 205, 70, 255),  // Lime
+	NewColor(98, 118, 228, 255),  // Indigo
+	NewColor(230, 112, 82, 255),  // Coral
+	NewColor(62, 178, 152, 255),  // Teal
+	NewColor(178, 132, 228, 255), // Lavender
+	NewColor(225, 82, 128, 255),  // Rose
+	NewColor(228, 158, 48, 255),  // Amber
 }
 
 // hitboxRadius returns the circle radius for a body of the given width.
@@ -6827,24 +3918,24 @@ func hitboxCircleOffsets(length, width float32) []float32 {
 func collisionRadius(car Car) float32          { return hitboxRadius(car.Width) }
 func collisionCircleOffsets(car Car) []float32 { return hitboxCircleOffsets(car.Length, car.Width) }
 
-func headingAngleDegrees(a, b rl.Vector2) float32 {
+func headingAngleDegrees(a, b Vec2) float32 {
 	da := normalize(a)
 	db := normalize(b)
 	d := clampf(dot(da, db), -1, 1)
 	return float32(math.Acos(float64(d)) * 180 / math.Pi)
 }
 
-func signedAngleDegrees(from, to rl.Vector2) float32 {
+func signedAngleDegrees(from, to Vec2) float32 {
 	nFrom := normalize(from)
 	nTo := normalize(to)
 	return float32(math.Atan2(float64(cross2D(nFrom, nTo)), float64(dot(nFrom, nTo))) * 180 / math.Pi)
 }
 
-func cross2D(a, b rl.Vector2) float32 {
+func cross2D(a, b Vec2) float32 {
 	return a.X*b.Y - a.Y*b.X
 }
 
-func vectorLengthSq(v rl.Vector2) float32 {
+func vectorLengthSq(v Vec2) float32 {
 	return v.X*v.X + v.Y*v.Y
 }
 
@@ -6852,35 +3943,35 @@ func pixelsToWorld(zoom, pixels float32) float32 {
 	return pixels / zoom
 }
 
-func vecAdd(a, b rl.Vector2) rl.Vector2 {
-	return rl.NewVector2(a.X+b.X, a.Y+b.Y)
+func vecAdd(a, b Vec2) Vec2 {
+	return NewVec2(a.X+b.X, a.Y+b.Y)
 }
 
-func vecSub(a, b rl.Vector2) rl.Vector2 {
-	return rl.NewVector2(a.X-b.X, a.Y-b.Y)
+func vecSub(a, b Vec2) Vec2 {
+	return NewVec2(a.X-b.X, a.Y-b.Y)
 }
 
-func vecScale(v rl.Vector2, s float32) rl.Vector2 {
-	return rl.NewVector2(v.X*s, v.Y*s)
+func vecScale(v Vec2, s float32) Vec2 {
+	return NewVec2(v.X*s, v.Y*s)
 }
 
-func dot(a, b rl.Vector2) float32 {
+func dot(a, b Vec2) float32 {
 	return a.X*b.X + a.Y*b.Y
 }
 
-func distSq(a, b rl.Vector2) float32 {
+func distSq(a, b Vec2) float32 {
 	dx := a.X - b.X
 	dy := a.Y - b.Y
 	return dx*dx + dy*dy
 }
 
-func normalize(v rl.Vector2) rl.Vector2 {
+func normalize(v Vec2) Vec2 {
 	lenSq := v.X*v.X + v.Y*v.Y
 	if lenSq <= 1e-9 {
-		return rl.NewVector2(1, 0)
+		return NewVec2(1, 0)
 	}
 	inv := 1 / float32(math.Sqrt(float64(lenSq)))
-	return rl.NewVector2(v.X*inv, v.Y*inv)
+	return NewVec2(v.X*inv, v.Y*inv)
 }
 
 func clampf(v, lo, hi float32) float32 {
@@ -6891,10 +3982,6 @@ func clampf(v, lo, hi float32) float32 {
 		return hi
 	}
 	return v
-}
-
-func randRange(lo, hi float32) float32 {
-	return lo + rand.Float32()*(hi-lo)
 }
 
 func minf(a, b float32) float32 {
