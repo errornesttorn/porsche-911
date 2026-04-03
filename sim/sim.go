@@ -687,6 +687,13 @@ func LoadWorld(path string) (*World, error) {
 		if car.CurveSpeedMultiplier == 0 {
 			car.CurveSpeedMultiplier = randRange(0.8, 1.2)
 		}
+		if spline, ok := FindSplineByID(world.Splines, car.CurrentSplineID); ok {
+			frontPos, tangent := SampleSplineAtDistance(spline, car.DistanceOnSpline)
+			car.RearPosition = Vec2{
+				X: frontPos.X - tangent.X*car.Length*wheelbaseFrac,
+				Y: frontPos.Y - tangent.Y*car.Length*wheelbaseFrac,
+			}
+		}
 		if car.VehicleKind == VehicleBus {
 			for _, route := range world.Routes {
 				if route.ID == car.RouteID {

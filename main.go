@@ -616,6 +616,7 @@ func main() {
 			paused = !paused
 		}
 		if isCtrlDown() && rl.IsKeyPressed(rl.KeyS) {
+			paused = true
 			path, err := pickSplineFilePath(true)
 			if err != nil {
 				noticeText = fmt.Sprintf("Save failed: %v", err)
@@ -642,6 +643,7 @@ func main() {
 					noticeTimer = 3.0
 				} else {
 					world = *loadedWorld
+					paused = true
 					stage = StageIdle
 					draft = newDraft()
 					cutDraft = newCutDraft()
