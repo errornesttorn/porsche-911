@@ -264,6 +264,9 @@ type Draft struct {
 	P1AxisDir        Vec2
 	SnapP3           bool
 	P2AxisDir        Vec2
+	PerpLockActive   bool
+	PerpLockOrigin   Vec2
+	PerpLockAxisDir  Vec2
 }
 
 type QuadraticDraft struct {
@@ -275,8 +278,11 @@ type QuadraticDraft struct {
 	PrevAxisDir       Vec2
 	MMirroredFromPrev bool
 
-	SnapP3      bool
-	NextAxisDir Vec2
+	SnapP3          bool
+	NextAxisDir     Vec2
+	PerpLockActive  bool
+	PerpLockOrigin  Vec2
+	PerpLockAxisDir Vec2
 }
 
 // CutDraft holds state for the spline-cut mode.
@@ -1370,6 +1376,10 @@ func ctrlDown() bool {
 	return rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)
 }
 
+func leftAltDown() bool {
+	return rl.IsKeyDown(rl.KeyLeftAlt)
+}
+
 func axisSnapStep() float32 {
 	return 4.0
 }
@@ -1532,6 +1542,20 @@ func axisConstrainedPoint(mouse, axisOrigin, axisDir Vec2, geometrySnap Geometry
 	return projectPointOntoAxis(mouse, axisOrigin, axisDir)
 }
 
+func startPerpendicularLock(selectedPoint Vec2, geometrySnap GeometrySnap) (bool, Vec2, Vec2) {
+	if !leftAltDown() || !geometrySnap.Active {
+		return false, Vec2{}, Vec2{}
+	}
+	return true, selectedPoint, perpendicular(geometrySnap.AxisDir)
+}
+
+func pendingPerpendicularPoint(mouse Vec2, active bool, origin, axisDir Vec2, geometrySnap GeometrySnap) Vec2 {
+	if !active {
+		return mouse
+	}
+	return axisConstrainedPoint(mouse, origin, axisDir, geometrySnap)
+}
+
 func mirroredP1FromPrevSpline(prev Spline) Vec2 {
 	return vecAdd(prev.P3, vecSub(prev.P3, prev.P2))
 }
@@ -1566,12 +1590,29 @@ func draftP1Preview(draft Draft, mouse Vec2, geometrySnap GeometrySnap) Vec2 {
 	if draft.LockP1 {
 		return axisConstrainedPoint(mouse, draft.P0, draft.P1AxisDir, geometrySnap)
 	}
+	if draft.PerpLockActive {
+		return pendingPerpendicularPoint(mouse, true, draft.PerpLockOrigin, draft.PerpLockAxisDir, geometrySnap)
+	}
+	return mouse
+}
+
+func draftP2FreePreview(draft Draft, mouse Vec2, geometrySnap GeometrySnap) Vec2 {
+	if draft.PerpLockActive {
+		return pendingPerpendicularPoint(mouse, true, draft.PerpLockOrigin, draft.PerpLockAxisDir, geometrySnap)
+	}
 	return mouse
 }
 
 func draftP2Preview(draft Draft, mouse Vec2, geometrySnap GeometrySnap) Vec2 {
 	if draft.SnapP3 {
 		return axisConstrainedPoint(mouse, draft.P3, draft.P2AxisDir, geometrySnap)
+	}
+	return mouse
+}
+
+func draftP3Preview(draft Draft, mouse Vec2, geometrySnap GeometrySnap) Vec2 {
+	if draft.PerpLockActive {
+		return pendingPerpendicularPoint(mouse, true, draft.PerpLockOrigin, draft.PerpLockAxisDir, geometrySnap)
 	}
 	return mouse
 }
@@ -1598,6 +1639,9 @@ func quadraticMOnPrevAxis(draft QuadraticDraft, mouse Vec2, geometrySnap Geometr
 	if draft.FromPrevAxis {
 		return axisConstrainedPoint(mouse, draft.P0, draft.PrevAxisDir, geometrySnap)
 	}
+	if draft.PerpLockActive {
+		return pendingPerpendicularPoint(mouse, true, draft.PerpLockOrigin, draft.PerpLockAxisDir, geometrySnap)
+	}
 	return mouse
 }
 
@@ -1606,6 +1650,13 @@ func quadraticMOnNextAxis(draft QuadraticDraft, mouse Vec2, geometrySnap Geometr
 		return axisConstrainedPoint(mouse, draft.P3, draft.NextAxisDir, geometrySnap)
 	}
 	return draft.M
+}
+
+func quadraticP3Preview(draft QuadraticDraft, mouse Vec2, geometrySnap GeometrySnap) Vec2 {
+	if draft.PerpLockActive {
+		return pendingPerpendicularPoint(mouse, true, draft.PerpLockOrigin, draft.PerpLockAxisDir, geometrySnap)
+	}
+	return mouse
 }
 
 func handleQuadraticMode(stage Stage, draft QuadraticDraft, splines []Spline, hoveredSpline int, hoveredNode EndHit, mouseWorld Vec2, geometrySnap GeometrySnap, nextSplineID int) (Stage, QuadraticDraft, []Spline, int, bool, string) {
@@ -1631,6 +1682,9 @@ func handleQuadraticMode(stage Stage, draft QuadraticDraft, splines []Spline, ho
 			draft.SnapP3 = false
 			draft.NextAxisDir = Vec2{}
 			draft.MMirroredFromPrev = false
+			draft.PerpLockActive = false
+			draft.PerpLockOrigin = Vec2{}
+			draft.PerpLockAxisDir = Vec2{}
 		}
 	}
 
@@ -1645,6 +1699,7 @@ func handleQuadraticMode(stage Stage, draft QuadraticDraft, splines []Spline, ho
 				draft.PrevAxisDir = endpointAxisDir(prev, hoveredNode.Kind)
 			} else {
 				draft.P0 = mouseWorld
+				draft.PerpLockActive, draft.PerpLockOrigin, draft.PerpLockAxisDir = startPerpendicularLock(draft.P0, geometrySnap)
 			}
 			stage = StageSetP1
 
@@ -1670,12 +1725,16 @@ func handleQuadraticMode(stage Stage, draft QuadraticDraft, splines []Spline, ho
 				draft.P3 = nextAnchor
 				draft.SnapP3 = true
 				draft.NextAxisDir = nextAxis
+				draft.PerpLockActive = false
+				draft.PerpLockOrigin = Vec2{}
+				draft.PerpLockAxisDir = Vec2{}
 				stage = StageSetP2
 				break
 			}
 
 			draft.M = quadraticMOnPrevAxis(draft, mouseWorld, geometrySnap)
 			draft.MMirroredFromPrev = false
+			draft.PerpLockActive, draft.PerpLockOrigin, draft.PerpLockAxisDir = startPerpendicularLock(draft.M, geometrySnap)
 			stage = StageSetP2
 
 		case StageSetP2:
@@ -1690,7 +1749,7 @@ func handleQuadraticMode(stage Stage, draft QuadraticDraft, splines []Spline, ho
 				break
 			}
 
-			p3 := mouseWorld
+			p3 := quadraticP3Preview(draft, mouseWorld, geometrySnap)
 			m := draft.M
 			if hoveredNode.SplineIndex >= 0 {
 				next := splines[hoveredNode.SplineIndex]
@@ -1744,6 +1803,9 @@ func handleEditMode(stage Stage, draft Draft, splines []Spline, hoveredSpline in
 			draft.SnapP3 = false
 			draft.P2AxisDir = Vec2{}
 			draft.P3 = Vec2{}
+			draft.PerpLockActive = false
+			draft.PerpLockOrigin = Vec2{}
+			draft.PerpLockAxisDir = Vec2{}
 			stage = StageSetP2
 		}
 	}
@@ -1760,6 +1822,7 @@ func handleEditMode(stage Stage, draft Draft, splines []Spline, hoveredSpline in
 				draft.P1AxisDir = endpointAxisDir(prev, hoveredNode.Kind)
 			} else {
 				draft.P0 = mouseWorld
+				draft.PerpLockActive, draft.PerpLockOrigin, draft.PerpLockAxisDir = startPerpendicularLock(draft.P0, geometrySnap)
 			}
 			stage = StageSetP1
 
@@ -1771,9 +1834,13 @@ func handleEditMode(stage Stage, draft Draft, splines []Spline, hoveredSpline in
 				draft.HasP1 = true
 				draft.LockP1 = false
 				draft.P1AxisDir = Vec2{}
+				draft.PerpLockActive = false
+				draft.PerpLockOrigin = Vec2{}
+				draft.PerpLockAxisDir = Vec2{}
 			} else {
 				draft.P1 = draftP1Preview(draft, mouseWorld, geometrySnap)
 				draft.HasP1 = true
+				draft.PerpLockActive, draft.PerpLockOrigin, draft.PerpLockAxisDir = startPerpendicularLock(draft.P1, geometrySnap)
 			}
 			stage = StageSetP2
 
@@ -1784,18 +1851,22 @@ func handleEditMode(stage Stage, draft Draft, splines []Spline, hoveredSpline in
 				draft.P3 = endpointAnchor(next, hoveredNode.Kind)
 				draft.P2AxisDir = endpointAxisDir(next, hoveredNode.Kind)
 				draft.HasP2 = false
+				draft.PerpLockActive = false
+				draft.PerpLockOrigin = Vec2{}
+				draft.PerpLockAxisDir = Vec2{}
 			} else {
-				draft.P2 = mouseWorld
+				draft.P2 = draftP2FreePreview(draft, mouseWorld, geometrySnap)
 				draft.HasP2 = true
 				draft.SnapP3 = false
 				draft.P2AxisDir = Vec2{}
 				draft.P3 = Vec2{}
+				draft.PerpLockActive, draft.PerpLockOrigin, draft.PerpLockAxisDir = startPerpendicularLock(draft.P2, geometrySnap)
 			}
 			stage = StageSetP3
 
 		case StageSetP3:
 			p2 := draft.P2
-			p3 := mouseWorld
+			p3 := draftP3Preview(draft, mouseWorld, geometrySnap)
 			if draft.SnapP3 {
 				p3 = draft.P3
 				p2 = draftP2Preview(draft, mouseWorld, geometrySnap)
@@ -4035,7 +4106,7 @@ func buildQuadraticPreview(stage Stage, draft QuadraticDraft, mouse Vec2, geomet
 			}
 			return newQuadraticSpline(-1, draft.P0, mirroredHandleAtEndpoint(next, hoveredNode.Kind), p3), true
 		}
-		return newQuadraticSpline(-1, draft.P0, draft.M, mouse), true
+		return newQuadraticSpline(-1, draft.P0, draft.M, quadraticP3Preview(draft, mouse, geometrySnap)), true
 	default:
 		return Spline{}, false
 	}
@@ -4062,7 +4133,7 @@ func drawQuadraticDraft(stage Stage, draft QuadraticDraft, mouse Vec2, zoom floa
 		drawEndpoint(mouse, handleRadius, NewColor(35, 85, 175, 255))
 	case StageSetP2:
 		m := draft.M
-		p3 := mouse
+		p3 := quadraticP3Preview(draft, mouse, geometrySnap)
 		if draft.SnapP3 {
 			m = quadraticMOnNextAxis(draft, mouse, geometrySnap)
 			p3 = draft.P3
@@ -4083,7 +4154,7 @@ func drawQuadraticDraftInfo(stage Stage, draft QuadraticDraft, mouseWorld Vec2, 
 		if draft.SnapP3 {
 			drawSegmentLabel(quadraticMOnNextAxis(draft, mouseWorld, geometrySnap), draft.P3, camera)
 		} else {
-			drawSegmentLabel(draft.M, mouseWorld, camera)
+			drawSegmentLabel(draft.M, quadraticP3Preview(draft, mouseWorld, geometrySnap), camera)
 		}
 		drawArcLabel(preview, camera)
 	}
@@ -4119,6 +4190,10 @@ func drawQuadraticSnapHint(stage Stage, draft QuadraticDraft, hoveredNode EndHit
 			drawAxisHint(draft.P0, draft.PrevAxisDir, mouse, zoom, ghostColor)
 			return
 		}
+		if draft.PerpLockActive {
+			drawAxisHint(draft.PerpLockOrigin, draft.PerpLockAxisDir, mouse, zoom, ghostColor)
+			return
+		}
 		if hoveredNode.SplineIndex < 0 {
 			return
 		}
@@ -4132,6 +4207,9 @@ func drawQuadraticSnapHint(stage Stage, draft QuadraticDraft, hoveredNode EndHit
 		if draft.SnapP3 {
 			drawAxisHint(draft.P3, draft.NextAxisDir, mouse, zoom, ghostColor)
 			return
+		}
+		if draft.PerpLockActive {
+			drawAxisHint(draft.PerpLockOrigin, draft.PerpLockAxisDir, mouse, zoom, ghostColor)
 		}
 		if hoveredNode.SplineIndex < 0 {
 			return
@@ -4159,7 +4237,8 @@ func buildPreview(stage Stage, draft Draft, mouse Vec2, geometrySnap GeometrySna
 	case StageSetP1:
 		return simpkg.NewSpline(-1, draft.P0, draftP1Preview(draft, mouse, geometrySnap), mouse, mouse), true
 	case StageSetP2:
-		return simpkg.NewSpline(-1, draft.P0, draft.P1, mouse, mouse), true
+		p2 := draftP2FreePreview(draft, mouse, geometrySnap)
+		return simpkg.NewSpline(-1, draft.P0, draft.P1, p2, p2), true
 	case StageSetP3:
 		if draft.SnapP3 {
 			return simpkg.NewSpline(-1, draft.P0, draft.P1, draftP2Preview(draft, mouse, geometrySnap), draft.P3), true
@@ -4170,7 +4249,7 @@ func buildPreview(stage Stage, draft Draft, mouse Vec2, geometrySnap GeometrySna
 			p2 := mirroredHandleAtEndpoint(next, hoveredNode.Kind)
 			return simpkg.NewSpline(-1, draft.P0, draft.P1, p2, p3), true
 		}
-		return simpkg.NewSpline(-1, draft.P0, draft.P1, draft.P2, mouse), true
+		return simpkg.NewSpline(-1, draft.P0, draft.P1, draft.P2, draftP3Preview(draft, mouse, geometrySnap)), true
 	default:
 		return Spline{}, false
 	}
@@ -4195,13 +4274,14 @@ func drawDraft(stage Stage, draft Draft, mouse Vec2, zoom float32, geometrySnap 
 			drawEndpoint(mouse, handleRadius, guide)
 		}
 	case StageSetP2:
+		p2 := draftP2FreePreview(draft, mouse, geometrySnap)
 		drawLineEx(draft.P0, draft.P1, lineThickness, guide)
-		drawLineEx(draft.P1, mouse, lineThickness, guide)
+		drawLineEx(draft.P1, p2, lineThickness, guide)
 		drawEndpoint(draft.P1, handleRadius, mapBoolColor(draft.LockP1, locked, guide))
-		drawEndpoint(mouse, handleRadius, guide)
+		drawEndpoint(p2, handleRadius, guide)
 	case StageSetP3:
 		p2 := draft.P2
-		p3 := mouse
+		p3 := draftP3Preview(draft, mouse, geometrySnap)
 		if draft.SnapP3 {
 			p2 = draftP2Preview(draft, mouse, geometrySnap)
 			p3 = draft.P3
@@ -4275,6 +4355,10 @@ func drawEditSnapHint(stage Stage, draft Draft, hoveredNode EndHit, splines []Sp
 			drawAxisHint(draft.P0, draft.P1AxisDir, mouse, zoom, ghostColor)
 			return
 		}
+		if draft.PerpLockActive {
+			drawAxisHint(draft.PerpLockOrigin, draft.PerpLockAxisDir, mouse, zoom, ghostColor)
+			return
+		}
 		if hoveredNode.SplineIndex < 0 {
 			return
 		}
@@ -4285,6 +4369,9 @@ func drawEditSnapHint(stage Stage, draft Draft, hoveredNode EndHit, splines []Sp
 		drawRing(anchor, pixelsToWorld(zoom, 5.5), pixelsToWorld(zoom, 7.5), 0, 360, 20, anchorColor)
 		drawEndpoint(p1, pixelsToWorld(zoom, 4.5), ghostColor)
 	case StageSetP2:
+		if draft.PerpLockActive {
+			drawAxisHint(draft.PerpLockOrigin, draft.PerpLockAxisDir, mouse, zoom, ghostColor)
+		}
 		if hoveredNode.SplineIndex < 0 {
 			return
 		}
@@ -4294,6 +4381,9 @@ func drawEditSnapHint(stage Stage, draft Draft, hoveredNode EndHit, splines []Sp
 		if draft.SnapP3 {
 			drawAxisHint(draft.P3, draft.P2AxisDir, mouse, zoom, ghostColor)
 			return
+		}
+		if draft.PerpLockActive {
+			drawAxisHint(draft.PerpLockOrigin, draft.PerpLockAxisDir, mouse, zoom, ghostColor)
 		}
 		if hoveredNode.SplineIndex < 0 {
 			return
@@ -4389,13 +4479,13 @@ func drawDraftInfo(stage Stage, draft Draft, mouseWorld Vec2, geometrySnap Geome
 			drawSegmentLabel(draft.P0, mouseWorld, camera)
 		}
 	case StageSetP2:
-		drawSegmentLabel(draft.P1, mouseWorld, camera)
+		drawSegmentLabel(draft.P1, draftP2FreePreview(draft, mouseWorld, geometrySnap), camera)
 		drawArcLabel(preview, camera)
 	case StageSetP3:
 		if draft.SnapP3 {
 			drawSegmentLabel(draftP2Preview(draft, mouseWorld, geometrySnap), draft.P3, camera)
 		} else {
-			drawSegmentLabel(draft.P2, mouseWorld, camera)
+			drawSegmentLabel(draft.P2, draftP3Preview(draft, mouseWorld, geometrySnap), camera)
 		}
 		drawArcLabel(preview, camera)
 	}
