@@ -310,6 +310,13 @@ type DirectionWarning struct {
 	Point Vec2
 }
 
+type worldRect struct {
+	MinX float32
+	MinY float32
+	MaxX float32
+	MaxY float32
+}
+
 type GeometrySnap struct {
 	Active            bool
 	SourceSplineID    int
@@ -1242,6 +1249,7 @@ func main() {
 		rl.ClearBackground(rl.RayWhite)
 
 		rl.BeginMode2D(camera)
+		viewRect := cameraWorldRect(camera, pixelsToWorld(camera.Zoom, 64))
 		drawGrid(camera)
 		drawAxes(camera)
 
@@ -1251,7 +1259,7 @@ func main() {
 			if !route.Valid {
 				continue
 			}
-			drawRouteWithIndex(route, splines, splineIndexByID, pixelsToWorld(camera.Zoom, 2.0), camera.Zoom)
+			drawRouteWithIndex(route, splines, splineIndexByID, pixelsToWorld(camera.Zoom, 2.0), camera.Zoom, viewRect)
 		}
 		if routePanel.Open && len(routePanel.PathIDs) > 0 {
 			drawRouteWithIndex(Route{
@@ -1262,10 +1270,13 @@ func main() {
 				VehicleKind:   routePanel.VehicleKind,
 				BusStops:      routePanel.BusStops,
 				Valid:         true,
-			}, splines, splineIndexByID, pixelsToWorld(camera.Zoom, 3.0), camera.Zoom)
+			}, splines, splineIndexByID, pixelsToWorld(camera.Zoom, 3.0), camera.Zoom, viewRect)
 		}
 
 		for i, spline := range splines {
+			if !splineVisibleInWorldRect(spline, viewRect) {
+				continue
+			}
 			color := splineDrawColor(spline)
 			thickness := baseThickness
 			if spline.Priority {
@@ -1282,9 +1293,9 @@ func main() {
 			drawEndpoint(spline.P0, handleRadius*0.8, NewColor(60, 160, 90, 255))
 			drawEndpoint(spline.P3, handleRadius, NewColor(50, 115, 225, 255))
 		}
-		drawDirectionWarnings(directionWarnings, camera.Zoom)
+		drawDirectionWarnings(directionWarnings, camera.Zoom, viewRect)
 		if tool == ToolReverse {
-			drawSplineDirectionArrows(splines, camera.Zoom)
+			drawSplineDirectionArrows(splines, camera.Zoom, viewRect)
 		}
 		if geometrySnap.Active && geometrySnap.SourceSplineIndex >= 0 && (tool == ToolSpline || tool == ToolQuadratic) {
 			drawSpline(splines[geometrySnap.SourceSplineIndex], pixelsToWorld(camera.Zoom, 4), NewColor(74, 196, 186, 200))
@@ -1338,10 +1349,10 @@ func main() {
 		}
 
 		if tool == ToolRouteCars {
-			drawRoutePicking(routeStartSplineID, routePanel, hoveredStart, hoveredEnd, splines, baseGraph, camera.Zoom)
+			drawRoutePicking(routeStartSplineID, routePanel, hoveredStart, hoveredEnd, splines, splineIndexByID, baseGraph, camera.Zoom, viewRect)
 		}
 		if tool == ToolRouteBuses {
-			drawRoutePicking(routeStartSplineID, routePanel, hoveredStart, hoveredEnd, splines, baseGraph, camera.Zoom)
+			drawRoutePicking(routeStartSplineID, routePanel, hoveredStart, hoveredEnd, splines, splineIndexByID, baseGraph, camera.Zoom, viewRect)
 			if routePanel.Open && routePanel.AddingBusStop {
 				drawBusStopPlacementPreview(routePanel, splines, baseGraph, mouseWorld, camera.Zoom)
 			}
@@ -1362,17 +1373,17 @@ func main() {
 			drawCutMode(stage, cutDraft, splines, mouseWorld, camera.Zoom)
 		}
 		allSplineIndexByID := simpkg.BuildSplineIndexByID(allSplines)
-		drawCars(cars, allSplines, allSplineIndexByID, camera.Zoom, debugMode)
+		drawCars(cars, allSplines, allSplineIndexByID, camera.Zoom, debugMode, viewRect)
 		if hitboxDebugMode {
-			drawCarHitboxes(cars, allSplines, allSplineIndexByID)
+			drawCarHitboxes(cars, allSplines, allSplineIndexByID, viewRect)
 		}
 		if debugMode {
-			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(220, 50, 50, 220))
-			drawDebugBlameLinks(holdBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(255, 165, 0, 220))
+			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(220, 50, 50, 220), viewRect)
+			drawDebugBlameLinks(holdBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(255, 165, 0, 220), viewRect)
 			if world.DebugSelectedCarMode == 0 {
-				drawDebugBlameLinks(debugCandidateLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(50, 220, 50, 200))
+				drawDebugBlameLinks(debugCandidateLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(50, 220, 50, 200), viewRect)
 			} else {
-				drawDebugBlameLinks(debugCandidateLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(180, 50, 220, 200))
+				drawDebugBlameLinks(debugCandidateLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(180, 50, 220, 200), viewRect)
 			}
 			if sel := world.DebugSelectedCar; sel >= 0 && sel < len(cars) {
 				if _, center, _, ok := carBodyPose(cars[sel], allSplines, allSplineIndexByID); ok {
@@ -1386,7 +1397,7 @@ func main() {
 			}
 			drawLaneChangeSplines(laneChangeSplines, camera.Zoom)
 		}
-		drawTrafficLights(trafficLights, pendingLights, trafficCycles, editingCycleID, editingPhaseIdx, showPhaseIdx, camera.Zoom)
+		drawTrafficLights(trafficLights, pendingLights, trafficCycles, editingCycleID, editingPhaseIdx, showPhaseIdx, camera.Zoom, viewRect)
 		if tool == ToolTrafficLight && (editingCycleID < 0 || editingLights) && editingPhaseIdx < 0 {
 			if _, _, snap, found := findNearestSplinePoint(splines, mouseWorld); found {
 				r := pixelsToWorld(camera.Zoom, 8)
@@ -1395,7 +1406,7 @@ func main() {
 			}
 		}
 		rl.EndMode2D()
-		drawDirectionWarningLabels(directionWarnings, camera)
+		drawDirectionWarningLabels(directionWarnings, camera, viewRect)
 
 		drawScaleBar(camera.Zoom)
 		if tool == ToolSpline {
@@ -1411,11 +1422,11 @@ func main() {
 			}
 		}
 		if tool == ToolSpeedLimit {
-			drawSpeedLimitLabels(splines, camera)
-			drawCarSpeedLabels(cars, allSplines, allSplineIndexByID, camera)
+			drawSpeedLimitLabels(splines, camera, viewRect)
+			drawCarSpeedLabels(cars, allSplines, allSplineIndexByID, camera, viewRect)
 		}
 		if tool == ToolPreference {
-			drawPreferenceLabels(splines, camera)
+			drawPreferenceLabels(splines, camera, viewRect)
 		}
 		drawHud(mode, tool, stage, draft, quadraticDraft, hoveredSpline, routeStartSplineID, coupleModeFirstID, debugMode, hitboxDebugMode, infoMode, paused, camera.Zoom, len(splines), len(routes), len(cars))
 		if profileMode {
@@ -2753,10 +2764,13 @@ func trafficToggleLightInPhase(cycles []TrafficCycle, cycleID, phaseIdx, lightID
 	return cycles
 }
 
-func drawTrafficLights(lights []TrafficLight, pending []TrafficLight, cycles []TrafficCycle, editingCycleID int, editingPhaseIdx int, showPhaseIdx int, zoom float32) {
+func drawTrafficLights(lights []TrafficLight, pending []TrafficLight, cycles []TrafficCycle, editingCycleID int, editingPhaseIdx int, showPhaseIdx int, zoom float32, viewRect worldRect) {
 	r := pixelsToWorld(zoom, 8)
 	all := append(lights, pending...)
 	for _, l := range all {
+		if !circleVisibleInWorldRect(l.WorldPos, r*1.5, viewRect) {
+			continue
+		}
 		var fill Color
 		if l.CycleID < 0 {
 			fill = NewColor(255, 165, 0, 220) // amber = pending
@@ -2965,12 +2979,15 @@ func drawSpeedLimitWorld(splines []Spline, hoveredSpline int, zoom float32) {
 
 // drawSpeedLimitLabels draws speed limit badges on any spline that has a limit,
 // in screen space, so they stay readable at any zoom level.
-func drawSpeedLimitLabels(splines []Spline, camera rl.Camera2D) {
+func drawSpeedLimitLabels(splines []Spline, camera rl.Camera2D, viewRect worldRect) {
 	for _, spline := range splines {
 		if spline.SpeedLimitKmh <= 0 {
 			continue
 		}
 		mid := spline.Samples[simSamples/2]
+		if !worldRectContainsPoint(viewRect, mid) {
+			continue
+		}
 		screen := getWorldToScreen2D(mid, camera)
 		label := fmt.Sprintf("%d", int(spline.SpeedLimitKmh))
 		fontSize := int32(14)
@@ -2985,13 +3002,16 @@ func drawSpeedLimitLabels(splines []Spline, camera rl.Camera2D) {
 
 // drawPreferenceLabels draws preference badges on splines that have a preference assigned,
 // in screen space, so they stay readable at any zoom level.
-func drawPreferenceLabels(splines []Spline, camera rl.Camera2D) {
+func drawPreferenceLabels(splines []Spline, camera rl.Camera2D, viewRect worldRect) {
 	color := NewColor(30, 150, 60, 255)
 	for _, spline := range splines {
 		if spline.LanePreference <= 0 {
 			continue
 		}
 		mid := spline.Samples[simSamples/2]
+		if !worldRectContainsPoint(viewRect, mid) {
+			continue
+		}
 		screen := getWorldToScreen2D(mid, camera)
 		label := fmt.Sprintf("%d", spline.LanePreference)
 		fontSize := int32(14)
@@ -3685,7 +3705,7 @@ func findClickedCar(cars []Car, splines []Spline, splineIndexByID map[int]int, p
 	return bestIdx
 }
 
-func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32, debugMode bool) {
+func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32, debugMode bool, viewRect worldRect) {
 	if len(cars) == 0 {
 		return
 	}
@@ -3694,45 +3714,61 @@ func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom fl
 		if !ok {
 			continue
 		}
+		bodyVisible := circleVisibleInWorldRect(center, (car.Length+car.Width)/2, viewRect)
+		trailerVisible := false
+		var trailerCenter Vec2
+		var trailerHeading Vec2
+		if car.Trailer.HasTrailer {
+			hitchPos := car.RearPosition
+			trailerHeading = normalize(vecSub(hitchPos, car.Trailer.RearPosition))
+			if vectorLengthSq(vecSub(hitchPos, car.Trailer.RearPosition)) <= 1e-9 {
+				trailerHeading = bodyHeading
+			}
+			trailerCenter = vecScale(vecAdd(hitchPos, car.Trailer.RearPosition), 0.5)
+			trailerVisible = circleVisibleInWorldRect(trailerCenter, (car.Trailer.Length+car.Trailer.Width)/2, viewRect)
+		}
+		if !bodyVisible && !trailerVisible {
+			continue
+		}
 		angle := float32(math.Atan2(float64(bodyHeading.Y), float64(bodyHeading.X)) * 180 / math.Pi)
 		rect := rl.NewRectangle(center.X, center.Y, car.Length, car.Width)
 		origin := NewVec2(car.Length/2, car.Width/2)
 		// Draw trailer first so the cab renders on top at the hitch point.
-		if car.Trailer.HasTrailer {
-			hitchPos := car.RearPosition
-			trailerHeading := normalize(vecSub(hitchPos, car.Trailer.RearPosition))
-			if vectorLengthSq(vecSub(hitchPos, car.Trailer.RearPosition)) <= 1e-9 {
-				trailerHeading = bodyHeading
-			}
-			trailerCenter := vecScale(vecAdd(hitchPos, car.Trailer.RearPosition), 0.5)
+		if car.Trailer.HasTrailer && trailerVisible {
 			trailerAngle := float32(math.Atan2(float64(trailerHeading.Y), float64(trailerHeading.X)) * 180 / math.Pi)
 			trailerRect := rl.NewRectangle(trailerCenter.X, trailerCenter.Y, car.Trailer.Length, car.Trailer.Width)
 			trailerOrigin := NewVec2(car.Trailer.Length/2, car.Trailer.Width/2)
 			drawRectanglePro(trailerRect, trailerOrigin, trailerAngle, car.Trailer.Color)
 		}
-		drawRectanglePro(rect, origin, angle, car.Color)
+		if bodyVisible {
+			drawRectanglePro(rect, origin, angle, car.Color)
+		}
 		if car.VehicleKind == VehicleBus {
 			windowColor := NewColor(235, 243, 250, 220)
 			windowRect := rl.NewRectangle(center.X, center.Y, car.Length*0.72, car.Width*0.42)
 			windowOrigin := NewVec2(windowRect.Width/2, windowRect.Height/2)
-			drawRectanglePro(windowRect, windowOrigin, angle, windowColor)
+			if bodyVisible {
+				drawRectanglePro(windowRect, windowOrigin, angle, windowColor)
+			}
 			frontRect := rl.NewRectangle(center.X+bodyHeading.X*car.Length*0.28, center.Y+bodyHeading.Y*car.Length*0.28, car.Length*0.12, car.Width*0.78)
 			frontOrigin := NewVec2(frontRect.Width/2, frontRect.Height/2)
-			drawRectanglePro(frontRect, frontOrigin, angle, NewColor(30, 30, 35, 90))
+			if bodyVisible {
+				drawRectanglePro(frontRect, frontOrigin, angle, NewColor(30, 30, 35, 90))
+			}
 		}
-		if car.Braking {
+		if bodyVisible && car.Braking {
 			drawCircleV(center, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), NewColor(220, 50, 50, 255))
-		} else if debugMode && car.SoftSlowing {
+		} else if bodyVisible && debugMode && car.SoftSlowing {
 			drawCircleV(center, maxf(car.Width*0.22, pixelsToWorld(zoom, 2)), NewColor(60, 120, 220, 255))
 		}
-		if car.VehicleKind == VehicleBus && car.BusStopTimer > 0 {
+		if bodyVisible && car.VehicleKind == VehicleBus && car.BusStopTimer > 0 {
 			drawCircleV(center, maxf(car.Width*0.24, pixelsToWorld(zoom, 2.5)), NewColor(255, 200, 40, 255))
 		}
 	}
 }
 
 // drawCarHitboxes renders the multi-circle collision hitbox of every car.
-func drawCarHitboxes(cars []Car, splines []Spline, splineIndexByID map[int]int) {
+func drawCarHitboxes(cars []Car, splines []Spline, splineIndexByID map[int]int, viewRect worldRect) {
 	fill := NewColor(255, 80, 255, 50)
 	outline := NewColor(255, 80, 255, 200)
 	pivotColor := NewColor(255, 220, 0, 220)
@@ -3750,37 +3786,50 @@ func drawCarHitboxes(cars []Car, splines []Spline, splineIndexByID map[int]int) 
 		}
 		center := vecScale(vecAdd(frontPos, car.RearPosition), 0.5)
 		r := collisionRadius(car)
+		bodyVisible := circleVisibleInWorldRect(center, (car.Length+car.Width)/2+r, viewRect)
+		trailerVisible := false
+		var trailerCenter Vec2
+		var trailerHeading Vec2
 		for _, offset := range collisionCircleOffsets(car) {
-			circlePos := vecAdd(center, vecScale(bodyHeading, offset))
-			drawCircleV(circlePos, r, fill)
-			drawCircleLinesV(circlePos, r, outline)
+			if bodyVisible {
+				circlePos := vecAdd(center, vecScale(bodyHeading, offset))
+				drawCircleV(circlePos, r, fill)
+				drawCircleLinesV(circlePos, r, outline)
+			}
 		}
 		// Mark front and rear pivots.
-		drawCircleV(frontPos, r*0.25, pivotColor)
-		drawCircleV(car.RearPosition, r*0.25, pivotColor)
+		if bodyVisible {
+			drawCircleV(frontPos, r*0.25, pivotColor)
+			drawCircleV(car.RearPosition, r*0.25, pivotColor)
+		}
 
 		if car.Trailer.HasTrailer {
 			hitchPos := car.RearPosition
-			trailerHeading := normalize(vecSub(hitchPos, car.Trailer.RearPosition))
+			trailerHeading = normalize(vecSub(hitchPos, car.Trailer.RearPosition))
 			if vectorLengthSq(vecSub(hitchPos, car.Trailer.RearPosition)) <= 1e-9 {
 				trailerHeading = bodyHeading
 			}
-			trailerCenter := vecScale(vecAdd(hitchPos, car.Trailer.RearPosition), 0.5)
+			trailerCenter = vecScale(vecAdd(hitchPos, car.Trailer.RearPosition), 0.5)
 			rT := hitboxRadius(car.Trailer.Width)
+			trailerVisible = circleVisibleInWorldRect(trailerCenter, (car.Trailer.Length+car.Trailer.Width)/2+rT, viewRect)
 			for _, offset := range hitboxCircleOffsets(car.Trailer.Length, car.Trailer.Width) {
-				circlePos := vecAdd(trailerCenter, vecScale(trailerHeading, offset))
-				drawCircleV(circlePos, rT, fill)
-				drawCircleLinesV(circlePos, rT, outline)
+				if trailerVisible {
+					circlePos := vecAdd(trailerCenter, vecScale(trailerHeading, offset))
+					drawCircleV(circlePos, rT, fill)
+					drawCircleLinesV(circlePos, rT, outline)
+				}
 			}
 			// Trailer rear pivot (hitch is already marked as cab rear pivot above).
-			drawCircleV(car.Trailer.RearPosition, rT*0.25, pivotColor)
+			if trailerVisible {
+				drawCircleV(car.Trailer.RearPosition, rT*0.25, pivotColor)
+			}
 		}
 	}
 }
 
 // drawCarSpeedLabels draws each car's current speed in km/h in screen space,
 // centred just above the car's position.
-func drawCarSpeedLabels(cars []Car, splines []Spline, splineIndexByID map[int]int, camera rl.Camera2D) {
+func drawCarSpeedLabels(cars []Car, splines []Spline, splineIndexByID map[int]int, camera rl.Camera2D, viewRect worldRect) {
 	fontSize := int32(12)
 	for _, car := range cars {
 		splineIdx, ok := splineIndexByID[car.CurrentSplineID]
@@ -3789,6 +3838,9 @@ func drawCarSpeedLabels(cars []Car, splines []Spline, splineIndexByID map[int]in
 		}
 		frontPos, _ := simpkg.SampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
 		center := vecScale(vecAdd(frontPos, car.RearPosition), 0.5)
+		if !worldRectContainsPoint(viewRect, center) {
+			continue
+		}
 		screen := getWorldToScreen2D(center, camera)
 		label := fmt.Sprintf("%d", int(car.Speed*3.6))
 		textW := measureText(label, fontSize)
@@ -3796,7 +3848,7 @@ func drawCarSpeedLabels(cars []Car, splines []Spline, splineIndexByID map[int]in
 	}
 }
 
-func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32, lineColor Color) {
+func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32, lineColor Color, viewRect worldRect) {
 	if len(links) == 0 || len(cars) == 0 {
 		return
 	}
@@ -3818,33 +3870,42 @@ func drawDebugBlameLinks(links []DebugBlameLink, cars []Car, splines []Spline, s
 		toFront, _ := simpkg.SampleSplineAtDistance(splines[toSplineIdx], cars[link.ToCarIndex].DistanceOnSpline)
 		fromPos := vecScale(vecAdd(fromFront, cars[link.FromCarIndex].RearPosition), 0.5)
 		toPos := vecScale(vecAdd(toFront, cars[link.ToCarIndex].RearPosition), 0.5)
+		if !worldRectIntersectsAABB(viewRect, minf(fromPos.X, toPos.X)-lineThickness, minf(fromPos.Y, toPos.Y)-lineThickness, maxf(fromPos.X, toPos.X)+lineThickness, maxf(fromPos.Y, toPos.Y)+lineThickness) {
+			continue
+		}
 		drawLineEx(fromPos, toPos, lineThickness, lineColor)
 		drawCircleV(fromPos, pixelsToWorld(zoom, 3.5), lineColor)
 	}
 }
 
-func drawRouteWithIndex(route Route, splines []Spline, indexByID map[int]int, thickness float32, zoom float32) {
+func drawRouteWithIndex(route Route, splines []Spline, indexByID map[int]int, thickness float32, zoom float32, viewRect worldRect) {
 	color := NewColor(route.Color.R, route.Color.G, route.Color.B, 90)
 	for _, pathID := range route.PathIDs {
 		idx, ok := indexByID[pathID]
 		if !ok {
 			continue
 		}
+		if !splineVisibleInWorldRect(splines[idx], viewRect) {
+			continue
+		}
 		drawSpline(splines[idx], thickness, color)
 	}
 	spawnR := pixelsToWorld(zoom, 10)
 	destR := pixelsToWorld(zoom, 10)
-	if start, ok := simpkg.FindSplineByID(splines, route.StartSplineID); ok {
-		drawEndpoint(start.P0, spawnR, route.Color)
+	if idx, ok := indexByID[route.StartSplineID]; ok && circleVisibleInWorldRect(splines[idx].P0, spawnR, viewRect) {
+		drawEndpoint(splines[idx].P0, spawnR, route.Color)
 	}
-	if end, ok := simpkg.FindSplineByID(splines, route.EndSplineID); ok {
-		drawEndpoint(end.P3, destR, color)
+	if idx, ok := indexByID[route.EndSplineID]; ok && circleVisibleInWorldRect(splines[idx].P3, destR, viewRect) {
+		drawEndpoint(splines[idx].P3, destR, color)
 	}
 	if route.VehicleKind == VehicleBus {
 		stopFill := NewColor(route.Color.R, route.Color.G, route.Color.B, 220)
 		stopOuter := NewColor(20, 20, 25, 220)
 		stopR := pixelsToWorld(zoom, 7)
 		for _, stop := range route.BusStops {
+			if !circleVisibleInWorldRect(stop.WorldPos, stopR, viewRect) {
+				continue
+			}
 			drawCircleV(stop.WorldPos, stopR, stopOuter)
 			drawCircleV(stop.WorldPos, stopR*0.72, stopFill)
 		}
@@ -3852,10 +3913,15 @@ func drawRouteWithIndex(route Route, splines []Spline, indexByID map[int]int, th
 }
 
 func drawRoute(route Route, splines []Spline, thickness float32, zoom float32) {
-	drawRouteWithIndex(route, splines, simpkg.BuildSplineIndexByID(splines), thickness, zoom)
+	drawRouteWithIndex(route, splines, simpkg.BuildSplineIndexByID(splines), thickness, zoom, worldRect{
+		MinX: -math.MaxFloat32,
+		MinY: -math.MaxFloat32,
+		MaxX: math.MaxFloat32,
+		MaxY: math.MaxFloat32,
+	})
 }
 
-func drawRoutePicking(routeStartSplineID int, routePanel RoutePanel, hoveredStart EndHit, hoveredEnd EndHit, splines []Spline, graph *RoadGraph, zoom float32) {
+func drawRoutePicking(routeStartSplineID int, routePanel RoutePanel, hoveredStart EndHit, hoveredEnd EndHit, splines []Spline, indexByID map[int]int, graph *RoadGraph, zoom float32, viewRect worldRect) {
 	handleRadius := pixelsToWorld(zoom, handlePixels)
 	if hoveredStart.SplineIndex >= 0 && routeStartSplineID < 0 {
 		drawEndpoint(hoveredStart.Point, handleRadius*1.6, NewColor(255, 196, 61, 255))
@@ -3873,7 +3939,7 @@ func drawRoutePicking(routeStartSplineID int, routePanel RoutePanel, hoveredStar
 			}
 			if pathIDs, _, _, ok := simpkg.ComputeRoutePathWithGraph(preview, graph); ok {
 				previewRoute := Route{PathIDs: pathIDs, Color: simpkg.RoutePaletteColor(routePanel.ColorIndex), Valid: true}
-				drawRoute(previewRoute, splines, pixelsToWorld(zoom, 4), zoom)
+				drawRouteWithIndex(previewRoute, splines, indexByID, pixelsToWorld(zoom, 4), zoom, viewRect)
 			}
 		}
 	}
@@ -4942,9 +5008,12 @@ func drawSplineDirectionArrow(s Spline, zoom float32, color Color) {
 	drawLineEx(left, right, pixelsToWorld(zoom, 1.8), color)
 }
 
-func drawSplineDirectionArrows(splines []Spline, zoom float32) {
+func drawSplineDirectionArrows(splines []Spline, zoom float32, viewRect worldRect) {
 	color := NewColor(255, 120, 40, 230)
 	for _, spline := range splines {
+		if !splineVisibleInWorldRect(spline, viewRect) {
+			continue
+		}
 		drawSplineDirectionArrow(spline, zoom, color)
 	}
 }
@@ -4953,16 +5022,22 @@ func drawEndpoint(p Vec2, radius float32, color Color) {
 	drawCircleV(p, radius, color)
 }
 
-func drawDirectionWarnings(warnings []DirectionWarning, zoom float32) {
+func drawDirectionWarnings(warnings []DirectionWarning, zoom float32, viewRect worldRect) {
 	for _, warning := range warnings {
 		r := pixelsToWorld(zoom, 10)
+		if !circleVisibleInWorldRect(warning.Point, r*1.15, viewRect) {
+			continue
+		}
 		drawCircleV(warning.Point, r, NewColor(255, 236, 150, 235))
 		drawRing(warning.Point, r*0.75, r*1.15, 0, 360, 20, NewColor(230, 120, 20, 230))
 	}
 }
 
-func drawDirectionWarningLabels(warnings []DirectionWarning, camera rl.Camera2D) {
+func drawDirectionWarningLabels(warnings []DirectionWarning, camera rl.Camera2D, viewRect worldRect) {
 	for _, warning := range warnings {
+		if !worldRectContainsPoint(viewRect, warning.Point) {
+			continue
+		}
 		screen := getWorldToScreen2D(warning.Point, camera)
 		drawText("!", int32(screen.X)-4, int32(screen.Y)-11, 18, NewColor(170, 60, 10, 255))
 	}
@@ -5216,6 +5291,37 @@ func pointKey(v Vec2) string {
 
 func pointInRect(p Vec2, r rl.Rectangle) bool {
 	return p.X >= r.X && p.X <= r.X+r.Width && p.Y >= r.Y && p.Y <= r.Y+r.Height
+}
+
+func cameraWorldRect(camera rl.Camera2D, pad float32) worldRect {
+	topLeft := rl.GetScreenToWorld2D(rl.NewVector2(0, 0), camera)
+	bottomRight := rl.GetScreenToWorld2D(rl.NewVector2(float32(rl.GetScreenWidth()), float32(rl.GetScreenHeight())), camera)
+	return worldRect{
+		MinX: minf(topLeft.X, bottomRight.X) - pad,
+		MinY: minf(topLeft.Y, bottomRight.Y) - pad,
+		MaxX: maxf(topLeft.X, bottomRight.X) + pad,
+		MaxY: maxf(topLeft.Y, bottomRight.Y) + pad,
+	}
+}
+
+func worldRectContainsPoint(r worldRect, p Vec2) bool {
+	return p.X >= r.MinX && p.X <= r.MaxX && p.Y >= r.MinY && p.Y <= r.MaxY
+}
+
+func worldRectIntersectsAABB(r worldRect, minX, minY, maxX, maxY float32) bool {
+	return maxX >= r.MinX && minX <= r.MaxX && maxY >= r.MinY && minY <= r.MaxY
+}
+
+func circleVisibleInWorldRect(center Vec2, radius float32, r worldRect) bool {
+	return worldRectIntersectsAABB(r, center.X-radius, center.Y-radius, center.X+radius, center.Y+radius)
+}
+
+func splineVisibleInWorldRect(s Spline, r worldRect) bool {
+	minX := minf(minf(s.P0.X, s.P1.X), minf(s.P2.X, s.P3.X))
+	minY := minf(minf(s.P0.Y, s.P1.Y), minf(s.P2.Y, s.P3.Y))
+	maxX := maxf(maxf(s.P0.X, s.P1.X), maxf(s.P2.X, s.P3.X))
+	maxY := maxf(maxf(s.P0.Y, s.P1.Y), maxf(s.P2.Y, s.P3.Y))
+	return worldRectIntersectsAABB(r, minX, minY, maxX, maxY)
 }
 
 func routeSpawnSliderStep(vehicleKind VehicleKind) float32 {
