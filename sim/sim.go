@@ -444,6 +444,97 @@ func NewWorld() World {
 	}
 }
 
+func cloneIntSlice(src []int) []int {
+	if len(src) == 0 {
+		return nil
+	}
+	return append([]int(nil), src...)
+}
+
+func cloneFloat32Slice(src []float32) []float32 {
+	if len(src) == 0 {
+		return nil
+	}
+	return append([]float32(nil), src...)
+}
+
+func cloneSplines(src []Spline) []Spline {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := append([]Spline(nil), src...)
+	for i := range dst {
+		dst[i].HardCoupledIDs = cloneIntSlice(src[i].HardCoupledIDs)
+		dst[i].SoftCoupledIDs = cloneIntSlice(src[i].SoftCoupledIDs)
+		dst[i].CurveSpeedMPS = cloneFloat32Slice(src[i].CurveSpeedMPS)
+	}
+	return dst
+}
+
+func cloneRoutes(src []Route) []Route {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := append([]Route(nil), src...)
+	for i := range dst {
+		dst[i].PathIDs = cloneIntSlice(src[i].PathIDs)
+		if len(src[i].BusStops) > 0 {
+			dst[i].BusStops = append([]BusStop(nil), src[i].BusStops...)
+		} else {
+			dst[i].BusStops = nil
+		}
+	}
+	return dst
+}
+
+func cloneTrafficCycles(src []TrafficCycle) []TrafficCycle {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := append([]TrafficCycle(nil), src...)
+	for i := range dst {
+		dst[i].LightIDs = cloneIntSlice(src[i].LightIDs)
+		if len(src[i].Phases) > 0 {
+			dst[i].Phases = append([]TrafficPhase(nil), src[i].Phases...)
+			for j := range dst[i].Phases {
+				dst[i].Phases[j].GreenLightIDs = cloneIntSlice(src[i].Phases[j].GreenLightIDs)
+			}
+		} else {
+			dst[i].Phases = nil
+		}
+	}
+	return dst
+}
+
+func cloneDebugBlameLinks(src []DebugBlameLink) []DebugBlameLink {
+	if len(src) == 0 {
+		return nil
+	}
+	return append([]DebugBlameLink(nil), src...)
+}
+
+func (w World) Clone() World {
+	clone := w
+	clone.Splines = cloneSplines(w.Splines)
+	clone.LaneChangeSplines = cloneSplines(w.LaneChangeSplines)
+	clone.Routes = cloneRoutes(w.Routes)
+	if len(w.Cars) > 0 {
+		clone.Cars = append([]Car(nil), w.Cars...)
+	} else {
+		clone.Cars = nil
+	}
+	if len(w.TrafficLights) > 0 {
+		clone.TrafficLights = append([]TrafficLight(nil), w.TrafficLights...)
+	} else {
+		clone.TrafficLights = nil
+	}
+	clone.TrafficCycles = cloneTrafficCycles(w.TrafficCycles)
+	clone.DebugBlameLinks = cloneDebugBlameLinks(w.DebugBlameLinks)
+	clone.HoldBlameLinks = cloneDebugBlameLinks(w.HoldBlameLinks)
+	clone.DebugCandidateLinks = cloneDebugBlameLinks(w.DebugCandidateLinks)
+	return clone
+}
+
 func NewSpline(id int, p0, p1, p2, p3 Vec2) Spline {
 	s := Spline{ID: id, P0: p0, P1: p1, P2: p2, P3: p3}
 	cacheSpline(&s)
@@ -2312,38 +2403,6 @@ func carHitboxTouchesSpline(car Car, targetSpline Spline, splines []Spline) bool
 	return false
 }
 
-func buildLookaheadSplineSets(cars []Car, graph *RoadGraph, lookahead float32) []map[int]bool {
-	pathSets := make([]map[int]bool, len(cars))
-	parallelFor(len(cars), func(start, end int) {
-		for i := start; i < end; i++ {
-			car := cars[i]
-			set := map[int]bool{car.CurrentSplineID: true}
-			currentSpline, ok := graph.splineByID(car.CurrentSplineID)
-			if !ok {
-				pathSets[i] = set
-				continue
-			}
-			covered := currentSpline.Length - car.DistanceOnSpline
-			curID := car.CurrentSplineID
-			for steps := 0; covered < lookahead && steps < len(graph.splines); steps++ {
-				nextID, ok := ChooseNextSplineOnBestPathWithGraph(graph, curID, car.DestinationSplineID, car.VehicleKind)
-				if !ok {
-					break
-				}
-				set[nextID] = true
-				nextSpline, ok := graph.splineByID(nextID)
-				if !ok {
-					break
-				}
-				covered += nextSpline.Length
-				curID = nextID
-			}
-			pathSets[i] = set
-		}
-	})
-	return pathSets
-}
-
 func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
 	caps := make([]float32, len(cars))
 	for i := range caps {
@@ -2363,7 +2422,46 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
 		}
 	})
 
-	pathSets := buildLookaheadSplineSets(cars, graph, followLookaheadM)
+	// Inverted index: spline ID -> car indices sitting on that spline.
+	carsBySpline := make(map[int][]int, len(graph.splines))
+	for i := range cars {
+		sid := cars[i].CurrentSplineID
+		carsBySpline[sid] = append(carsBySpline[sid], i)
+	}
+
+	// For each car, walk its lookahead splines and collect candidate
+	// car indices directly, replacing the per-car map[int]bool allocation.
+	lookaheadCandidates := make([][]int, len(cars))
+	parallelFor(len(cars), func(start, end int) {
+		for i := start; i < end; i++ {
+			car := cars[i]
+			var candidates []int
+			candidates = append(candidates, carsBySpline[car.CurrentSplineID]...)
+			currentSpline, ok := graph.splineByID(car.CurrentSplineID)
+			if !ok {
+				lookaheadCandidates[i] = candidates
+				continue
+			}
+			covered := currentSpline.Length - car.DistanceOnSpline
+			curID := car.CurrentSplineID
+			for steps := 0; covered < followLookaheadM && steps < len(graph.splines); steps++ {
+				nextID, ok := ChooseNextSplineOnBestPathWithGraph(graph, curID, car.DestinationSplineID, car.VehicleKind)
+				if !ok {
+					break
+				}
+				candidates = append(candidates, carsBySpline[nextID]...)
+				nextSpline, ok := graph.splineByID(nextID)
+				if !ok {
+					break
+				}
+				covered += nextSpline.Length
+				curID = nextID
+			}
+			lookaheadCandidates[i] = candidates
+		}
+	})
+
+	followLookaheadSq := followLookaheadM * followLookaheadM
 
 	parallelFor(len(cars), func(start, end int) {
 		for i := start; i < end; i++ {
@@ -2371,14 +2469,12 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
 			hI := poses[i].heading
 			pI := poses[i].pos
 			desiredGap := followMinGapM + car.Speed*followTimeHeadwaySecs
-			bestDist := float32(math.MaxFloat32)
+			desiredGapSq := desiredGap * desiredGap
+			bestDistSq := float32(math.MaxFloat32)
 			bestSpeed := float32(math.MaxFloat32)
 
-			for j, other := range cars {
-				if i == j {
-					continue
-				}
-				if !pathSets[i][other.CurrentSplineID] {
+			for _, j := range lookaheadCandidates[i] {
+				if j == i {
 					continue
 				}
 				hJ := poses[j].heading
@@ -2391,22 +2487,22 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
 				if proj <= 0 {
 					continue
 				}
-				euclidean := float32(math.Sqrt(float64(diff.X*diff.X + diff.Y*diff.Y)))
-				if euclidean > followLookaheadM {
+				dSq := diff.X*diff.X + diff.Y*diff.Y
+				if dSq > followLookaheadSq {
 					continue
 				}
-				leaderRear := other.RearPosition
-				if other.Trailer.HasTrailer {
-					leaderRear = other.Trailer.RearPosition
+				leaderRear := cars[j].RearPosition
+				if cars[j].Trailer.HasTrailer {
+					leaderRear = cars[j].Trailer.RearPosition
 				}
 				rearDiff := vecSub(leaderRear, pI)
-				gap := float32(math.Sqrt(float64(rearDiff.X*rearDiff.X + rearDiff.Y*rearDiff.Y)))
-				if gap > desiredGap {
+				gapSq := rearDiff.X*rearDiff.X + rearDiff.Y*rearDiff.Y
+				if gapSq > desiredGapSq {
 					continue
 				}
-				if euclidean < bestDist {
-					bestDist = euclidean
-					bestSpeed = other.Speed
+				if dSq < bestDistSq {
+					bestDistSq = dSq
+					bestSpeed = cars[j].Speed
 				}
 			}
 			caps[i] = bestSpeed
