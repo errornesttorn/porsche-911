@@ -864,6 +864,7 @@ func main() {
 		allSplines := simpkg.MergedSplines(splines, laneChangeSplines)
 		debugBlameLinks := world.DebugBlameLinks
 		holdBlameLinks := world.HoldBlameLinks
+		debugCandidateLinks := world.DebugCandidateLinks
 		frameProf.basePathHits = world.BasePathHits
 		frameProf.basePathMisses = world.BasePathMisses
 		frameProf.allPathHits = world.AllPathHits
@@ -875,6 +876,10 @@ func main() {
 		frameProf.followMS = world.FollowMS
 		frameProf.updateCarsMS = world.UpdateCarsMS
 		frameProf.brakingDetail = world.BrakingProfile
+
+		if debugMode && rl.IsMouseButtonPressed(rl.MouseButtonMiddle) && !mouseOnToolbar {
+			world.DebugSelectedCar = findClickedCar(cars, allSplines, simpkg.BuildSplineIndexByID(allSplines), mouseWorld)
+		}
 
 		if routePanel.Open {
 			var applied bool
@@ -1350,6 +1355,13 @@ func main() {
 		if debugMode {
 			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(220, 50, 50, 220))
 			drawDebugBlameLinks(holdBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(255, 165, 0, 220))
+			drawDebugBlameLinks(debugCandidateLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(50, 220, 50, 200))
+			if sel := world.DebugSelectedCar; sel >= 0 && sel < len(cars) {
+				if _, center, _, ok := carBodyPose(cars[sel], allSplines, allSplineIndexByID); ok {
+					r := pixelsToWorld(camera.Zoom, 8)
+					drawRing(center, r*0.6, r, 0, 360, 24, NewColor(50, 220, 50, 255))
+				}
+			}
 			drawLaneChangeSplines(laneChangeSplines, camera.Zoom)
 		}
 		drawTrafficLights(trafficLights, pendingLights, trafficCycles, editingCycleID, editingPhaseIdx, showPhaseIdx, camera.Zoom)
@@ -3631,6 +3643,24 @@ func eraseCarsAtPoint(cars []Car, splines []Spline, splineIndexByID map[int]int,
 		}
 	}
 	return out
+}
+
+func findClickedCar(cars []Car, splines []Spline, splineIndexByID map[int]int, point Vec2) int {
+	bestIdx := -1
+	bestDistSq := float32(math.MaxFloat32)
+	for i, car := range cars {
+		_, center, _, ok := carBodyPose(car, splines, splineIndexByID)
+		if !ok {
+			continue
+		}
+		halfDiag := (car.Length + car.Width) / 2
+		dSq := distSq(center, point)
+		if dSq <= halfDiag*halfDiag && dSq < bestDistSq {
+			bestDistSq = dSq
+			bestIdx = i
+		}
+	}
+	return bestIdx
 }
 
 func drawCars(cars []Car, splines []Spline, splineIndexByID map[int]int, zoom float32, debugMode bool) {

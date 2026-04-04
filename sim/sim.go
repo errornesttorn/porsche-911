@@ -376,8 +376,10 @@ type World struct {
 
 	RouteVisualsTimer float32
 
-	DebugBlameLinks []DebugBlameLink
-	HoldBlameLinks  []DebugBlameLink
+	DebugBlameLinks      []DebugBlameLink
+	HoldBlameLinks       []DebugBlameLink
+	DebugSelectedCar     int
+	DebugCandidateLinks  []DebugBlameLink
 	BasePathHits    int
 	BasePathMisses  int
 	AllPathHits     int
@@ -404,6 +406,7 @@ func NewWorld() World {
 		NextRouteID:       1,
 		NextLightID:       1,
 		NextCycleID:       1,
+		DebugSelectedCar:  -1,
 	}
 }
 
@@ -480,7 +483,7 @@ func (w *World) Step(dt float32) {
 	w.GraphBuildMS += sinceMS(graphStart)
 
 	brakingStart := time.Now()
-	brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks, brakingProfile := computeBrakingDecisions(w.Cars, allGraph)
+	brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks, candidateLinks, brakingProfile := computeBrakingDecisions(w.Cars, allGraph, w.DebugSelectedCar)
 	w.BrakingMS = sinceMS(brakingStart)
 	w.BrakingProfile = brakingProfile
 
@@ -498,6 +501,12 @@ func (w *World) Step(dt float32) {
 
 	w.DebugBlameLinks = remapBlameLinks(debugBlameLinks, indexRemap)
 	w.HoldBlameLinks = remapBlameLinks(holdBlameLinks, indexRemap)
+	w.DebugCandidateLinks = remapBlameLinks(candidateLinks, indexRemap)
+	if w.DebugSelectedCar >= 0 && w.DebugSelectedCar < len(indexRemap) {
+		w.DebugSelectedCar = indexRemap[w.DebugSelectedCar]
+	} else if w.DebugSelectedCar >= len(indexRemap) {
+		w.DebugSelectedCar = -1
+	}
 	w.BasePathHits = baseGraph.pathCacheHits
 	w.BasePathMisses = baseGraph.pathCacheMisses
 	w.AllPathHits = allGraph.pathCacheHits
@@ -1282,9 +1291,22 @@ func (g *spatialGrid) cellKey(p Vec2) [2]int32 {
 	}
 }
 
-func (g *spatialGrid) insert(index int, p Vec2) {
-	k := g.cellKey(p)
-	g.cells[k] = append(g.cells[k], index)
+func (g *spatialGrid) insert(index int, p Vec2, radius float32) {
+	if radius <= g.cellSize {
+		k := g.cellKey(p)
+		g.cells[k] = append(g.cells[k], index)
+		return
+	}
+	minX := int32(math.Floor(float64((p.X - radius) * g.invCellSize)))
+	maxX := int32(math.Floor(float64((p.X + radius) * g.invCellSize)))
+	minY := int32(math.Floor(float64((p.Y - radius) * g.invCellSize)))
+	maxY := int32(math.Floor(float64((p.Y + radius) * g.invCellSize)))
+	for cx := minX; cx <= maxX; cx++ {
+		for cy := minY; cy <= maxY; cy++ {
+			k := [2]int32{cx, cy}
+			g.cells[k] = append(g.cells[k], index)
+		}
+	}
 }
 
 func (g *spatialGrid) queryNeighbors(p Vec2, buf []int) []int {
@@ -1303,15 +1325,26 @@ func recentlyLeft(car Car, splineID int) bool {
 	return splineID >= 0 && (car.PrevSplineIDs[0] == splineID || car.PrevSplineIDs[1] == splineID)
 }
 
-func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []DebugBlameLink, []DebugBlameLink, BrakingProfile) {
+func medianReach(reach []float32) float32 {
+	if len(reach) == 0 {
+		return 1
+	}
+	sorted := make([]float32, len(reach))
+	copy(sorted, reach)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return sorted[len(sorted)/2]
+}
+
+func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int) ([]bool, []bool, []DebugBlameLink, []DebugBlameLink, []DebugBlameLink, BrakingProfile) {
 	flags := make([]bool, len(cars))
 	holdSpeed := make([]bool, len(cars))
 	initialBlame := make([]bool, len(cars))
 	tentativeLinks := make([]DebugBlameLink, 0)
 	holdLinks := make([]DebugBlameLink, 0)
+	candidateLinks := make([]DebugBlameLink, 0)
 	profile := BrakingProfile{Cars: len(cars)}
 	if len(cars) < 2 {
-		return flags, holdSpeed, tentativeLinks, holdLinks, profile
+		return flags, holdSpeed, tentativeLinks, holdLinks, candidateLinks, profile
 	}
 
 	basePredictStart := time.Now()
@@ -1338,19 +1371,14 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 	}
 	profile.BasePredictMS = sinceMS(basePredictStart)
 
-	var maxReach float32
-	for _, r := range reach {
-		if r > maxReach {
-			maxReach = r
-		}
+	gridCellSize := medianReach(reach)
+	if gridCellSize < 1 {
+		gridCellSize = 1
 	}
-	if maxReach < 1 {
-		maxReach = 1
-	}
-	grid := newSpatialGrid(maxReach, len(cars))
+	grid := newSpatialGrid(gridCellSize, len(cars))
 	for i := range cars {
 		if len(predictions[i]) > 0 {
-			grid.insert(i, poses[i].pos)
+			grid.insert(i, poses[i].pos, reach[i])
 		}
 	}
 
@@ -1376,6 +1404,9 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 				continue
 			}
 			profile.PrimaryBroadPhasePairs++
+			if debugSelectedCar >= 0 && (i == debugSelectedCar || j == debugSelectedCar) {
+				candidateLinks = append(candidateLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
+			}
 			profile.PrimaryCollisionChecks++
 			collision, ok := predictCollision(predictions[i], predictions[j], geometries[i], geometries[j])
 			if !ok {
@@ -1543,7 +1574,7 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph) ([]bool, []bool, []De
 	}
 	profile.FinalizeMS = sinceMS(finalizeStart)
 
-	return flags, holdSpeed, debugLinks, activeHoldLinks, profile
+	return flags, holdSpeed, debugLinks, activeHoldLinks, candidateLinks, profile
 }
 
 func remapBlameLinks(links []DebugBlameLink, remap []int) []DebugBlameLink {
