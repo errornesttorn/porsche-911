@@ -1322,6 +1322,60 @@ func (g *spatialGrid) queryNeighbors(p Vec2, buf []int) []int {
 	return buf
 }
 
+type trajectoryAABB struct {
+	minX, minY, maxX, maxY float32
+}
+
+func buildTrajectoryAABB(samples []TrajectorySample, coarseRadius float32) trajectoryAABB {
+	if len(samples) == 0 {
+		return trajectoryAABB{}
+	}
+	bb := trajectoryAABB{
+		minX: samples[0].Position.X,
+		minY: samples[0].Position.Y,
+		maxX: samples[0].Position.X,
+		maxY: samples[0].Position.Y,
+	}
+	for _, s := range samples[1:] {
+		if s.Position.X < bb.minX {
+			bb.minX = s.Position.X
+		}
+		if s.Position.X > bb.maxX {
+			bb.maxX = s.Position.X
+		}
+		if s.Position.Y < bb.minY {
+			bb.minY = s.Position.Y
+		}
+		if s.Position.Y > bb.maxY {
+			bb.maxY = s.Position.Y
+		}
+		if s.HasTrailer {
+			if s.TrailerPosition.X < bb.minX {
+				bb.minX = s.TrailerPosition.X
+			}
+			if s.TrailerPosition.X > bb.maxX {
+				bb.maxX = s.TrailerPosition.X
+			}
+			if s.TrailerPosition.Y < bb.minY {
+				bb.minY = s.TrailerPosition.Y
+			}
+			if s.TrailerPosition.Y > bb.maxY {
+				bb.maxY = s.TrailerPosition.Y
+			}
+		}
+	}
+	bb.minX -= coarseRadius
+	bb.minY -= coarseRadius
+	bb.maxX += coarseRadius
+	bb.maxY += coarseRadius
+	return bb
+}
+
+func aabbOverlap(a, b trajectoryAABB) bool {
+	return a.minX <= b.maxX && a.maxX >= b.minX &&
+		a.minY <= b.maxY && a.maxY >= b.minY
+}
+
 // closingRateScale returns a multiplier in [0.3, 1.0] for the broad-phase
 // distance threshold based on how fast two cars are approaching each other.
 // 1.0 when closing head-on, 0.3 when separating.
@@ -1399,6 +1453,11 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int,
 	}
 	profile.BasePredictMS = sinceMS(basePredictStart)
 
+	trajAABBs := make([]trajectoryAABB, len(cars))
+	for i := range cars {
+		trajAABBs[i] = buildTrajectoryAABB(predictions[i], geometries[i].coarseRadius)
+	}
+
 	gridCellSize := medianReach(reach)
 	if gridCellSize < 1 {
 		gridCellSize = 1
@@ -1433,6 +1492,9 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int,
 				continue
 			}
 			profile.PrimaryBroadPhasePairs++
+			if !aabbOverlap(trajAABBs[i], trajAABBs[j]) {
+				continue
+			}
 			if debugSelectedCar >= 0 && debugSelectedCarMode == 0 && (i == debugSelectedCar || j == debugSelectedCar) {
 				candidateLinks = append(candidateLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
 			}
@@ -1503,7 +1565,7 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int,
 		if !initialBlame[i] {
 			continue
 		}
-		if shouldBrakeForBlamedConflicts(i, cars, graph, predictions, geometries, poses, reach, &grid, &profile) {
+		if shouldBrakeForBlamedConflicts(i, cars, graph, predictions, geometries, poses, reach, trajAABBs, &grid, &profile) {
 			flags[i] = true
 		}
 	}
@@ -1526,6 +1588,7 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int,
 		if len(fasterPred) == 0 {
 			continue
 		}
+		fasterAABB := buildTrajectoryAABB(fasterPred, geometries[i].coarseRadius)
 		neighborBuf = grid.queryNeighbors(poses[i].pos, neighborBuf)
 		for _, j := range neighborBuf {
 			if j == i || len(predictions[j]) == 0 {
@@ -1534,6 +1597,9 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int,
 			scale := closingRateScale(poses[i].pos, poses[j].pos, poses[i].heading, poses[j].heading, cars[i].Speed, cars[j].Speed)
 			broadPhaseDist := (reach[i] + reach[j]) * scale * scale
 			if distSq(poses[i].pos, poses[j].pos) > broadPhaseDist*broadPhaseDist {
+				continue
+			}
+			if !aabbOverlap(fasterAABB, trajAABBs[j]) {
 				continue
 			}
 			if debugSelectedCar >= 0 && debugSelectedCarMode == 1 && i == debugSelectedCar {
@@ -1629,7 +1695,7 @@ func remapBlameLinks(links []DebugBlameLink, remap []int) []DebugBlameLink {
 	return out
 }
 
-func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, graph *RoadGraph, predictions [][]TrajectorySample, geometries []collisionGeometry, poses []carPose, reach []float32, grid *spatialGrid, profile *BrakingProfile) bool {
+func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, graph *RoadGraph, predictions [][]TrajectorySample, geometries []collisionGeometry, poses []carPose, reach []float32, trajAABBs []trajectoryAABB, grid *spatialGrid, profile *BrakingProfile) bool {
 	if carIndex < 0 || carIndex >= len(cars) {
 		return false
 	}
@@ -1664,7 +1730,8 @@ func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, graph *RoadGraph, p
 		if len(testPrediction) == 0 {
 			return true
 		}
-		if hasBlamedConflictWithPrediction(carIndex, testCar, testPrediction, cars, graph, predictions, geometries, poses, reach, grid, profile) {
+		testAABB := buildTrajectoryAABB(testPrediction, geometries[carIndex].coarseRadius)
+		if hasBlamedConflictWithPrediction(carIndex, testCar, testPrediction, testAABB, cars, graph, predictions, geometries, poses, reach, trajAABBs, grid, profile) {
 			return true
 		}
 	}
@@ -1672,7 +1739,7 @@ func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, graph *RoadGraph, p
 	return false
 }
 
-func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction []TrajectorySample, cars []Car, graph *RoadGraph, predictions [][]TrajectorySample, geometries []collisionGeometry, poses []carPose, reach []float32, grid *spatialGrid, profile *BrakingProfile) bool {
+func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction []TrajectorySample, testAABB trajectoryAABB, cars []Car, graph *RoadGraph, predictions [][]TrajectorySample, geometries []collisionGeometry, poses []carPose, reach []float32, trajAABBs []trajectoryAABB, grid *spatialGrid, profile *BrakingProfile) bool {
 	neighbors := grid.queryNeighbors(poses[carIndex].pos, nil)
 	for _, otherIndex := range neighbors {
 		if otherIndex == carIndex || otherIndex >= len(predictions) || len(predictions[otherIndex]) == 0 {
@@ -1681,6 +1748,9 @@ func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction [
 		scale := closingRateScale(poses[carIndex].pos, poses[otherIndex].pos, poses[carIndex].heading, poses[otherIndex].heading, cars[carIndex].Speed, cars[otherIndex].Speed)
 		broadPhaseDist := (reach[carIndex] + reach[otherIndex]) * scale
 		if distSq(poses[carIndex].pos, poses[otherIndex].pos) > broadPhaseDist*broadPhaseDist {
+			continue
+		}
+		if !aabbOverlap(testAABB, trajAABBs[otherIndex]) {
 			continue
 		}
 		otherCar := cars[otherIndex]
