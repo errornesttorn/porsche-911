@@ -379,6 +379,7 @@ type World struct {
 	DebugBlameLinks      []DebugBlameLink
 	HoldBlameLinks       []DebugBlameLink
 	DebugSelectedCar     int
+	DebugSelectedCarMode int // 0 = primary candidates, 1 = hold candidates
 	DebugCandidateLinks  []DebugBlameLink
 	BasePathHits    int
 	BasePathMisses  int
@@ -483,7 +484,7 @@ func (w *World) Step(dt float32) {
 	w.GraphBuildMS += sinceMS(graphStart)
 
 	brakingStart := time.Now()
-	brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks, candidateLinks, brakingProfile := computeBrakingDecisions(w.Cars, allGraph, w.DebugSelectedCar)
+	brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks, candidateLinks, brakingProfile := computeBrakingDecisions(w.Cars, allGraph, w.DebugSelectedCar, w.DebugSelectedCarMode)
 	w.BrakingMS = sinceMS(brakingStart)
 	w.BrakingProfile = brakingProfile
 
@@ -1321,6 +1322,33 @@ func (g *spatialGrid) queryNeighbors(p Vec2, buf []int) []int {
 	return buf
 }
 
+// closingRateScale returns a multiplier in [0.3, 1.0] for the broad-phase
+// distance threshold based on how fast two cars are approaching each other.
+// 1.0 when closing head-on, 0.3 when separating.
+func closingRateScale(posI, posJ, headingI, headingJ Vec2, speedI, speedJ float32) float32 {
+	displacement := vecSub(posJ, posI)
+	dLen := float32(math.Sqrt(float64(vectorLengthSq(displacement))))
+	if dLen < 1e-6 {
+		return 1.0
+	}
+	dNorm := vecScale(displacement, 1.0/dLen)
+	// positive closing rate = cars approaching
+	closingRate := dot(vecScale(headingI, speedI), dNorm) - dot(vecScale(headingJ, speedJ), dNorm)
+	maxClosing := speedI + speedJ
+	if maxClosing < 1e-6 {
+		return 1.0
+	}
+	// ratio: 1.0 = head-on, 0.0 = perpendicular, -1.0 = separating
+	ratio := closingRate / maxClosing
+	// map [-1, 1] to [0.3, 1.0]
+	if ratio > 1 {
+		ratio = 1
+	} else if ratio < -1 {
+		ratio = -1
+	}
+	return 0.65 + 0.35*ratio
+}
+
 func recentlyLeft(car Car, splineID int) bool {
 	return splineID >= 0 && (car.PrevSplineIDs[0] == splineID || car.PrevSplineIDs[1] == splineID)
 }
@@ -1335,7 +1363,7 @@ func medianReach(reach []float32) float32 {
 	return sorted[len(sorted)/2]
 }
 
-func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int) ([]bool, []bool, []DebugBlameLink, []DebugBlameLink, []DebugBlameLink, BrakingProfile) {
+func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int, debugSelectedCarMode int) ([]bool, []bool, []DebugBlameLink, []DebugBlameLink, []DebugBlameLink, BrakingProfile) {
 	flags := make([]bool, len(cars))
 	holdSpeed := make([]bool, len(cars))
 	initialBlame := make([]bool, len(cars))
@@ -1399,12 +1427,13 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int)
 			}
 			seen[[2]int{i, j}] = true
 			profile.PrimaryPairCandidates++
-			broadPhaseDist := reach[i] + reach[j]
+			scale := closingRateScale(poses[i].pos, poses[j].pos, poses[i].heading, poses[j].heading, cars[i].Speed, cars[j].Speed)
+			broadPhaseDist := (reach[i] + reach[j]) * scale
 			if distSq(poses[i].pos, poses[j].pos) > broadPhaseDist*broadPhaseDist {
 				continue
 			}
 			profile.PrimaryBroadPhasePairs++
-			if debugSelectedCar >= 0 && (i == debugSelectedCar || j == debugSelectedCar) {
+			if debugSelectedCar >= 0 && debugSelectedCarMode == 0 && (i == debugSelectedCar || j == debugSelectedCar) {
 				candidateLinks = append(candidateLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
 			}
 			profile.PrimaryCollisionChecks++
@@ -1502,9 +1531,13 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int)
 			if j == i || len(predictions[j]) == 0 {
 				continue
 			}
-			broadPhaseDist := reach[i] + reach[j]
+			scale := closingRateScale(poses[i].pos, poses[j].pos, poses[i].heading, poses[j].heading, cars[i].Speed, cars[j].Speed)
+			broadPhaseDist := (reach[i] + reach[j]) * scale * scale
 			if distSq(poses[i].pos, poses[j].pos) > broadPhaseDist*broadPhaseDist {
 				continue
+			}
+			if debugSelectedCar >= 0 && debugSelectedCarMode == 1 && i == debugSelectedCar {
+				candidateLinks = append(candidateLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
 			}
 			profile.HoldCollisionChecks++
 			collision, ok := predictCollision(fasterPred, predictions[j], geometries[i], geometries[j])
@@ -1645,7 +1678,8 @@ func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction [
 		if otherIndex == carIndex || otherIndex >= len(predictions) || len(predictions[otherIndex]) == 0 {
 			continue
 		}
-		broadPhaseDist := reach[carIndex] + reach[otherIndex]
+		scale := closingRateScale(poses[carIndex].pos, poses[otherIndex].pos, poses[carIndex].heading, poses[otherIndex].heading, cars[carIndex].Speed, cars[otherIndex].Speed)
+		broadPhaseDist := (reach[carIndex] + reach[otherIndex]) * scale
 		if distSq(poses[carIndex].pos, poses[otherIndex].pos) > broadPhaseDist*broadPhaseDist {
 			continue
 		}

@@ -878,7 +878,21 @@ func main() {
 		frameProf.brakingDetail = world.BrakingProfile
 
 		if debugMode && rl.IsMouseButtonPressed(rl.MouseButtonMiddle) && !mouseOnToolbar {
-			world.DebugSelectedCar = findClickedCar(cars, allSplines, simpkg.BuildSplineIndexByID(allSplines), mouseWorld)
+			clicked := findClickedCar(cars, allSplines, simpkg.BuildSplineIndexByID(allSplines), mouseWorld)
+			if clicked < 0 {
+				world.DebugSelectedCar = -1
+				world.DebugSelectedCarMode = 0
+			} else if clicked == world.DebugSelectedCar {
+				if world.DebugSelectedCarMode == 0 {
+					world.DebugSelectedCarMode = 1
+				} else {
+					world.DebugSelectedCar = -1
+					world.DebugSelectedCarMode = 0
+				}
+			} else {
+				world.DebugSelectedCar = clicked
+				world.DebugSelectedCarMode = 0
+			}
 		}
 
 		if routePanel.Open {
@@ -1355,11 +1369,19 @@ func main() {
 		if debugMode {
 			drawDebugBlameLinks(debugBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(220, 50, 50, 220))
 			drawDebugBlameLinks(holdBlameLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(255, 165, 0, 220))
-			drawDebugBlameLinks(debugCandidateLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(50, 220, 50, 200))
+			if world.DebugSelectedCarMode == 0 {
+				drawDebugBlameLinks(debugCandidateLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(50, 220, 50, 200))
+			} else {
+				drawDebugBlameLinks(debugCandidateLinks, cars, allSplines, allSplineIndexByID, camera.Zoom, NewColor(180, 50, 220, 200))
+			}
 			if sel := world.DebugSelectedCar; sel >= 0 && sel < len(cars) {
 				if _, center, _, ok := carBodyPose(cars[sel], allSplines, allSplineIndexByID); ok {
 					r := pixelsToWorld(camera.Zoom, 8)
-					drawRing(center, r*0.6, r, 0, 360, 24, NewColor(50, 220, 50, 255))
+					ringColor := NewColor(50, 220, 50, 255)
+					if world.DebugSelectedCarMode == 1 {
+						ringColor = NewColor(180, 50, 220, 255)
+					}
+					drawRing(center, r*0.6, r, 0, 360, 24, ringColor)
 				}
 			}
 			drawLaneChangeSplines(laneChangeSplines, camera.Zoom)
