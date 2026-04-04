@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	simpkg "mygame/sim"
+	simpkg "simple-traffic-simulation/sim"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
 )
