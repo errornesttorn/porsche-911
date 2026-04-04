@@ -11,8 +11,9 @@ import (
 	"strings"
 	"time"
 
-	rl "github.com/gen2brain/raylib-go/raylib"
 	simpkg "mygame/sim"
+
+	rl "github.com/gen2brain/raylib-go/raylib"
 )
 
 // Run with:

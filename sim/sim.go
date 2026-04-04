@@ -101,6 +101,8 @@ type Spline struct {
 	SpeedFactor    float32
 	Samples        [simSamples + 1]Vec2
 	CumLen         [simSamples + 1]float32
+	SampleTangents []Vec2
+	SampleCurv     []float32
 	HardCoupledIDs []int
 	SoftCoupledIDs []int
 	SpeedLimitKmh  float32
@@ -458,6 +460,13 @@ func cloneFloat32Slice(src []float32) []float32 {
 	return append([]float32(nil), src...)
 }
 
+func cloneVec2Slice(src []Vec2) []Vec2 {
+	if len(src) == 0 {
+		return nil
+	}
+	return append([]Vec2(nil), src...)
+}
+
 func cloneSplines(src []Spline) []Spline {
 	if len(src) == 0 {
 		return nil
@@ -466,6 +475,8 @@ func cloneSplines(src []Spline) []Spline {
 	for i := range dst {
 		dst[i].HardCoupledIDs = cloneIntSlice(src[i].HardCoupledIDs)
 		dst[i].SoftCoupledIDs = cloneIntSlice(src[i].SoftCoupledIDs)
+		dst[i].SampleTangents = cloneVec2Slice(src[i].SampleTangents)
+		dst[i].SampleCurv = cloneFloat32Slice(src[i].SampleCurv)
 		dst[i].CurveSpeedMPS = cloneFloat32Slice(src[i].CurveSpeedMPS)
 	}
 	return dst
@@ -1493,6 +1504,11 @@ type trajectoryAABB struct {
 	minX, minY, maxX, maxY float32
 }
 
+type splineSampleCursor struct {
+	splineID int
+	idx      int
+}
+
 func buildTrajectoryAABB(samples []TrajectorySample, coarseRadius float32) trajectoryAABB {
 	if len(samples) == 0 {
 		return trajectoryAABB{}
@@ -2100,14 +2116,59 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 	simTrailerRearPos := car.Trailer.RearPosition
 	speed := maxf(car.Speed, 0)
 	active := true
+	var sampleCursor splineSampleCursor
+	sampleCursor.splineID = -1
+
+	if speed <= 0.01 {
+		spline, ok := graph.splineByID(simCar.CurrentSplineID)
+		if !ok {
+			return nil
+		}
+		splinePos, splineTangent, _ := sampleSplineStateAtDistance(spline, simCar.DistanceOnSpline, &sampleCursor)
+		rightNormal := Vec2{X: splineTangent.Y, Y: -splineTangent.X}
+		frontPos := vecAdd(splinePos, vecScale(rightNormal, simCar.LateralOffset))
+		rearToFront := vecSub(frontPos, simRearPos)
+		if vectorLengthSq(rearToFront) > 1e-9 {
+			simRearPos = vecSub(frontPos, vecScale(normalize(rearToFront), simCar.Length*wheelbaseFrac))
+		} else {
+			simRearPos = vecSub(frontPos, vecScale(splineTangent, simCar.Length*wheelbaseFrac))
+		}
+		center := vecScale(vecAdd(frontPos, simRearPos), 0.5)
+		bodyHeading := normalize(vecSub(frontPos, simRearPos))
+
+		baseSample := TrajectorySample{
+			Position: center,
+			Heading:  bodyHeading,
+			Priority: spline.Priority,
+			SplineID: spline.ID,
+		}
+		if simCar.Trailer.HasTrailer {
+			hitchPos := simRearPos
+			trailerRearToHitch := vecSub(hitchPos, simTrailerRearPos)
+			if vectorLengthSq(trailerRearToHitch) > 1e-9 {
+				simTrailerRearPos = vecSub(hitchPos, vecScale(normalize(trailerRearToHitch), simCar.Trailer.Length*wheelbaseFrac))
+			} else {
+				simTrailerRearPos = vecSub(hitchPos, vecScale(splineTangent, simCar.Trailer.Length*wheelbaseFrac))
+			}
+			baseSample.HasTrailer = true
+			baseSample.TrailerPosition = vecScale(vecAdd(hitchPos, simTrailerRearPos), 0.5)
+			baseSample.TrailerHeading = normalize(vecSub(hitchPos, simTrailerRearPos))
+		}
+
+		for stepIndex := 0; stepIndex <= steps; stepIndex++ {
+			sample := baseSample
+			sample.Time = float32(stepIndex) * step
+			samples = append(samples, sample)
+		}
+		return samples
+	}
 
 	for stepIndex := 0; stepIndex <= steps; stepIndex++ {
 		spline, ok := graph.splineByID(simCar.CurrentSplineID)
 		if !ok {
 			break
 		}
-		splinePos, splineTangent := sampleSplineAtDistance(spline, simCar.DistanceOnSpline)
-		κ := signedCurvatureAtArcLen(&spline, simCar.DistanceOnSpline)
+		splinePos, splineTangent, κ := sampleSplineStateAtDistance(spline, simCar.DistanceOnSpline, &sampleCursor)
 		wb := simCar.Length * wheelbaseFrac
 		targetOffset := κ * wb * wb / 6
 		if simCar.Trailer.HasTrailer {
@@ -2527,6 +2588,8 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 	}
 	alive := cars[:0]
 	for i, car := range cars {
+		var sampleCursor splineSampleCursor
+		sampleCursor.splineID = -1
 		routeIdx, ok := routeIndexByID[car.RouteID]
 		if !ok || !routes[routeIdx].Valid {
 			continue
@@ -2653,7 +2716,7 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 
 			car.DistanceOnSpline += car.Speed * dt
 			if car.DistanceOnSpline <= currentSpline.Length {
-				κ := signedCurvatureAtArcLen(&currentSpline, car.DistanceOnSpline)
+				splinePos, tangent, κ := sampleSplineStateAtDistance(currentSpline, car.DistanceOnSpline, &sampleCursor)
 				wb := car.Length * wheelbaseFrac
 				targetOffset := κ * wb * wb / 6
 				if car.Trailer.HasTrailer {
@@ -2663,7 +2726,6 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 				lerpRate := car.Speed / (2 * (wb + 0.01))
 				car.LateralOffset += (targetOffset - car.LateralOffset) * clampf(lerpRate*dt, 0, 1)
 
-				splinePos, tangent := sampleSplineAtDistance(currentSpline, car.DistanceOnSpline)
 				rightNormal := Vec2{X: tangent.Y, Y: -tangent.X}
 				frontPos := vecAdd(splinePos, vecScale(rightNormal, car.LateralOffset))
 				rearToFront := vecSub(frontPos, car.RearPosition)
@@ -3082,17 +3144,31 @@ func findOvertakeLaneCandidates(car Car, splines []Spline, splineIndexByID map[i
 }
 
 func cacheSpline(s *Spline) {
-	s.Samples[0] = s.P0
-	s.CumLen[0] = 0
+	if len(s.SampleTangents) != simSamples+1 {
+		s.SampleTangents = make([]Vec2, simSamples+1)
+	}
+	if len(s.SampleCurv) != simSamples+1 {
+		s.SampleCurv = make([]float32, simSamples+1)
+	}
+
 	total := float32(0)
-	prev := s.P0
-	for i := 1; i <= simSamples; i++ {
+	var prev Vec2
+	for i := 0; i <= simSamples; i++ {
 		t := float32(i) / float32(simSamples)
 		pt := bezierPoint(s.P0, s.P1, s.P2, s.P3, t)
-		total += float32(math.Sqrt(float64(distSq(prev, pt))))
 		s.Samples[i] = pt
+		s.SampleTangents[i] = normalize(bezierDerivative(*s, t))
+		if i == 0 {
+			s.CumLen[i] = 0
+			prev = pt
+			continue
+		}
+		total += float32(math.Sqrt(float64(distSq(prev, pt))))
 		s.CumLen[i] = total
 		prev = pt
+	}
+	for i := 0; i <= simSamples; i++ {
+		s.SampleCurv[i] = sampleCurvatureAtIndex(&s.Samples, i)
 	}
 	s.Length = total
 	s.SpeedFactor = 1.0
@@ -3158,26 +3234,11 @@ func buildSplineTravelTime(s *Spline) float32 {
 }
 
 func curveSpeedAtArcLen(s *Spline, d float32) float32 {
-	idx := 0
-	for idx < simSamples && s.CumLen[idx+1] < d {
-		idx++
-	}
-	i0, i1, i2 := idx-1, idx, idx+1
-	if i0 < 0 {
-		i0, i1, i2 = 0, 1, 2
-	}
-	if i2 > simSamples {
-		i0, i1, i2 = simSamples-2, simSamples-1, simSamples
-	}
-	A, B, C := s.Samples[i0], s.Samples[i1], s.Samples[i2]
-	ab := float32(math.Sqrt(float64(distSq(A, B))))
-	bc := float32(math.Sqrt(float64(distSq(B, C))))
-	ca := float32(math.Sqrt(float64(distSq(C, A))))
-	cross := absf((B.X-A.X)*(C.Y-A.Y) - (B.Y-A.Y)*(C.X-A.X))
-	if cross < 1e-6 {
+	curvature := absf(signedCurvatureAtArcLen(s, d))
+	if curvature < 1e-6 {
 		return maxCarSpeed
 	}
-	r := ab * bc * ca / (2 * cross)
+	r := 1 / curvature
 	v := float32(math.Sqrt(float64(maxLateralAccelMPS2 * r)))
 	if v > maxCarSpeed {
 		return maxCarSpeed
@@ -3186,27 +3247,8 @@ func curveSpeedAtArcLen(s *Spline, d float32) float32 {
 }
 
 func signedCurvatureAtArcLen(s *Spline, d float32) float32 {
-	idx := 0
-	for idx < simSamples && s.CumLen[idx+1] < d {
-		idx++
-	}
-	i0, i1, i2 := idx-1, idx, idx+1
-	if i0 < 0 {
-		i0, i1, i2 = 0, 1, 2
-	}
-	if i2 > simSamples {
-		i0, i1, i2 = simSamples-2, simSamples-1, simSamples
-	}
-	A, B, C := s.Samples[i0], s.Samples[i1], s.Samples[i2]
-	ab := float32(math.Sqrt(float64(distSq(A, B))))
-	bc := float32(math.Sqrt(float64(distSq(B, C))))
-	ca := float32(math.Sqrt(float64(distSq(C, A))))
-	denom := ab * bc * ca
-	if denom < 1e-6 {
-		return 0
-	}
-	cross := (B.X-A.X)*(C.Y-A.Y) - (B.Y-A.Y)*(C.X-A.X)
-	return 2 * cross / denom
+	_, _, curvature := sampleSplineStateAtDistance(*s, d, nil)
+	return curvature
 }
 
 func lookupCurveSpeed(spline Spline, dist float32) float32 {
@@ -3476,26 +3518,90 @@ func segmentTravelCost(s Spline, vehicleCounts map[int]int) float32 {
 }
 
 func sampleSplineAtDistance(s Spline, distance float32) (Vec2, Vec2) {
+	pos, tangent, _ := sampleSplineStateAtDistance(s, distance, nil)
+	return pos, tangent
+}
+
+func sampleCurvatureAtIndex(samples *[simSamples + 1]Vec2, idx int) float32 {
+	i0, i1, i2 := idx-1, idx, idx+1
+	if i0 < 0 {
+		i0, i1, i2 = 0, 1, 2
+	}
+	if i2 > simSamples {
+		i0, i1, i2 = simSamples-2, simSamples-1, simSamples
+	}
+	A, B, C := samples[i0], samples[i1], samples[i2]
+	ab := float32(math.Sqrt(float64(distSq(A, B))))
+	bc := float32(math.Sqrt(float64(distSq(B, C))))
+	ca := float32(math.Sqrt(float64(distSq(C, A))))
+	denom := ab * bc * ca
+	if denom < 1e-6 {
+		return 0
+	}
+	cross := (B.X-A.X)*(C.Y-A.Y) - (B.Y-A.Y)*(C.X-A.X)
+	return 2 * cross / denom
+}
+
+func splineSegmentIndex(s Spline, distance float32, cursor *splineSampleCursor) int {
 	if s.Length <= 0 {
-		return s.P0, NewVec2(1, 0)
+		return 0
+	}
+	if cursor != nil && cursor.splineID == s.ID {
+		idx := cursor.idx
+		if idx < 1 {
+			idx = 1
+		}
+		if idx > simSamples {
+			idx = simSamples
+		}
+		for idx < simSamples && distance > s.CumLen[idx] {
+			idx++
+		}
+		for idx > 1 && distance <= s.CumLen[idx-1] {
+			idx--
+		}
+		cursor.idx = idx
+		return idx
+	}
+	idx := sort.Search(simSamples, func(i int) bool {
+		return distance <= s.CumLen[i+1]
+	}) + 1
+	if idx > simSamples {
+		idx = simSamples
+	}
+	if cursor != nil {
+		cursor.splineID = s.ID
+		cursor.idx = idx
+	}
+	return idx
+}
+
+func sampleSplineStateAtDistance(s Spline, distance float32, cursor *splineSampleCursor) (Vec2, Vec2, float32) {
+	if s.Length <= 0 {
+		return s.P0, NewVec2(1, 0), 0
 	}
 	distance = clampf(distance, 0, s.Length)
-	for i := 1; i <= simSamples; i++ {
-		if distance <= s.CumLen[i] {
-			span := s.CumLen[i] - s.CumLen[i-1]
-			alpha := float32(0)
-			if span > 0 {
-				alpha = (distance - s.CumLen[i-1]) / span
-			}
-			t0 := float32(i-1) / float32(simSamples)
-			t1 := float32(i) / float32(simSamples)
-			t := t0 + (t1-t0)*alpha
-			pos := bezierPoint(s.P0, s.P1, s.P2, s.P3, t)
-			tangent := bezierDerivative(s, t)
-			return pos, normalize(tangent)
-		}
+	idx := splineSegmentIndex(s, distance, cursor)
+	if idx <= 0 {
+		return s.P0, NewVec2(1, 0), 0
 	}
-	return s.P3, normalize(vecSub(s.P3, s.P2))
+
+	span := s.CumLen[idx] - s.CumLen[idx-1]
+	alpha := float32(0)
+	if span > 0 {
+		alpha = (distance - s.CumLen[idx-1]) / span
+	}
+	t0 := float32(idx-1) / float32(simSamples)
+	t1 := float32(idx) / float32(simSamples)
+	t := t0 + (t1-t0)*alpha
+	pos := bezierPoint(s.P0, s.P1, s.P2, s.P3, t)
+
+	tangent := normalize(vecAdd(
+		vecScale(s.SampleTangents[idx-1], 1-alpha),
+		vecScale(s.SampleTangents[idx], alpha),
+	))
+	curvature := (1-alpha)*s.SampleCurv[idx-1] + alpha*s.SampleCurv[idx]
+	return pos, tangent, curvature
 }
 
 func SampleSplineAtDistance(s Spline, distance float32) (Vec2, Vec2) {
