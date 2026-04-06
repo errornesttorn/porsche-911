@@ -699,14 +699,30 @@ func (w *World) Step(dt float32) {
 	allGraph := newRoadGraphFromSlices(w.Splines, w.LaneChangeSplines, vehicleCounts)
 	w.GraphBuildMS += sinceMS(graphStart)
 
-	brakingStart := time.Now()
-	brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks, candidateLinks, brakingProfile := computeBrakingDecisions(w.Cars, allGraph, w.DebugSelectedCar, w.DebugSelectedCarMode)
-	w.BrakingMS = sinceMS(brakingStart)
-	w.BrakingProfile = brakingProfile
+	var brakingDecisions, holdSpeedDecisions []bool
+	var debugBlameLinks, holdBlameLinks, candidateLinks []DebugBlameLink
+	var brakingProfile BrakingProfile
+	var followCaps []float32
+	var brakingMS, followMS float64
 
-	followStart := time.Now()
-	followCaps := computeFollowingSpeedCaps(w.Cars, allGraph)
-	w.FollowMS = sinceMS(followStart)
+	var wgBrakeFollow sync.WaitGroup
+	wgBrakeFollow.Add(2)
+	go func() {
+		defer wgBrakeFollow.Done()
+		brakingStart := time.Now()
+		brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks, candidateLinks, brakingProfile = computeBrakingDecisions(w.Cars, allGraph, w.DebugSelectedCar, w.DebugSelectedCarMode)
+		brakingMS = sinceMS(brakingStart)
+	}()
+	go func() {
+		defer wgBrakeFollow.Done()
+		followStart := time.Now()
+		followCaps = computeFollowingSpeedCaps(w.Cars, allGraph)
+		followMS = sinceMS(followStart)
+	}()
+	wgBrakeFollow.Wait()
+	w.BrakingMS = brakingMS
+	w.BrakingProfile = brakingProfile
+	w.FollowMS = followMS
 
 	updateCarsStart := time.Now()
 	var indexRemap []int
@@ -1685,100 +1701,161 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int,
 	}
 
 	conflictScanStart := time.Now()
-	seenJ := make([]bool, len(cars))
-	var seenJReset []int
-	neighborBuf := make([]int, 0, 32)
-	for i := 0; i < len(cars); i++ {
-		if len(predictions[i]) == 0 {
-			continue
+	type conflictScanResult struct {
+		initialBlame           []bool
+		stationaryPredictions  [][]TrajectorySample
+		tentativeLinks         []DebugBlameLink
+		candidateLinks         []DebugBlameLink
+		primaryPairCandidates  int
+		primaryBroadPhasePairs int
+		primaryCollisionChecks int
+		primaryCollisionHits   int
+		stationaryPredictions_ int
+		stationaryCollChecks   int
+		stationaryCollHits     int
+		totalPredictions       int
+		totalPredSamples       int
+	}
+	workers := parallelWorkerCount(len(cars))
+	scanResults := make([]conflictScanResult, workers)
+	chunkSize := (len(cars) + workers - 1) / workers
+	var scanWg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wStart := w * chunkSize
+		if wStart >= len(cars) {
+			break
 		}
-		for _, idx := range seenJReset {
-			seenJ[idx] = false
+		wEnd := wStart + chunkSize
+		if wEnd > len(cars) {
+			wEnd = len(cars)
 		}
-		seenJReset = seenJReset[:0]
-		neighborBuf = grid.queryNeighbors(poses[i].pos, neighborBuf)
-		for _, j := range neighborBuf {
-			if j <= i {
-				continue
-			}
-			if seenJ[j] {
-				continue
-			}
-			seenJ[j] = true
-			seenJReset = append(seenJReset, j)
-			profile.PrimaryPairCandidates++
-			disp := vecSub(poses[j].pos, poses[i].pos)
-			dSq := vectorLengthSq(disp)
-			scale := closingRateScale(disp, dSq, poses[i].heading, poses[j].heading, cars[i].Speed, cars[j].Speed)
-			broadPhaseDist := (reach[i] + reach[j]) * scale
-			if dSq > broadPhaseDist*broadPhaseDist {
-				continue
-			}
-			profile.PrimaryBroadPhasePairs++
-			if !aabbOverlap(trajAABBs[i], trajAABBs[j]) {
-				continue
-			}
-			if debugSelectedCar >= 0 && debugSelectedCarMode == 0 && (i == debugSelectedCar || j == debugSelectedCar) {
-				candidateLinks = append(candidateLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
-			}
-			profile.PrimaryCollisionChecks++
-			collision, ok := predictCollision(predictions[i], predictions[j], geometries[i], geometries[j])
-			if !ok {
-				continue
-			}
-			profile.PrimaryCollisionHits++
-			blameI, blameJ := determineBlame(collision, cars[i], cars[j], graph)
-			alreadyCollided := collision.AlreadyCollided
-			if blameI && recentlyLeft(cars[i], cars[j].CurrentSplineID) {
-				blameI = false
-			}
-			if blameJ && recentlyLeft(cars[j], cars[i].CurrentSplineID) {
-				blameJ = false
-			}
-			if blameI && !alreadyCollided {
-				if stationaryPredictions[i] == nil {
-					sc := cars[i]
-					sc.Speed = 0
-					stationaryPredictions[i] = predictCarTrajectory(sc, graph, predictionHorizonSeconds, predictionStepSeconds)
-					profile.StationaryPredictions++
-					profile.TotalPredictions++
-					profile.TotalPredictionSamples += len(stationaryPredictions[i])
+		scanWg.Add(1)
+		go func(workerIdx, iStart, iEnd int) {
+			defer scanWg.Done()
+			r := &scanResults[workerIdx]
+			r.initialBlame = make([]bool, len(cars))
+			r.stationaryPredictions = make([][]TrajectorySample, len(cars))
+			seenJ := make([]bool, len(cars))
+			var seenJReset []int
+			neighborBuf := make([]int, 0, 32)
+			for i := iStart; i < iEnd; i++ {
+				if len(predictions[i]) == 0 {
+					continue
 				}
-				profile.StationaryCollisionChecks++
-				if _, still := predictCollision(stationaryPredictions[i], predictions[j], geometries[i], geometries[j]); still {
-					profile.StationaryCollisionHits++
-					blameI = false
+				for _, idx := range seenJReset {
+					seenJ[idx] = false
+				}
+				seenJReset = seenJReset[:0]
+				neighborBuf = grid.queryNeighbors(poses[i].pos, neighborBuf)
+				for _, j := range neighborBuf {
+					if j <= i {
+						continue
+					}
+					if seenJ[j] {
+						continue
+					}
+					seenJ[j] = true
+					seenJReset = append(seenJReset, j)
+					r.primaryPairCandidates++
+					disp := vecSub(poses[j].pos, poses[i].pos)
+					dSq := vectorLengthSq(disp)
+					scale := closingRateScale(disp, dSq, poses[i].heading, poses[j].heading, cars[i].Speed, cars[j].Speed)
+					broadPhaseDist := (reach[i] + reach[j]) * scale
+					if dSq > broadPhaseDist*broadPhaseDist {
+						continue
+					}
+					r.primaryBroadPhasePairs++
+					if !aabbOverlap(trajAABBs[i], trajAABBs[j]) {
+						continue
+					}
+					if debugSelectedCar >= 0 && debugSelectedCarMode == 0 && (i == debugSelectedCar || j == debugSelectedCar) {
+						r.candidateLinks = append(r.candidateLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
+					}
+					r.primaryCollisionChecks++
+					collision, ok := predictCollision(predictions[i], predictions[j], geometries[i], geometries[j])
+					if !ok {
+						continue
+					}
+					r.primaryCollisionHits++
+					blameI, blameJ := determineBlame(collision, cars[i], cars[j], graph)
+					alreadyCollided := collision.AlreadyCollided
+					if blameI && recentlyLeft(cars[i], cars[j].CurrentSplineID) {
+						blameI = false
+					}
+					if blameJ && recentlyLeft(cars[j], cars[i].CurrentSplineID) {
+						blameJ = false
+					}
+					if blameI && !alreadyCollided {
+						if r.stationaryPredictions[i] == nil {
+							sc := cars[i]
+							sc.Speed = 0
+							r.stationaryPredictions[i] = predictCarTrajectory(sc, graph, predictionHorizonSeconds, predictionStepSeconds)
+							r.stationaryPredictions_++
+							r.totalPredictions++
+							r.totalPredSamples += len(r.stationaryPredictions[i])
+						}
+						r.stationaryCollChecks++
+						if _, still := predictCollision(r.stationaryPredictions[i], predictions[j], geometries[i], geometries[j]); still {
+							r.stationaryCollHits++
+							blameI = false
+						}
+					}
+					if blameJ && !alreadyCollided {
+						if r.stationaryPredictions[j] == nil {
+							sc := cars[j]
+							sc.Speed = 0
+							r.stationaryPredictions[j] = predictCarTrajectory(sc, graph, predictionHorizonSeconds, predictionStepSeconds)
+							r.stationaryPredictions_++
+							r.totalPredictions++
+							r.totalPredSamples += len(r.stationaryPredictions[j])
+						}
+						r.stationaryCollChecks++
+						if _, still := predictCollision(r.stationaryPredictions[j], predictions[i], geometries[j], geometries[i]); still {
+							r.stationaryCollHits++
+							blameJ = false
+						}
+					}
+					if blameI {
+						r.initialBlame[i] = true
+						r.tentativeLinks = append(r.tentativeLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
+					}
+					if blameJ {
+						r.initialBlame[j] = true
+						r.tentativeLinks = append(r.tentativeLinks, DebugBlameLink{FromCarIndex: j, ToCarIndex: i})
+					}
 				}
 			}
-			if blameJ && !alreadyCollided {
-				if stationaryPredictions[j] == nil {
-					sc := cars[j]
-					sc.Speed = 0
-					stationaryPredictions[j] = predictCarTrajectory(sc, graph, predictionHorizonSeconds, predictionStepSeconds)
-					profile.StationaryPredictions++
-					profile.TotalPredictions++
-					profile.TotalPredictionSamples += len(stationaryPredictions[j])
-				}
-				profile.StationaryCollisionChecks++
-				if _, still := predictCollision(stationaryPredictions[j], predictions[i], geometries[j], geometries[i]); still {
-					profile.StationaryCollisionHits++
-					blameJ = false
-				}
-			}
-			if blameI {
-				if !initialBlame[i] {
-					profile.InitiallyBlamedCars++
-				}
+		}(w, wStart, wEnd)
+	}
+	scanWg.Wait()
+
+	// Merge per-worker results.
+	for _, r := range scanResults {
+		for i, blamed := range r.initialBlame {
+			if blamed {
 				initialBlame[i] = true
-				tentativeLinks = append(tentativeLinks, DebugBlameLink{FromCarIndex: i, ToCarIndex: j})
 			}
-			if blameJ {
-				if !initialBlame[j] {
-					profile.InitiallyBlamedCars++
-				}
-				initialBlame[j] = true
-				tentativeLinks = append(tentativeLinks, DebugBlameLink{FromCarIndex: j, ToCarIndex: i})
+		}
+		for i, sp := range r.stationaryPredictions {
+			if sp != nil && stationaryPredictions[i] == nil {
+				stationaryPredictions[i] = sp
 			}
+		}
+		tentativeLinks = append(tentativeLinks, r.tentativeLinks...)
+		candidateLinks = append(candidateLinks, r.candidateLinks...)
+		profile.PrimaryPairCandidates += r.primaryPairCandidates
+		profile.PrimaryBroadPhasePairs += r.primaryBroadPhasePairs
+		profile.PrimaryCollisionChecks += r.primaryCollisionChecks
+		profile.PrimaryCollisionHits += r.primaryCollisionHits
+		profile.StationaryPredictions += r.stationaryPredictions_
+		profile.StationaryCollisionChecks += r.stationaryCollChecks
+		profile.StationaryCollisionHits += r.stationaryCollHits
+		profile.TotalPredictions += r.totalPredictions
+		profile.TotalPredictionSamples += r.totalPredSamples
+	}
+	for _, blamed := range initialBlame {
+		if blamed {
+			profile.InitiallyBlamedCars++
 		}
 	}
 	profile.ConflictScanMS = sinceMS(conflictScanStart)
