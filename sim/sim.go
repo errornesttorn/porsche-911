@@ -319,7 +319,7 @@ func (h *dijkstraHeap) Pop() interface{} {
 type RoadGraph struct {
 	splines          []*Spline
 	indexByID        map[int]int
-	startsByNode     map[string][]int
+	startsByNode     map[NodeKey][]int
 	routeNeighbors   [][]int
 	reverseNeighbors [][]int
 	segmentCosts     []float32
@@ -352,7 +352,7 @@ func newRoadGraphFromSplineRefs(splineRefs []*Spline, vehicleCounts map[int]int)
 	segmentCosts := make([]float32, len(splineRefs))
 	for i := range splineRefs {
 		segmentCosts[i] = segmentTravelCost(splineRefs[i], vehicleCounts)
-		next := startsByNode[pointKey(splineRefs[i].P3)]
+		next := startsByNode[nodeKeyFromVec2(splineRefs[i].P3)]
 		if len(next) > 0 {
 			routeNeighbors[i] = append([]int(nil), expandWithCoupledNeighborRefs(next, splineRefs, indexByID)...)
 			for _, nextIdx := range routeNeighbors[i] {
@@ -396,7 +396,7 @@ func (g *RoadGraph) nextPhysicalIndices(currentSplineID int) []int {
 	if !ok {
 		return nil
 	}
-	return g.startsByNode[pointKey(currentSpline.P3)]
+	return g.startsByNode[nodeKeyFromVec2(currentSpline.P3)]
 }
 
 type DebugBlameLink struct {
@@ -1127,7 +1127,7 @@ func CurrentRouteTarget(route Route, nextBusStopIndex int) int {
 	return route.EndSplineID
 }
 
-func PickBestBusStopSpline(graph *RoadGraph, nodeKey string, fromSplineID, toSplineID int) (BusStop, bool) {
+func PickBestBusStopSpline(graph *RoadGraph, nodeKey NodeKey, fromSplineID, toSplineID int) (BusStop, bool) {
 	if graph == nil {
 		return BusStop{}, false
 	}
@@ -1428,7 +1428,7 @@ func computeBusStopSpeedCap(car Car, route Route, currentSpline *Spline, graph *
 		if adj <= 0 {
 			return 0
 		}
-		return float32(math.Sqrt(float64(2 * decel * adj)))
+		return sqrtf(2 * decel * adj)
 	}
 
 	if currentSpline.ID == stopSplineID {
@@ -1503,8 +1503,8 @@ func newSpatialGrid(cellSize float32, n int) spatialGrid {
 
 func (g *spatialGrid) cellKey(p Vec2) [2]int32 {
 	return [2]int32{
-		int32(math.Floor(float64(p.X * g.invCellSize))),
-		int32(math.Floor(float64(p.Y * g.invCellSize))),
+		floorf32(p.X * g.invCellSize),
+		floorf32(p.Y * g.invCellSize),
 	}
 }
 
@@ -1514,10 +1514,10 @@ func (g *spatialGrid) insert(index int, p Vec2, radius float32) {
 		g.cells[k] = append(g.cells[k], index)
 		return
 	}
-	minX := int32(math.Floor(float64((p.X - radius) * g.invCellSize)))
-	maxX := int32(math.Floor(float64((p.X + radius) * g.invCellSize)))
-	minY := int32(math.Floor(float64((p.Y - radius) * g.invCellSize)))
-	maxY := int32(math.Floor(float64((p.Y + radius) * g.invCellSize)))
+	minX := floorf32((p.X - radius) * g.invCellSize)
+	maxX := floorf32((p.X + radius) * g.invCellSize)
+	minY := floorf32((p.Y - radius) * g.invCellSize)
+	maxY := floorf32((p.Y + radius) * g.invCellSize)
 	for cx := minX; cx <= maxX; cx++ {
 		for cy := minY; cy <= maxY; cy++ {
 			k := [2]int32{cx, cy}
@@ -1600,22 +1600,22 @@ func aabbOverlap(a, b trajectoryAABB) bool {
 // closingRateScale returns a multiplier in [0.3, 1.0] for the broad-phase
 // distance threshold based on how fast two cars are approaching each other.
 // 1.0 when closing head-on, 0.3 when separating.
-func closingRateScale(posI, posJ, headingI, headingJ Vec2, speedI, speedJ float32) float32 {
-	displacement := vecSub(posJ, posI)
-	dLen := float32(math.Sqrt(float64(vectorLengthSq(displacement))))
-	if dLen < 1e-6 {
+// closingRateScale returns a multiplier in [0.3, 1.0] for the broad-phase
+// distance threshold based on how fast two cars are approaching each other.
+// Takes precomputed displacement vector and its squared length to avoid
+// redundant computation at call sites.
+func closingRateScale(displacement Vec2, dLenSq float32, headingI, headingJ Vec2, speedI, speedJ float32) float32 {
+	if dLenSq < 1e-12 {
 		return 1.0
 	}
-	dNorm := vecScale(displacement, 1.0/dLen)
-	// positive closing rate = cars approaching
-	closingRate := dot(vecScale(headingI, speedI), dNorm) - dot(vecScale(headingJ, speedJ), dNorm)
 	maxClosing := speedI + speedJ
 	if maxClosing < 1e-6 {
 		return 1.0
 	}
-	// ratio: 1.0 = head-on, 0.0 = perpendicular, -1.0 = separating
-	ratio := closingRate / maxClosing
-	// map [-1, 1] to [0.3, 1.0]
+	// ratio = dot(velI - velJ, displacement) / (|displacement| * maxClosing)
+	numerator := dot(vecScale(headingI, speedI), displacement) - dot(vecScale(headingJ, speedJ), displacement)
+	invDLenMaxClosing := 1.0 / (sqrtf(dLenSq) * maxClosing)
+	ratio := numerator * invDLenMaxClosing
 	if ratio > 1 {
 		ratio = 1
 	} else if ratio < -1 {
@@ -1685,25 +1685,33 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int,
 	}
 
 	conflictScanStart := time.Now()
-	seen := make(map[[2]int]bool, len(cars)*4)
+	seenJ := make([]bool, len(cars))
+	var seenJReset []int
 	neighborBuf := make([]int, 0, 32)
 	for i := 0; i < len(cars); i++ {
 		if len(predictions[i]) == 0 {
 			continue
 		}
+		for _, idx := range seenJReset {
+			seenJ[idx] = false
+		}
+		seenJReset = seenJReset[:0]
 		neighborBuf = grid.queryNeighbors(poses[i].pos, neighborBuf)
 		for _, j := range neighborBuf {
 			if j <= i {
 				continue
 			}
-			if seen[[2]int{i, j}] {
+			if seenJ[j] {
 				continue
 			}
-			seen[[2]int{i, j}] = true
+			seenJ[j] = true
+			seenJReset = append(seenJReset, j)
 			profile.PrimaryPairCandidates++
-			scale := closingRateScale(poses[i].pos, poses[j].pos, poses[i].heading, poses[j].heading, cars[i].Speed, cars[j].Speed)
+			disp := vecSub(poses[j].pos, poses[i].pos)
+			dSq := vectorLengthSq(disp)
+			scale := closingRateScale(disp, dSq, poses[i].heading, poses[j].heading, cars[i].Speed, cars[j].Speed)
 			broadPhaseDist := (reach[i] + reach[j]) * scale
-			if distSq(poses[i].pos, poses[j].pos) > broadPhaseDist*broadPhaseDist {
+			if dSq > broadPhaseDist*broadPhaseDist {
 				continue
 			}
 			profile.PrimaryBroadPhasePairs++
@@ -1930,9 +1938,11 @@ func computeHoldProbeResultForCar(i int, cars []Car, graph *RoadGraph, flags []b
 		if j == i || j < 0 || j >= len(predictions) || len(predictions[j]) == 0 {
 			continue
 		}
-		scale := closingRateScale(poses[i].pos, poses[j].pos, poses[i].heading, poses[j].heading, cars[i].Speed, cars[j].Speed)
+		disp := vecSub(poses[j].pos, poses[i].pos)
+		dSq := vectorLengthSq(disp)
+		scale := closingRateScale(disp, dSq, poses[i].heading, poses[j].heading, cars[i].Speed, cars[j].Speed)
 		broadPhaseDist := (reach[i] + reach[j]) * scale * scale
-		if distSq(poses[i].pos, poses[j].pos) > broadPhaseDist*broadPhaseDist {
+		if dSq > broadPhaseDist*broadPhaseDist {
 			continue
 		}
 		if !aabbOverlap(fasterAABB, trajAABBs[j]) {
@@ -2046,9 +2056,11 @@ func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction [
 		if otherIndex == carIndex || otherIndex >= len(predictions) || len(predictions[otherIndex]) == 0 {
 			continue
 		}
-		scale := closingRateScale(poses[carIndex].pos, poses[otherIndex].pos, poses[carIndex].heading, poses[otherIndex].heading, cars[carIndex].Speed, cars[otherIndex].Speed)
+		disp := vecSub(poses[otherIndex].pos, poses[carIndex].pos)
+		dSq := vectorLengthSq(disp)
+		scale := closingRateScale(disp, dSq, poses[carIndex].heading, poses[otherIndex].heading, cars[carIndex].Speed, cars[otherIndex].Speed)
 		broadPhaseDist := (reach[carIndex] + reach[otherIndex]) * scale
-		if distSq(poses[carIndex].pos, poses[otherIndex].pos) > broadPhaseDist*broadPhaseDist {
+		if dSq > broadPhaseDist*broadPhaseDist {
 			continue
 		}
 		if !aabbOverlap(testAABB, trajAABBs[otherIndex]) {
@@ -2871,7 +2883,7 @@ func FindForcedLaneChangePathWithGraph(graph *RoadGraph, currentSplineID, destSp
 	if !found {
 		return 0, 0, false
 	}
-	for _, nextIdx := range graph.startsByNode[pointKey(currentSpline.P3)] {
+	for _, nextIdx := range graph.startsByNode[nodeKeyFromVec2(currentSpline.P3)] {
 		nextSpline := graph.splines[nextIdx]
 		if !isSplineUsableForVehicle(nextSpline, vehicleKind) {
 			continue
@@ -3143,7 +3155,7 @@ func nearestLeaderSpeed(carIdx int, cars []Car, carsBySpline map[int][]int, pose
 		if proj <= 0 {
 			continue
 		}
-		euclidean := float32(math.Sqrt(float64(diff.X*diff.X + diff.Y*diff.Y)))
+		euclidean := sqrtf(diff.X*diff.X + diff.Y*diff.Y)
 		if euclidean > followLookaheadM {
 			continue
 		}
@@ -3201,7 +3213,7 @@ func cacheSpline(s *Spline) {
 			prev = pt
 			continue
 		}
-		total += float32(math.Sqrt(float64(distSq(prev, pt))))
+		total += sqrtf(distSq(prev, pt))
 		s.CumLen[i] = total
 		prev = pt
 	}
@@ -3277,7 +3289,7 @@ func curveSpeedAtArcLen(s *Spline, d float32) float32 {
 		return maxCarSpeed
 	}
 	r := 1 / curvature
-	v := float32(math.Sqrt(float64(maxLateralAccelMPS2 * r)))
+	v := sqrtf(maxLateralAccelMPS2 * r)
 	if v > maxCarSpeed {
 		return maxCarSpeed
 	}
@@ -3332,7 +3344,7 @@ func computeTrafficLightSpeedCap(car Car, currentSpline *Spline, graph *RoadGrap
 			result = 0
 			return
 		}
-		allowed := float32(math.Sqrt(float64(2 * decel * adj)))
+		allowed := sqrtf(2 * decel * adj)
 		if allowed < result {
 			result = allowed
 		}
@@ -3370,7 +3382,7 @@ func computeAnticipatoryTargetSpeed(car Car, currentSpline *Spline, graph *RoadG
 		for d := startDist + curveSpeedIntervalM; d <= spline.Length; d += curveSpeedIntervalM {
 			reqSpeed := lookupCurveSpeed(spline, d) * car.CurveSpeedMultiplier
 			rawDistAhead := offset + (d - startDist)
-			allowedNow := float32(math.Sqrt(float64(reqSpeed*reqSpeed + 2*decel*rawDistAhead)))
+			allowedNow := sqrtf(reqSpeed*reqSpeed + 2*decel*rawDistAhead)
 			if allowedNow < result {
 				result = allowedNow
 			}
@@ -3540,7 +3552,7 @@ func ChooseNextSplineOnBestPathWithGraph(graph *RoadGraph, currentSplineID, dest
 	if !ok {
 		return 0, false
 	}
-	candidateIndices := graph.startsByNode[pointKey(currentSpline.P3)]
+	candidateIndices := graph.startsByNode[nodeKeyFromVec2(currentSpline.P3)]
 	if len(candidateIndices) == 0 {
 		return 0, false
 	}
@@ -3596,16 +3608,16 @@ func expandWithCoupledNeighbors(indices []int, splines []Spline, indexByID map[i
 	return expandWithCoupledNeighborRefs(indices, splineRefs, indexByID)
 }
 
-func buildStartsByNodeRefs(splines []*Spline) map[string][]int {
-	startsByNode := map[string][]int{}
+func buildStartsByNodeRefs(splines []*Spline) map[NodeKey][]int {
+	startsByNode := make(map[NodeKey][]int, len(splines))
 	for i := range splines {
-		key := pointKey(splines[i].P0)
+		key := nodeKeyFromVec2(splines[i].P0)
 		startsByNode[key] = append(startsByNode[key], i)
 	}
 	return startsByNode
 }
 
-func buildStartsByNode(splines []Spline) map[string][]int {
+func BuildStartsByNode(splines []Spline) map[NodeKey][]int {
 	splineRefs := make([]*Spline, len(splines))
 	for i := range splines {
 		splineRefs[i] = &splines[i]
@@ -3631,9 +3643,9 @@ func sampleCurvatureAtIndex(samples *[simSamples + 1]Vec2, idx int) float32 {
 		i0, i1, i2 = simSamples-2, simSamples-1, simSamples
 	}
 	A, B, C := samples[i0], samples[i1], samples[i2]
-	ab := float32(math.Sqrt(float64(distSq(A, B))))
-	bc := float32(math.Sqrt(float64(distSq(B, C))))
-	ca := float32(math.Sqrt(float64(distSq(C, A))))
+	ab := sqrtf(distSq(A, B))
+	bc := sqrtf(distSq(B, C))
+	ca := sqrtf(distSq(C, A))
 	denom := ab * bc * ca
 	if denom < 1e-6 {
 		return 0
@@ -4020,7 +4032,7 @@ func normalize(v Vec2) Vec2 {
 	if lenSq <= 1e-9 {
 		return NewVec2(1, 0)
 	}
-	inv := 1 / float32(math.Sqrt(float64(lenSq)))
+	inv := 1 / sqrtf(lenSq)
 	return NewVec2(v.X*inv, v.Y*inv)
 }
 
@@ -4059,10 +4071,25 @@ func absf(v float32) float32 {
 	return v
 }
 
-func pointKey(v Vec2) string {
-	qx := int(math.Round(float64(v.X * 100)))
-	qy := int(math.Round(float64(v.Y * 100)))
-	return fmt.Sprintf("%d:%d", qx, qy)
+func sqrtf(v float32) float32 {
+	return float32(math.Sqrt(float64(v)))
+}
+
+func floorf32(v float32) int32 {
+	i := int32(v)
+	if v < float32(i) {
+		i--
+	}
+	return i
+}
+
+type NodeKey [2]int32
+
+func nodeKeyFromVec2(v Vec2) NodeKey {
+	return NodeKey{
+		int32(math.Round(float64(v.X * 100))),
+		int32(math.Round(float64(v.Y * 100))),
+	}
 }
 
 func randomizedSpawnDelay(spawnPerMinute float32) float32 {

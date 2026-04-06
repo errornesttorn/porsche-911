@@ -2079,8 +2079,9 @@ func findBusStopCandidate(panel RoutePanel, splines []Spline, graph *RoadGraph, 
 	}
 
 	bestDist := thresholdSq
-	bestNodeKey := ""
+	var bestNodeKey simpkg.NodeKey
 	bestPoint := Vec2{}
+	found := false
 	for nodeKey, starts := range startsByNode {
 		if len(starts) == 0 || len(endsByNode[nodeKey]) == 0 {
 			continue
@@ -2091,9 +2092,10 @@ func findBusStopCandidate(panel RoutePanel, splines []Spline, graph *RoadGraph, 
 			bestDist = d
 			bestNodeKey = nodeKey
 			bestPoint = point
+			found = true
 		}
 	}
-	if bestNodeKey == "" {
+	if !found {
 		return BusStop{}, false
 	}
 
@@ -2140,19 +2142,19 @@ func handleBusStopPlacement(panel RoutePanel, splines []Spline, graph *RoadGraph
 	return panel, true
 }
 
-func buildEndsByNode(splines []Spline) map[string][]int {
-	endsByNode := map[string][]int{}
+func buildEndsByNode(splines []Spline) map[simpkg.NodeKey][]int {
+	endsByNode := make(map[simpkg.NodeKey][]int, len(splines))
 	for i, spline := range splines {
-		key := pointKey(spline.P3)
+		key := nodeKeyFromVec2(spline.P3)
 		endsByNode[key] = append(endsByNode[key], i)
 	}
 	return endsByNode
 }
 
-func buildStartsByNode(splines []Spline) map[string][]int {
-	startsByNode := map[string][]int{}
+func buildStartsByNode(splines []Spline) map[simpkg.NodeKey][]int {
+	startsByNode := make(map[simpkg.NodeKey][]int, len(splines))
 	for i, spline := range splines {
-		key := pointKey(spline.P0)
+		key := nodeKeyFromVec2(spline.P0)
 		startsByNode[key] = append(startsByNode[key], i)
 	}
 	return startsByNode
@@ -2164,15 +2166,15 @@ func findDirectionWarnings(splines []Spline) []DirectionWarning {
 		starts int
 		ends   int
 	}
-	nodes := map[string]*nodeCounts{}
+	nodes := map[simpkg.NodeKey]*nodeCounts{}
 	for _, spline := range splines {
-		startKey := pointKey(spline.P0)
+		startKey := nodeKeyFromVec2(spline.P0)
 		if nodes[startKey] == nil {
 			nodes[startKey] = &nodeCounts{point: spline.P0}
 		}
 		nodes[startKey].starts++
 
-		endKey := pointKey(spline.P3)
+		endKey := nodeKeyFromVec2(spline.P3)
 		if nodes[endKey] == nil {
 			nodes[endKey] = &nodeCounts{point: spline.P3}
 		}
@@ -5284,10 +5286,11 @@ func isCtrlDown() bool {
 	return rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)
 }
 
-func pointKey(v Vec2) string {
-	qx := int(math.Round(float64(v.X * 100)))
-	qy := int(math.Round(float64(v.Y * 100)))
-	return fmt.Sprintf("%d:%d", qx, qy)
+func nodeKeyFromVec2(v Vec2) simpkg.NodeKey {
+	return simpkg.NodeKey{
+		int32(math.Round(float64(v.X * 100))),
+		int32(math.Round(float64(v.Y * 100))),
+	}
 }
 
 func pointInRect(p Vec2, r rl.Rectangle) bool {
