@@ -287,6 +287,16 @@ type pathCacheEntry struct {
 	OK      bool
 }
 
+type routeTreeKey struct {
+	DestinationID int
+	VehicleKind   VehicleKind
+}
+
+type routeTreeEntry struct {
+	costs   []float32
+	nextHop []int
+}
+
 type dijkstraItem struct {
 	idx  int
 	dist float32
@@ -307,45 +317,74 @@ func (h *dijkstraHeap) Pop() interface{} {
 }
 
 type RoadGraph struct {
-	splines         []Spline
-	indexByID       map[int]int
-	startsByNode    map[string][]int
-	routeNeighbors  [][]int
-	segmentCosts    []float32
-	pathCacheMu     sync.RWMutex
-	pathCache       map[pathCacheKey]pathCacheEntry
-	pathCacheHits   int
-	pathCacheMisses int
+	splines          []*Spline
+	indexByID        map[int]int
+	startsByNode     map[string][]int
+	routeNeighbors   [][]int
+	reverseNeighbors [][]int
+	segmentCosts     []float32
+	routeCacheMu     sync.RWMutex
+	routeCache       map[routeTreeKey]routeTreeEntry
+	pathCacheHits    int
+	pathCacheMisses  int
 }
 
 func NewRoadGraph(splines []Spline, vehicleCounts map[int]int) *RoadGraph {
-	indexByID := buildSplineIndexByID(splines)
-	startsByNode := buildStartsByNode(splines)
-	routeNeighbors := make([][]int, len(splines))
-	segmentCosts := make([]float32, len(splines))
-	for i, spline := range splines {
-		segmentCosts[i] = segmentTravelCost(spline, vehicleCounts)
-		next := startsByNode[pointKey(spline.P3)]
+	return newRoadGraphFromSlices(splines, nil, vehicleCounts)
+}
+
+func newRoadGraphFromSlices(permanent, temporary []Spline, vehicleCounts map[int]int) *RoadGraph {
+	splineRefs := make([]*Spline, 0, len(permanent)+len(temporary))
+	for i := range permanent {
+		splineRefs = append(splineRefs, &permanent[i])
+	}
+	for i := range temporary {
+		splineRefs = append(splineRefs, &temporary[i])
+	}
+	return newRoadGraphFromSplineRefs(splineRefs, vehicleCounts)
+}
+
+func newRoadGraphFromSplineRefs(splineRefs []*Spline, vehicleCounts map[int]int) *RoadGraph {
+	indexByID := buildSplinePtrIndexByID(splineRefs)
+	startsByNode := buildStartsByNodeRefs(splineRefs)
+	routeNeighbors := make([][]int, len(splineRefs))
+	reverseNeighbors := make([][]int, len(splineRefs))
+	segmentCosts := make([]float32, len(splineRefs))
+	for i := range splineRefs {
+		segmentCosts[i] = segmentTravelCost(splineRefs[i], vehicleCounts)
+		next := startsByNode[pointKey(splineRefs[i].P3)]
 		if len(next) > 0 {
-			routeNeighbors[i] = append([]int(nil), expandWithCoupledNeighbors(next, splines, indexByID)...)
+			routeNeighbors[i] = append([]int(nil), expandWithCoupledNeighborRefs(next, splineRefs, indexByID)...)
+			for _, nextIdx := range routeNeighbors[i] {
+				reverseNeighbors[nextIdx] = append(reverseNeighbors[nextIdx], i)
+			}
 		}
 	}
 	return &RoadGraph{
-		splines:        splines,
-		indexByID:      indexByID,
-		startsByNode:   startsByNode,
-		routeNeighbors: routeNeighbors,
-		segmentCosts:   segmentCosts,
-		pathCache:      make(map[pathCacheKey]pathCacheEntry),
+		splines:          splineRefs,
+		indexByID:        indexByID,
+		startsByNode:     startsByNode,
+		routeNeighbors:   routeNeighbors,
+		reverseNeighbors: reverseNeighbors,
+		segmentCosts:     segmentCosts,
+		routeCache:       make(map[routeTreeKey]routeTreeEntry),
 	}
 }
 
-func (g *RoadGraph) splineByID(id int) (Spline, bool) {
+func (g *RoadGraph) splinePtrByID(id int) (*Spline, bool) {
 	idx, ok := g.indexByID[id]
+	if !ok {
+		return nil, false
+	}
+	return g.splines[idx], true
+}
+
+func (g *RoadGraph) splineByID(id int) (Spline, bool) {
+	spline, ok := g.splinePtrByID(id)
 	if !ok {
 		return Spline{}, false
 	}
-	return g.splines[idx], true
+	return *spline, true
 }
 
 func (g *RoadGraph) SplineByID(id int) (Spline, bool) {
@@ -353,7 +392,7 @@ func (g *RoadGraph) SplineByID(id int) (Spline, bool) {
 }
 
 func (g *RoadGraph) nextPhysicalIndices(currentSplineID int) []int {
-	currentSpline, ok := g.splineByID(currentSplineID)
+	currentSpline, ok := g.splinePtrByID(currentSplineID)
 	if !ok {
 		return nil
 	}
@@ -657,8 +696,7 @@ func (w *World) Step(dt float32) {
 	w.LaneChangesMS = sinceMS(laneChangesStart)
 
 	graphStart = time.Now()
-	allSplines := mergedSplines(w.Splines, w.LaneChangeSplines)
-	allGraph := NewRoadGraph(allSplines, vehicleCounts)
+	allGraph := newRoadGraphFromSlices(w.Splines, w.LaneChangeSplines, vehicleCounts)
 	w.GraphBuildMS += sinceMS(graphStart)
 
 	brakingStart := time.Now()
@@ -1041,10 +1079,10 @@ func ComputeRoutePathWithGraph(route Route, graph *RoadGraph) ([]int, float32, s
 		return nil, 0, "", false
 	}
 	if route.VehicleKind == VehicleCar {
-		if startSpline, ok := graph.splineByID(route.StartSplineID); ok && startSpline.BusOnly {
+		if startSpline, ok := graph.splinePtrByID(route.StartSplineID); ok && startSpline.BusOnly {
 			return nil, 0, "Bus-only splines cannot be used for car routes.", false
 		}
-		if endSpline, ok := graph.splineByID(route.EndSplineID); ok && endSpline.BusOnly {
+		if endSpline, ok := graph.splinePtrByID(route.EndSplineID); ok && endSpline.BusOnly {
 			return nil, 0, "Bus-only splines cannot be used for car routes.", false
 		}
 	}
@@ -1103,8 +1141,8 @@ func PickBestBusStopSpline(graph *RoadGraph, nodeKey string, fromSplineID, toSpl
 	found := false
 	for _, idx := range indices {
 		candidate := graph.splines[idx]
-		_, firstCost, okFirst := FindShortestPathWeightedWithGraph(graph, fromSplineID, candidate.ID, VehicleBus)
-		_, secondCost, okSecond := FindShortestPathWeightedWithGraph(graph, candidate.ID, toSplineID, VehicleBus)
+		firstCost, okFirst := PathCostToDestinationWithGraph(graph, fromSplineID, candidate.ID, VehicleBus)
+		secondCost, okSecond := PathCostToDestinationWithGraph(graph, candidate.ID, toSplineID, VehicleBus)
 		if !okFirst || !okSecond {
 			continue
 		}
@@ -1249,7 +1287,7 @@ func updateRouteSpawning(routes []Route, cars []Car, splines []Spline, dt float3
 }
 
 func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
-	spline, ok := findSplineByID(splines, candidate.CurrentSplineID)
+	spline, ok := findSplinePtrByID(splines, candidate.CurrentSplineID)
 	if !ok {
 		return false
 	}
@@ -1263,7 +1301,7 @@ func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 		if other.CurrentSplineID != candidate.CurrentSplineID {
 			continue
 		}
-		otherSpline, ok := findSplineByID(splines, other.CurrentSplineID)
+		otherSpline, ok := findSplinePtrByID(splines, other.CurrentSplineID)
 		if !ok {
 			continue
 		}
@@ -1330,7 +1368,7 @@ func spawnVehicle(route Route, splines []Spline) Car {
 		OvertakeCooldown:     rand.Float32() * overtakeCooldownS,
 		VehicleKind:          route.VehicleKind,
 	}
-	if spline, ok := findSplineByID(splines, route.StartSplineID); ok {
+	if spline, ok := findSplinePtrByID(splines, route.StartSplineID); ok {
 		frontPos, tangent := sampleSplineAtDistance(spline, 0)
 		car.RearPosition = vecSub(frontPos, vecScale(tangent, car.Length*wheelbaseFrac))
 
@@ -1378,7 +1416,7 @@ func resumeBusRouteAfterStop(route Route, car *Car) {
 	}
 }
 
-func computeBusStopSpeedCap(car Car, route Route, currentSpline Spline, graph *RoadGraph) float32 {
+func computeBusStopSpeedCap(car Car, route Route, currentSpline *Spline, graph *RoadGraph) float32 {
 	if route.VehicleKind != VehicleBus || car.NextBusStopIndex >= len(route.BusStops) {
 		return float32(math.MaxFloat32)
 	}
@@ -1414,7 +1452,7 @@ func computeBusStopSpeedCap(car Car, route Route, currentSpline Spline, graph *R
 	return checkStop(currentSpline.Length - car.DistanceOnSpline)
 }
 
-func shouldBeginBusStopDwell(car Car, route Route, currentSpline Spline, graph *RoadGraph) bool {
+func shouldBeginBusStopDwell(car Car, route Route, currentSpline *Spline, graph *RoadGraph) bool {
 	if route.VehicleKind != VehicleBus || car.BusStopTimer > 0 || car.NextBusStopIndex >= len(route.BusStops) {
 		return false
 	}
@@ -1681,7 +1719,7 @@ func computeBrakingDecisions(cars []Car, graph *RoadGraph, debugSelectedCar int,
 				continue
 			}
 			profile.PrimaryCollisionHits++
-			blameI, blameJ := determineBlame(collision, cars[i], cars[j], graph.splines)
+			blameI, blameJ := determineBlame(collision, cars[i], cars[j], graph)
 			alreadyCollided := collision.AlreadyCollided
 			if blameI && recentlyLeft(cars[i], cars[j].CurrentSplineID) {
 				blameI = false
@@ -1813,7 +1851,7 @@ func computeBasePredictionResults(cars []Car, graph *RoadGraph) []basePrediction
 		for i := start; i < end; i++ {
 			car := cars[i]
 			result := &results[i]
-			if spline, ok := graph.splineByID(car.CurrentSplineID); ok {
+			if spline, ok := graph.splinePtrByID(car.CurrentSplineID); ok {
 				pos, heading := sampleSplineAtDistance(spline, car.DistanceOnSpline)
 				result.pose = carPose{pos: pos, heading: heading}
 			}
@@ -1909,7 +1947,7 @@ func computeHoldProbeResultForCar(i int, cars []Car, graph *RoadGraph, flags []b
 			continue
 		}
 		result.holdCollisionHits++
-		blameI, _ := determineBlame(collision, fasterCar, cars[j], graph.splines)
+		blameI, _ := determineBlame(collision, fasterCar, cars[j], graph)
 		if !blameI || recentlyLeft(fasterCar, cars[j].CurrentSplineID) {
 			continue
 		}
@@ -1964,7 +2002,7 @@ func shouldBrakeForBlamedConflicts(carIndex int, cars []Car, graph *RoadGraph, p
 	}
 
 	car := cars[carIndex]
-	currentSpline, ok := graph.splineByID(car.CurrentSplineID)
+	currentSpline, ok := graph.splinePtrByID(car.CurrentSplineID)
 	if !ok {
 		return true
 	}
@@ -2032,7 +2070,7 @@ func hasBlamedConflictWithPrediction(carIndex int, testCar Car, testPrediction [
 			profile.EscapeCollisionHits++
 		}
 
-		blameTestCar, _ := determineBlame(collision, testCar, otherCar, graph.splines)
+		blameTestCar, _ := determineBlame(collision, testCar, otherCar, graph)
 		if blameTestCar {
 			return true
 		}
@@ -2120,7 +2158,7 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 	sampleCursor.splineID = -1
 
 	if speed <= 0.01 {
-		spline, ok := graph.splineByID(simCar.CurrentSplineID)
+		spline, ok := graph.splinePtrByID(simCar.CurrentSplineID)
 		if !ok {
 			return nil
 		}
@@ -2164,7 +2202,7 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 	}
 
 	for stepIndex := 0; stepIndex <= steps; stepIndex++ {
-		spline, ok := graph.splineByID(simCar.CurrentSplineID)
+		spline, ok := graph.splinePtrByID(simCar.CurrentSplineID)
 		if !ok {
 			break
 		}
@@ -2222,7 +2260,7 @@ func predictCarTrajectory(car Car, graph *RoadGraph, horizon, step float32) []Tr
 
 		move := speed * step
 		for move > 0 && active {
-			currentSpline, ok := graph.splineByID(simCar.CurrentSplineID)
+			currentSpline, ok := graph.splinePtrByID(simCar.CurrentSplineID)
 			if !ok {
 				active = false
 				break
@@ -2338,7 +2376,7 @@ func predictCollision(aSamples, bSamples []TrajectorySample, geomA, geomB collis
 	return CollisionPrediction{}, false
 }
 
-func determineBlame(collision CollisionPrediction, carA, carB Car, splines []Spline) (bool, bool) {
+func determineBlame(collision CollisionPrediction, carA, carB Car, graph *RoadGraph) (bool, bool) {
 	if collision.AlreadyCollided {
 		if headingAngleDegrees(collision.HeadingA, collision.HeadingB) >= 60 {
 			return false, false
@@ -2347,12 +2385,12 @@ func determineBlame(collision CollisionPrediction, carA, carB Car, splines []Spl
 	}
 	if collision.PriorityA != collision.PriorityB {
 		if collision.PriorityA {
-			if normalCarOccupiesPriorityCollisionSpline(carB, collision.SplineAID, splines) {
+			if normalCarOccupiesPriorityCollisionSpline(carB, collision.SplineAID, graph) {
 				return true, false
 			}
 			return false, true
 		}
-		if normalCarOccupiesPriorityCollisionSpline(carA, collision.SplineBID, splines) {
+		if normalCarOccupiesPriorityCollisionSpline(carA, collision.SplineBID, graph) {
 			return false, true
 		}
 		return true, false
@@ -2428,19 +2466,19 @@ func blameLeftCar(collision CollisionPrediction, carA, carB Car) (bool, bool) {
 	return true, false
 }
 
-func normalCarOccupiesPriorityCollisionSpline(car Car, prioritySplineID int, splines []Spline) bool {
+func normalCarOccupiesPriorityCollisionSpline(car Car, prioritySplineID int, graph *RoadGraph) bool {
 	if prioritySplineID < 0 {
 		return false
 	}
-	prioritySpline, ok := findSplineByID(splines, prioritySplineID)
+	prioritySpline, ok := graph.splinePtrByID(prioritySplineID)
 	if !ok || !prioritySpline.Priority {
 		return false
 	}
-	return carHitboxTouchesSpline(car, prioritySpline, splines)
+	return carHitboxTouchesSpline(car, prioritySpline, graph)
 }
 
-func carHitboxTouchesSpline(car Car, targetSpline Spline, splines []Spline) bool {
-	currentSpline, ok := findSplineByID(splines, car.CurrentSplineID)
+func carHitboxTouchesSpline(car Car, targetSpline *Spline, graph *RoadGraph) bool {
+	currentSpline, ok := graph.splinePtrByID(car.CurrentSplineID)
 	if !ok {
 		return false
 	}
@@ -2498,7 +2536,7 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
 			car := cars[i]
 			var candidates []int
 			candidates = append(candidates, carsBySpline[car.CurrentSplineID]...)
-			currentSpline, ok := graph.splineByID(car.CurrentSplineID)
+			currentSpline, ok := graph.splinePtrByID(car.CurrentSplineID)
 			if !ok {
 				lookaheadCandidates[i] = candidates
 				continue
@@ -2511,7 +2549,7 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
 					break
 				}
 				candidates = append(candidates, carsBySpline[nextID]...)
-				nextSpline, ok := graph.splineByID(nextID)
+				nextSpline, ok := graph.splinePtrByID(nextID)
 				if !ok {
 					break
 				}
@@ -2625,7 +2663,7 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 		const frustrateThreshMPS = 10.0 / 3.6
 		if !shouldBrake && followCap < float32(math.MaxFloat32) {
 			frustrated := false
-			if spline, ok := graph.splineByID(car.CurrentSplineID); ok {
+			if spline, ok := graph.splinePtrByID(car.CurrentSplineID); ok {
 				preferredSpeed := car.MaxSpeed * spline.SpeedFactor
 				if spline.SpeedLimitKmh > 0 {
 					if limitMPS := spline.SpeedLimitKmh / 3.6; limitMPS < preferredSpeed {
@@ -2647,7 +2685,7 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 		}
 
 		for {
-			currentSpline, ok := graph.splineByID(car.CurrentSplineID)
+			currentSpline, ok := graph.splinePtrByID(car.CurrentSplineID)
 			if !ok {
 				break
 			}
@@ -2780,7 +2818,7 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 				}
 				nextSplineID = forcedNext
 				car.DesiredLaneSplineID = desiredLane
-				if src, srcOk := graph.splineByID(forcedNext); srcOk {
+				if src, srcOk := graph.splinePtrByID(forcedNext); srcOk {
 					car.DesiredLaneDeadline = maxf(src.Length-laneChangeForcedDistEnd, 0)
 				}
 			}
@@ -2790,11 +2828,11 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 			resumeBusRouteAfterStop(route, &car)
 
 			if car.DesiredLaneSplineID < 0 && car.CurrentSplineID != car.DestinationSplineID {
-				if newSpline, scOk := graph.splineByID(car.CurrentSplineID); scOk && len(newSpline.HardCoupledIDs) > 0 {
-					_, curTime, curOk := FindShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
+				if newSpline, scOk := graph.splinePtrByID(car.CurrentSplineID); scOk && len(newSpline.HardCoupledIDs) > 0 {
+					curTime, curOk := PathCostToDestinationWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
 					if curOk {
 						for _, cid := range newSpline.HardCoupledIDs {
-							_, coupledTime, coupledOk := FindShortestPathWeightedWithGraph(graph, cid, car.DestinationSplineID, car.VehicleKind)
+							coupledTime, coupledOk := PathCostToDestinationWithGraph(graph, cid, car.DestinationSplineID, car.VehicleKind)
 							if coupledOk && curTime-coupledTime >= 20.0 {
 								car.DesiredLaneSplineID = cid
 								car.DesiredLaneDeadline = maxf(newSpline.Length-laneChangeForcedDistEnd, 0)
@@ -2810,14 +2848,14 @@ func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions [
 }
 
 func laneChangeFeasibleAt(src, dst Spline, distance, speed float32) bool {
-	carPos, carHeading := sampleSplineAtDistance(src, distance)
+	carPos, carHeading := sampleSplineAtDistance(&src, distance)
 	halfDist := speed * laneChangeHalfSecs
 	p1 := vecAdd(carPos, vecScale(carHeading, halfDist))
-	_, crossDist := nearestSampleWithDist(dst, p1)
+	_, crossDist := nearestSampleWithDist(&dst, p1)
 	if crossDist == 0 || dst.Length-crossDist < halfDist {
 		return false
 	}
-	_, destHeading := sampleSplineAtDistance(dst, crossDist+halfDist)
+	_, destHeading := sampleSplineAtDistance(&dst, crossDist+halfDist)
 	return carHeading.X*destHeading.X+carHeading.Y*destHeading.Y >= laneChangeDirCos
 }
 
@@ -2829,7 +2867,7 @@ func EffectiveMaxSpeedMPS(spline Spline) float32 {
 }
 
 func FindForcedLaneChangePathWithGraph(graph *RoadGraph, currentSplineID, destSplineID int, vehicleKind VehicleKind) (nextSplineID, desiredSplineID int, ok bool) {
-	currentSpline, found := graph.splineByID(currentSplineID)
+	currentSpline, found := graph.splinePtrByID(currentSplineID)
 	if !found {
 		return 0, 0, false
 	}
@@ -2839,10 +2877,10 @@ func FindForcedLaneChangePathWithGraph(graph *RoadGraph, currentSplineID, destSp
 			continue
 		}
 		for _, coupledID := range nextSpline.HardCoupledIDs {
-			if coupledSpline, ok := graph.splineByID(coupledID); ok && !isSplineUsableForVehicle(coupledSpline, vehicleKind) {
+			if coupledSpline, ok := graph.splinePtrByID(coupledID); ok && !isSplineUsableForVehicle(coupledSpline, vehicleKind) {
 				continue
 			}
-			if _, _, pathOk := FindShortestPathWeightedWithGraph(graph, coupledID, destSplineID, vehicleKind); pathOk {
+			if _, pathOk := PathCostToDestinationWithGraph(graph, coupledID, destSplineID, vehicleKind); pathOk {
 				return nextSpline.ID, coupledID, true
 			}
 		}
@@ -2854,15 +2892,15 @@ func laneChangeLandingDist(car Car, srcSpline, destSpline Spline) (float32, bool
 	if car.Speed < laneChangeMinSpeed {
 		return 0, false
 	}
-	carPos, carHeading := sampleSplineAtDistance(srcSpline, car.DistanceOnSpline)
+	carPos, carHeading := sampleSplineAtDistance(&srcSpline, car.DistanceOnSpline)
 	halfDist := car.Speed * laneChangeHalfSecs
 	p1 := vecAdd(carPos, vecScale(carHeading, halfDist))
-	_, crossDist := nearestSampleWithDist(destSpline, p1)
+	_, crossDist := nearestSampleWithDist(&destSpline, p1)
 	if crossDist == 0 || destSpline.Length-crossDist < halfDist {
 		return 0, false
 	}
 	p3Dist := crossDist + halfDist
-	_, destHeading := sampleSplineAtDistance(destSpline, p3Dist)
+	_, destHeading := sampleSplineAtDistance(&destSpline, p3Dist)
 	if carHeading.X*destHeading.X+carHeading.Y*destHeading.Y < laneChangeDirCos {
 		return 0, false
 	}
@@ -2906,7 +2944,7 @@ func buildLaneChangeBridge(car *Car, destSplineID int, splines []Spline, splineI
 
 	srcSpline := splines[srcIdx]
 	destSpline := splines[destIdx]
-	carPos, carHeading := sampleSplineAtDistance(srcSpline, car.DistanceOnSpline)
+	carPos, carHeading := sampleSplineAtDistance(&srcSpline, car.DistanceOnSpline)
 	effectiveSpeed := car.Speed
 	if forced && effectiveSpeed < laneChangeMinSpeed {
 		effectiveSpeed = laneChangeMinSpeed
@@ -2914,12 +2952,12 @@ func buildLaneChangeBridge(car *Car, destSplineID int, splines []Spline, splineI
 	halfDist := effectiveSpeed * laneChangeHalfSecs
 
 	p1 := vecAdd(carPos, vecScale(carHeading, halfDist))
-	_, crossDist := nearestSampleWithDist(destSpline, p1)
+	_, crossDist := nearestSampleWithDist(&destSpline, p1)
 	if crossDist == 0 || destSpline.Length-crossDist < halfDist {
 		return lcs, false
 	}
 	p3Dist := crossDist + halfDist
-	p3, destHeading := sampleSplineAtDistance(destSpline, p3Dist)
+	p3, destHeading := sampleSplineAtDistance(&destSpline, p3Dist)
 	if carHeading.X*destHeading.X+carHeading.Y*destHeading.Y < laneChangeDirCos {
 		return lcs, false
 	}
@@ -2946,7 +2984,7 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 	carsBySpline := make(map[int][]int, len(cars))
 	for i, car := range cars {
 		if splineIdx, ok := splineIndexByID[car.CurrentSplineID]; ok {
-			pos, heading := sampleSplineAtDistance(splines[splineIdx], car.DistanceOnSpline)
+			pos, heading := sampleSplineAtDistance(&splines[splineIdx], car.DistanceOnSpline)
 			poses[i] = carPose{pos: pos, heading: heading}
 		}
 		carsBySpline[car.CurrentSplineID] = append(carsBySpline[car.CurrentSplineID], i)
@@ -2986,9 +3024,9 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 		car.PreferenceCooldown -= dt
 		if car.PreferenceCooldown <= 0 {
 			car.PreferenceCooldown = preferenceChangeCooldownS
-			_, curPrefTime, curPrefTimeOk := FindShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
+			curPrefTime, curPrefTimeOk := PathCostToDestinationWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
 			for _, destID := range findBetterPreferenceLaneCandidates(*car, splines, splineIndexByID) {
-				_, destTime, pathOk := FindShortestPathWeightedWithGraph(graph, destID, car.DestinationSplineID, car.VehicleKind)
+				destTime, pathOk := PathCostToDestinationWithGraph(graph, destID, car.DestinationSplineID, car.VehicleKind)
 				if !pathOk {
 					continue
 				}
@@ -3015,9 +3053,9 @@ func computeLaneChanges(cars []Car, splines []Spline, lcs []Spline, nextID *int,
 		leaderSpeed, leaderFound := nearestLeaderSpeed(i, cars, carsBySpline, poses)
 		if car.SlowedTimer > overtakeSlowThresholdS && car.OvertakeCooldown <= 0 && (!leaderFound || leaderSpeed <= car.Speed) {
 			car.OvertakeCooldown = overtakeCooldownS
-			_, curOvertakeTime, curOvertakeTimeOk := FindShortestPathWeightedWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
+			curOvertakeTime, curOvertakeTimeOk := PathCostToDestinationWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
 			for _, destID := range findOvertakeLaneCandidates(*car, splines, splineIndexByID) {
-				_, destTime, pathOk := FindShortestPathWeightedWithGraph(graph, destID, car.DestinationSplineID, car.VehicleKind)
+				destTime, pathOk := PathCostToDestinationWithGraph(graph, destID, car.DestinationSplineID, car.VehicleKind)
 				if !pathOk {
 					continue
 				}
@@ -3051,7 +3089,7 @@ func findBetterPreferenceLaneCandidates(car Car, splines []Spline, splineIndexBy
 	if !ok {
 		return nil
 	}
-	currentSpline := splines[idx]
+	currentSpline := &splines[idx]
 	currentPref := currentSpline.LanePreference
 
 	allCoupled := append(append([]int(nil), currentSpline.HardCoupledIDs...), currentSpline.SoftCoupledIDs...)
@@ -3065,7 +3103,7 @@ func findBetterPreferenceLaneCandidates(car Car, splines []Spline, splineIndexBy
 		if !cOk {
 			continue
 		}
-		coupled := splines[cIdx]
+		coupled := &splines[cIdx]
 		if coupled.LanePreference <= 0 {
 			continue
 		}
@@ -3123,7 +3161,7 @@ func findOvertakeLaneCandidates(car Car, splines []Spline, splineIndexByID map[i
 	if !ok {
 		return nil
 	}
-	currentSpline := splines[idx]
+	currentSpline := &splines[idx]
 	currentPref := currentSpline.LanePreference
 	if currentPref <= 0 {
 		return nil
@@ -3247,11 +3285,11 @@ func curveSpeedAtArcLen(s *Spline, d float32) float32 {
 }
 
 func signedCurvatureAtArcLen(s *Spline, d float32) float32 {
-	_, _, curvature := sampleSplineStateAtDistance(*s, d, nil)
+	_, _, curvature := sampleSplineStateAtDistance(s, d, nil)
 	return curvature
 }
 
-func lookupCurveSpeed(spline Spline, dist float32) float32 {
+func lookupCurveSpeed(spline *Spline, dist float32) float32 {
 	if len(spline.CurveSpeedMPS) == 0 {
 		return maxCarSpeed
 	}
@@ -3279,7 +3317,7 @@ func trafficLightShouldStop(l TrafficLight, cycles []TrafficCycle) bool {
 	return false
 }
 
-func computeTrafficLightSpeedCap(car Car, currentSpline Spline, graph *RoadGraph, lights []TrafficLight, cycles []TrafficCycle) float32 {
+func computeTrafficLightSpeedCap(car Car, currentSpline *Spline, graph *RoadGraph, lights []TrafficLight, cycles []TrafficCycle) float32 {
 	decel := car.Accel * 1.5
 	result := float32(math.MaxFloat32)
 	remaining := currentSpline.Length - car.DistanceOnSpline
@@ -3310,7 +3348,7 @@ func computeTrafficLightSpeedCap(car Car, currentSpline Spline, graph *RoadGraph
 	if remaining < lookahead {
 		nextID, ok := ChooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, car.DestinationSplineID, car.VehicleKind)
 		if ok {
-			if _, ok2 := graph.splineByID(nextID); ok2 {
+			if _, ok2 := graph.splinePtrByID(nextID); ok2 {
 				for _, l := range lights {
 					if l.SplineID != nextID || !trafficLightShouldStop(l, cycles) {
 						continue
@@ -3324,11 +3362,11 @@ func computeTrafficLightSpeedCap(car Car, currentSpline Spline, graph *RoadGraph
 	return result
 }
 
-func computeAnticipatoryTargetSpeed(car Car, currentSpline Spline, graph *RoadGraph) float32 {
+func computeAnticipatoryTargetSpeed(car Car, currentSpline *Spline, graph *RoadGraph) float32 {
 	decel := car.Accel * 1.5
 	result := float32(math.MaxFloat32)
 
-	checkSpline := func(spline Spline, startDist, offset float32) {
+	checkSpline := func(spline *Spline, startDist, offset float32) {
 		for d := startDist + curveSpeedIntervalM; d <= spline.Length; d += curveSpeedIntervalM {
 			reqSpeed := lookupCurveSpeed(spline, d) * car.CurveSpeedMultiplier
 			rawDistAhead := offset + (d - startDist)
@@ -3343,7 +3381,7 @@ func computeAnticipatoryTargetSpeed(car Car, currentSpline Spline, graph *RoadGr
 
 	remaining := currentSpline.Length - car.DistanceOnSpline
 	if nextID, ok := ChooseNextSplineOnBestPathWithGraph(graph, currentSpline.ID, car.DestinationSplineID, car.VehicleKind); ok {
-		if nextSpline, ok2 := graph.splineByID(nextID); ok2 {
+		if nextSpline, ok2 := graph.splinePtrByID(nextID); ok2 {
 			checkSpline(nextSpline, 0, remaining)
 		}
 	}
@@ -3359,104 +3397,146 @@ func BuildVehicleCounts(cars []Car) map[int]int {
 	return counts
 }
 
-func isSplineUsableForVehicle(s Spline, vehicleKind VehicleKind) bool {
+func isSplineUsableForVehicle(s *Spline, vehicleKind VehicleKind) bool {
 	return vehicleKind == VehicleBus || !s.BusOnly
+}
+
+const routeCostInf = float32(1e30)
+
+func buildRouteTree(graph *RoadGraph, destIdx int, vehicleKind VehicleKind) routeTreeEntry {
+	costs := make([]float32, len(graph.splines))
+	nextHop := make([]int, len(graph.splines))
+	for i := range costs {
+		costs[i] = routeCostInf
+		nextHop[i] = -1
+	}
+	if destIdx < 0 || destIdx >= len(graph.splines) {
+		return routeTreeEntry{costs: costs, nextHop: nextHop}
+	}
+
+	destSpline := graph.splines[destIdx]
+	costs[destIdx] = graph.segmentCosts[destIdx]
+	nextHop[destIdx] = destIdx
+	if vehicleKind == VehicleCar && destSpline.BusOnly {
+		return routeTreeEntry{costs: costs, nextHop: nextHop}
+	}
+
+	pq := dijkstraHeap{{idx: destIdx, dist: costs[destIdx]}}
+	heap.Init(&pq)
+	for pq.Len() > 0 {
+		item := heap.Pop(&pq).(dijkstraItem)
+		if item.dist != costs[item.idx] {
+			continue
+		}
+		for _, prevIdx := range graph.reverseNeighbors[item.idx] {
+			if vehicleKind == VehicleCar && graph.splines[prevIdx].BusOnly {
+				continue
+			}
+			alt := item.dist + graph.segmentCosts[prevIdx]
+			if alt < costs[prevIdx] {
+				costs[prevIdx] = alt
+				nextHop[prevIdx] = item.idx
+				heap.Push(&pq, dijkstraItem{idx: prevIdx, dist: alt})
+			}
+		}
+	}
+
+	return routeTreeEntry{costs: costs, nextHop: nextHop}
+}
+
+func (g *RoadGraph) routeTree(destinationSplineID int, vehicleKind VehicleKind) (routeTreeEntry, bool) {
+	if g == nil || len(g.splines) == 0 {
+		return routeTreeEntry{}, false
+	}
+	key := routeTreeKey{DestinationID: destinationSplineID, VehicleKind: vehicleKind}
+
+	g.routeCacheMu.RLock()
+	entry, ok := g.routeCache[key]
+	g.routeCacheMu.RUnlock()
+	if ok {
+		g.routeCacheMu.Lock()
+		g.pathCacheHits++
+		g.routeCacheMu.Unlock()
+		return entry, true
+	}
+
+	destIdx, ok := g.indexByID[destinationSplineID]
+	if !ok {
+		g.routeCacheMu.Lock()
+		g.pathCacheMisses++
+		g.routeCacheMu.Unlock()
+		return routeTreeEntry{}, false
+	}
+
+	g.routeCacheMu.Lock()
+	if entry, ok = g.routeCache[key]; ok {
+		g.pathCacheHits++
+		g.routeCacheMu.Unlock()
+		return entry, true
+	}
+	g.pathCacheMisses++
+	entry = buildRouteTree(g, destIdx, vehicleKind)
+	g.routeCache[key] = entry
+	g.routeCacheMu.Unlock()
+	return entry, true
 }
 
 func FindShortestPathWeightedWithGraph(graph *RoadGraph, startSplineID, endSplineID int, vehicleKind VehicleKind) ([]int, float32, bool) {
 	if graph == nil || len(graph.splines) == 0 {
 		return nil, 0, false
 	}
-	key := pathCacheKey{StartID: startSplineID, EndID: endSplineID, VehicleKind: vehicleKind}
-	graph.pathCacheMu.RLock()
-	cached, ok := graph.pathCache[key]
-	graph.pathCacheMu.RUnlock()
-	if ok {
-		graph.pathCacheMu.Lock()
-		graph.pathCacheHits++
-		graph.pathCacheMu.Unlock()
-		return append([]int(nil), cached.PathIDs...), cached.Cost, cached.OK
-	}
-	graph.pathCacheMu.Lock()
-	graph.pathCacheMisses++
-	graph.pathCacheMu.Unlock()
 	startIdx, okStart := graph.indexByID[startSplineID]
 	endIdx, okEnd := graph.indexByID[endSplineID]
 	if !okStart || !okEnd {
-		graph.pathCacheMu.Lock()
-		graph.pathCache[key] = pathCacheEntry{OK: false}
-		graph.pathCacheMu.Unlock()
 		return nil, 0, false
 	}
 	if vehicleKind == VehicleCar && startIdx != endIdx && graph.splines[endIdx].BusOnly {
-		graph.pathCacheMu.Lock()
-		graph.pathCache[key] = pathCacheEntry{OK: false}
-		graph.pathCacheMu.Unlock()
 		return nil, 0, false
 	}
 
-	const inf = float32(1e30)
-	dist := make([]float32, len(graph.splines))
-	prev := make([]int, len(graph.splines))
-	for i := range dist {
-		dist[i] = inf
-		prev[i] = -1
-	}
-	dist[startIdx] = graph.segmentCosts[startIdx]
-	pq := dijkstraHeap{{idx: startIdx, dist: dist[startIdx]}}
-	heap.Init(&pq)
-
-	for pq.Len() > 0 {
-		item := heap.Pop(&pq).(dijkstraItem)
-		if item.dist != dist[item.idx] {
-			continue
-		}
-		if item.idx == endIdx {
-			break
-		}
-		for _, nextIdx := range graph.routeNeighbors[item.idx] {
-			if vehicleKind == VehicleCar && graph.splines[nextIdx].BusOnly {
-				continue
-			}
-			alt := item.dist + graph.segmentCosts[nextIdx]
-			if alt < dist[nextIdx] {
-				dist[nextIdx] = alt
-				prev[nextIdx] = item.idx
-				heap.Push(&pq, dijkstraItem{idx: nextIdx, dist: alt})
-			}
-		}
-	}
-
-	if dist[endIdx] >= inf/2 {
-		graph.pathCacheMu.Lock()
-		graph.pathCache[key] = pathCacheEntry{OK: false}
-		graph.pathCacheMu.Unlock()
+	tree, ok := graph.routeTree(endSplineID, vehicleKind)
+	if !ok || startIdx >= len(tree.costs) || tree.costs[startIdx] >= routeCostInf/2 {
 		return nil, 0, false
 	}
 
-	pathIndices := make([]int, 0, 16)
-	for at := endIdx; at >= 0; at = prev[at] {
-		pathIndices = append(pathIndices, at)
+	pathIDs := make([]int, 0, 16)
+	for at, steps := startIdx, 0; ; steps++ {
+		if at < 0 || at >= len(graph.splines) || steps > len(graph.splines) {
+			return nil, 0, false
+		}
+		pathIDs = append(pathIDs, graph.splines[at].ID)
+		if at == endIdx {
+			return pathIDs, tree.costs[startIdx], true
+		}
+		nextIdx := tree.nextHop[at]
+		if nextIdx < 0 || nextIdx == at {
+			return nil, 0, false
+		}
+		at = nextIdx
 	}
-	for i, j := 0, len(pathIndices)-1; i < j; i, j = i+1, j-1 {
-		pathIndices[i], pathIndices[j] = pathIndices[j], pathIndices[i]
+}
+
+func PathCostToDestinationWithGraph(graph *RoadGraph, startSplineID, endSplineID int, vehicleKind VehicleKind) (float32, bool) {
+	if graph == nil || len(graph.splines) == 0 {
+		return 0, false
 	}
-	pathIDs := make([]int, 0, len(pathIndices))
-	for _, idx := range pathIndices {
-		pathIDs = append(pathIDs, graph.splines[idx].ID)
+	startIdx, okStart := graph.indexByID[startSplineID]
+	endIdx, okEnd := graph.indexByID[endSplineID]
+	if !okStart || !okEnd {
+		return 0, false
 	}
-	graph.pathCacheMu.Lock()
-	graph.pathCache[key] = pathCacheEntry{
-		PathIDs: append([]int(nil), pathIDs...),
-		Cost:    dist[endIdx],
-		OK:      true,
+	if vehicleKind == VehicleCar && startIdx != endIdx && graph.splines[endIdx].BusOnly {
+		return 0, false
 	}
-	graph.pathCacheMu.Unlock()
-	return pathIDs, dist[endIdx], true
+	tree, ok := graph.routeTree(endSplineID, vehicleKind)
+	if !ok || startIdx >= len(tree.costs) || tree.costs[startIdx] >= routeCostInf/2 {
+		return 0, false
+	}
+	return tree.costs[startIdx], true
 }
 
 func ChooseNextSplineOnBestPathWithGraph(graph *RoadGraph, currentSplineID, destinationSplineID int, vehicleKind VehicleKind) (int, bool) {
-	currentSpline, ok := graph.splineByID(currentSplineID)
+	currentSpline, ok := graph.splinePtrByID(currentSplineID)
 	if !ok {
 		return 0, false
 	}
@@ -3464,19 +3544,23 @@ func ChooseNextSplineOnBestPathWithGraph(graph *RoadGraph, currentSplineID, dest
 	if len(candidateIndices) == 0 {
 		return 0, false
 	}
+	tree, ok := graph.routeTree(destinationSplineID, vehicleKind)
+	if !ok {
+		return 0, false
+	}
 
 	bestSplineID := 0
-	bestCost := float32(1e30)
+	bestCost := routeCostInf
 	found := false
 	for _, idx := range candidateIndices {
 		candidate := graph.splines[idx]
 		if !isSplineUsableForVehicle(candidate, vehicleKind) {
 			continue
 		}
-		_, cost, ok := FindShortestPathWeightedWithGraph(graph, candidate.ID, destinationSplineID, vehicleKind)
-		if !ok {
+		if idx >= len(tree.costs) || tree.costs[idx] >= routeCostInf/2 {
 			continue
 		}
+		cost := tree.costs[idx]
 		if !found || cost < bestCost {
 			bestCost = cost
 			bestSplineID = candidate.ID
@@ -3486,7 +3570,7 @@ func ChooseNextSplineOnBestPathWithGraph(graph *RoadGraph, currentSplineID, dest
 	return bestSplineID, found
 }
 
-func expandWithCoupledNeighbors(indices []int, splines []Spline, indexByID map[int]int) []int {
+func expandWithCoupledNeighborRefs(indices []int, splines []*Spline, indexByID map[int]int) []int {
 	seen := make(map[int]bool, len(indices)*2)
 	result := make([]int, 0, len(indices)*2)
 	for _, idx := range indices {
@@ -3504,20 +3588,36 @@ func expandWithCoupledNeighbors(indices []int, splines []Spline, indexByID map[i
 	return result
 }
 
-func buildStartsByNode(splines []Spline) map[string][]int {
+func expandWithCoupledNeighbors(indices []int, splines []Spline, indexByID map[int]int) []int {
+	splineRefs := make([]*Spline, len(splines))
+	for i := range splines {
+		splineRefs[i] = &splines[i]
+	}
+	return expandWithCoupledNeighborRefs(indices, splineRefs, indexByID)
+}
+
+func buildStartsByNodeRefs(splines []*Spline) map[string][]int {
 	startsByNode := map[string][]int{}
-	for i, spline := range splines {
-		key := pointKey(spline.P0)
+	for i := range splines {
+		key := pointKey(splines[i].P0)
 		startsByNode[key] = append(startsByNode[key], i)
 	}
 	return startsByNode
 }
 
-func segmentTravelCost(s Spline, vehicleCounts map[int]int) float32 {
+func buildStartsByNode(splines []Spline) map[string][]int {
+	splineRefs := make([]*Spline, len(splines))
+	for i := range splines {
+		splineRefs[i] = &splines[i]
+	}
+	return buildStartsByNodeRefs(splineRefs)
+}
+
+func segmentTravelCost(s *Spline, vehicleCounts map[int]int) float32 {
 	return s.TravelTimeS + float32(vehicleCounts[s.ID])*2.0
 }
 
-func sampleSplineAtDistance(s Spline, distance float32) (Vec2, Vec2) {
+func sampleSplineAtDistance(s *Spline, distance float32) (Vec2, Vec2) {
 	pos, tangent, _ := sampleSplineStateAtDistance(s, distance, nil)
 	return pos, tangent
 }
@@ -3542,7 +3642,7 @@ func sampleCurvatureAtIndex(samples *[simSamples + 1]Vec2, idx int) float32 {
 	return 2 * cross / denom
 }
 
-func splineSegmentIndex(s Spline, distance float32, cursor *splineSampleCursor) int {
+func splineSegmentIndex(s *Spline, distance float32, cursor *splineSampleCursor) int {
 	if s.Length <= 0 {
 		return 0
 	}
@@ -3576,7 +3676,7 @@ func splineSegmentIndex(s Spline, distance float32, cursor *splineSampleCursor) 
 	return idx
 }
 
-func sampleSplineStateAtDistance(s Spline, distance float32, cursor *splineSampleCursor) (Vec2, Vec2, float32) {
+func sampleSplineStateAtDistance(s *Spline, distance float32, cursor *splineSampleCursor) (Vec2, Vec2, float32) {
 	if s.Length <= 0 {
 		return s.P0, NewVec2(1, 0), 0
 	}
@@ -3605,7 +3705,7 @@ func sampleSplineStateAtDistance(s Spline, distance float32, cursor *splineSampl
 }
 
 func SampleSplineAtDistance(s Spline, distance float32) (Vec2, Vec2) {
-	return sampleSplineAtDistance(s, distance)
+	return sampleSplineAtDistance(&s, distance)
 }
 
 func bezierDerivative(s Spline, t float32) Vec2 {
@@ -3630,8 +3730,16 @@ func bezierPoint(p0, p1, p2, p3 Vec2, t float32) Vec2 {
 
 func buildSplineIndexByID(splines []Spline) map[int]int {
 	m := make(map[int]int, len(splines))
-	for i, s := range splines {
-		m[s.ID] = i
+	for i := range splines {
+		m[splines[i].ID] = i
+	}
+	return m
+}
+
+func buildSplinePtrIndexByID(splines []*Spline) map[int]int {
+	m := make(map[int]int, len(splines))
+	for i := range splines {
+		m[splines[i].ID] = i
 	}
 	return m
 }
@@ -3640,13 +3748,21 @@ func BuildSplineIndexByID(splines []Spline) map[int]int {
 	return buildSplineIndexByID(splines)
 }
 
-func findSplineByID(splines []Spline, id int) (Spline, bool) {
-	for _, s := range splines {
-		if s.ID == id {
-			return s, true
+func findSplinePtrByID(splines []Spline, id int) (*Spline, bool) {
+	for i := range splines {
+		if splines[i].ID == id {
+			return &splines[i], true
 		}
 	}
-	return Spline{}, false
+	return nil, false
+}
+
+func findSplineByID(splines []Spline, id int) (Spline, bool) {
+	spline, ok := findSplinePtrByID(splines, id)
+	if !ok {
+		return Spline{}, false
+	}
+	return *spline, true
 }
 
 func FindSplineByID(splines []Spline, id int) (Spline, bool) {
@@ -3690,7 +3806,7 @@ func RemoveCarsForRoute(cars []Car, routeID int) []Car {
 	return kept
 }
 
-func nearestSampleOnSpline(spline Spline, pos Vec2) Vec2 {
+func nearestSampleOnSpline(spline *Spline, pos Vec2) Vec2 {
 	best := spline.Samples[0]
 	bestDSq := distSq(best, pos)
 	for i := 1; i <= simSamples; i++ {
@@ -3703,7 +3819,7 @@ func nearestSampleOnSpline(spline Spline, pos Vec2) Vec2 {
 	return best
 }
 
-func nearestSampleWithDist(spline Spline, pos Vec2) (point Vec2, dist float32) {
+func nearestSampleWithDist(spline *Spline, pos Vec2) (point Vec2, dist float32) {
 	point = spline.Samples[0]
 	dist = spline.CumLen[0]
 	bestDSq := distSq(point, pos)
