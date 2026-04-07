@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 type VehicleKind int
@@ -260,6 +261,17 @@ type UpdateCarsProfile struct {
 	RemovedCars    int
 }
 
+type FollowingProfile struct {
+	Cars int
+
+	PoseMS      float64
+	IndexMS     float64
+	CandidateMS float64
+	ScanMS      float64
+
+	CandidateRefs int
+}
+
 type holdProbeCarResult struct {
 	shouldHold                bool
 	holdLink                  DebugBlameLink
@@ -344,6 +356,15 @@ type RoadGraph struct {
 	pathCacheMisses  atomic.Int64
 }
 
+type roadGraphTopology struct {
+	splines          []*Spline
+	indexByID        map[int]int
+	startsByNode     map[NodeKey][]int
+	endsByNode       map[NodeKey][]int
+	routeNeighbors   [][]int
+	reverseNeighbors [][]int
+}
+
 func NewRoadGraph(splines []Spline, vehicleCounts map[int]int) *RoadGraph {
 	return newRoadGraphFromSlices(splines, nil, vehicleCounts)
 }
@@ -356,17 +377,16 @@ func newRoadGraphFromSlices(permanent, temporary []Spline, vehicleCounts map[int
 	for i := range temporary {
 		splineRefs = append(splineRefs, &temporary[i])
 	}
-	return newRoadGraphFromSplineRefs(splineRefs, vehicleCounts)
+	return newRoadGraphFromTopology(buildRoadGraphTopologyFromSplineRefs(splineRefs), vehicleCounts)
 }
 
-func newRoadGraphFromSplineRefs(splineRefs []*Spline, vehicleCounts map[int]int) *RoadGraph {
+func buildRoadGraphTopologyFromSplineRefs(splineRefs []*Spline) *roadGraphTopology {
 	indexByID := buildSplinePtrIndexByID(splineRefs)
 	startsByNode := buildStartsByNodeRefs(splineRefs)
+	endsByNode := buildEndsByNodeRefs(splineRefs)
 	routeNeighbors := make([][]int, len(splineRefs))
 	reverseNeighbors := make([][]int, len(splineRefs))
-	segmentCosts := make([]float32, len(splineRefs))
 	for i := range splineRefs {
-		segmentCosts[i] = segmentTravelCost(splineRefs[i], vehicleCounts)
 		next := startsByNode[nodeKeyFromVec2(splineRefs[i].P3)]
 		if len(next) > 0 {
 			routeNeighbors[i] = append([]int(nil), expandWithCoupledNeighborRefs(next, splineRefs, indexByID)...)
@@ -375,12 +395,27 @@ func newRoadGraphFromSplineRefs(splineRefs []*Spline, vehicleCounts map[int]int)
 			}
 		}
 	}
-	return &RoadGraph{
+	return &roadGraphTopology{
 		splines:          splineRefs,
 		indexByID:        indexByID,
 		startsByNode:     startsByNode,
+		endsByNode:       endsByNode,
 		routeNeighbors:   routeNeighbors,
 		reverseNeighbors: reverseNeighbors,
+	}
+}
+
+func newRoadGraphFromTopology(topology *roadGraphTopology, vehicleCounts map[int]int) *RoadGraph {
+	segmentCosts := make([]float32, len(topology.splines))
+	for i := range topology.splines {
+		segmentCosts[i] = segmentTravelCost(topology.splines[i], vehicleCounts)
+	}
+	return &RoadGraph{
+		splines:          topology.splines,
+		indexByID:        topology.indexByID,
+		startsByNode:     topology.startsByNode,
+		routeNeighbors:   topology.routeNeighbors,
+		reverseNeighbors: topology.reverseNeighbors,
 		segmentCosts:     segmentCosts,
 		routeCache:       make(map[routeTreeKey]routeTreeEntry),
 	}
@@ -479,6 +514,7 @@ type RuntimeState struct {
 	AllPathHits          int
 	AllPathMisses        int
 	BrakingProfile       BrakingProfile
+	FollowingProfile     FollowingProfile
 	UpdateCarsProfile    UpdateCarsProfile
 
 	RouteVisualsMS float64
@@ -487,6 +523,11 @@ type RuntimeState struct {
 	BrakingMS      float64
 	FollowMS       float64
 	UpdateCarsMS   float64
+
+	permanentGraphTopology    *roadGraphTopology
+	permanentGraphTopologyKey uint64
+	permanentGraphSplineAddr  uintptr
+	permanentGraphSplineCount int
 }
 
 type World struct {
@@ -614,6 +655,10 @@ func (w World) Clone() World {
 	clone.DebugBlameLinks = cloneDebugBlameLinks(w.DebugBlameLinks)
 	clone.HoldBlameLinks = cloneDebugBlameLinks(w.HoldBlameLinks)
 	clone.DebugCandidateLinks = cloneDebugBlameLinks(w.DebugCandidateLinks)
+	clone.permanentGraphTopology = nil
+	clone.permanentGraphTopologyKey = 0
+	clone.permanentGraphSplineAddr = 0
+	clone.permanentGraphSplineCount = 0
 	return clone
 }
 
@@ -720,6 +765,145 @@ func parallelFor(n int, fn func(start, end int)) {
 	wg.Wait()
 }
 
+func splineSliceAddr(splines []Spline) uintptr {
+	if len(splines) == 0 {
+		return 0
+	}
+	return uintptr(unsafe.Pointer(&splines[0]))
+}
+
+func hashFloat32Bits(h uint64, v float32) uint64 {
+	const prime = 1099511628211
+	h ^= uint64(math.Float32bits(v))
+	return h * prime
+}
+
+func hashIntBits(h uint64, v int) uint64 {
+	const prime = 1099511628211
+	h ^= uint64(uint32(v))
+	return h * prime
+}
+
+func splineTopologyKey(splines []Spline) uint64 {
+	const offset = 1469598103934665603
+	h := uint64(offset)
+	h = hashIntBits(h, len(splines))
+	for i := range splines {
+		s := &splines[i]
+		h = hashIntBits(h, s.ID)
+		h = hashFloat32Bits(h, s.P0.X)
+		h = hashFloat32Bits(h, s.P0.Y)
+		h = hashFloat32Bits(h, s.P3.X)
+		h = hashFloat32Bits(h, s.P3.Y)
+		h = hashIntBits(h, len(s.HardCoupledIDs))
+		for _, coupledID := range s.HardCoupledIDs {
+			h = hashIntBits(h, coupledID)
+		}
+	}
+	return h
+}
+
+func cloneIndexMap(src map[NodeKey][]int) map[NodeKey][]int {
+	if len(src) == 0 {
+		return make(map[NodeKey][]int)
+	}
+	dst := make(map[NodeKey][]int, len(src))
+	for key, indices := range src {
+		dst[key] = append([]int(nil), indices...)
+	}
+	return dst
+}
+
+func buildMergedRoadGraphFromTopology(base *roadGraphTopology, temporary []Spline, vehicleCounts map[int]int) *RoadGraph {
+	if len(temporary) == 0 {
+		return newRoadGraphFromTopology(base, vehicleCounts)
+	}
+
+	baseCount := len(base.splines)
+	total := baseCount + len(temporary)
+	splineRefs := make([]*Spline, 0, total)
+	splineRefs = append(splineRefs, base.splines...)
+	for i := range temporary {
+		splineRefs = append(splineRefs, &temporary[i])
+	}
+
+	indexByID := make(map[int]int, total)
+	for id, idx := range base.indexByID {
+		indexByID[id] = idx
+	}
+	startsByNode := cloneIndexMap(base.startsByNode)
+	endsByNode := cloneIndexMap(base.endsByNode)
+	for i := range temporary {
+		idx := baseCount + i
+		spline := &temporary[i]
+		indexByID[spline.ID] = idx
+		startKey := nodeKeyFromVec2(spline.P0)
+		endKey := nodeKeyFromVec2(spline.P3)
+		startsByNode[startKey] = append(startsByNode[startKey], idx)
+		endsByNode[endKey] = append(endsByNode[endKey], idx)
+	}
+
+	routeNeighbors := make([][]int, total)
+	copy(routeNeighbors, base.routeNeighbors)
+	recompute := make([]bool, total)
+	for i := range temporary {
+		idx := baseCount + i
+		recompute[idx] = true
+		startKey := nodeKeyFromVec2(temporary[i].P0)
+		for _, srcIdx := range endsByNode[startKey] {
+			recompute[srcIdx] = true
+		}
+	}
+	for idx, needs := range recompute {
+		if !needs {
+			continue
+		}
+		next := startsByNode[nodeKeyFromVec2(splineRefs[idx].P3)]
+		if len(next) == 0 {
+			routeNeighbors[idx] = nil
+			continue
+		}
+		routeNeighbors[idx] = append([]int(nil), expandWithCoupledNeighborRefs(next, splineRefs, indexByID)...)
+	}
+
+	reverseNeighbors := make([][]int, total)
+	for fromIdx, next := range routeNeighbors {
+		for _, toIdx := range next {
+			reverseNeighbors[toIdx] = append(reverseNeighbors[toIdx], fromIdx)
+		}
+	}
+
+	return newRoadGraphFromTopology(&roadGraphTopology{
+		splines:          splineRefs,
+		indexByID:        indexByID,
+		startsByNode:     startsByNode,
+		endsByNode:       endsByNode,
+		routeNeighbors:   routeNeighbors,
+		reverseNeighbors: reverseNeighbors,
+	}, vehicleCounts)
+}
+
+func (w *World) permanentRoadGraphTopology() *roadGraphTopology {
+	key := splineTopologyKey(w.Splines)
+	addr := splineSliceAddr(w.Splines)
+	if w.permanentGraphTopology != nil &&
+		w.permanentGraphTopologyKey == key &&
+		w.permanentGraphSplineAddr == addr &&
+		w.permanentGraphSplineCount == len(w.Splines) {
+		return w.permanentGraphTopology
+	}
+
+	splineRefs := make([]*Spline, len(w.Splines))
+	for i := range w.Splines {
+		splineRefs[i] = &w.Splines[i]
+	}
+	w.permanentGraphTopology = buildRoadGraphTopologyFromSplineRefs(splineRefs)
+	w.permanentGraphTopologyKey = key
+	w.permanentGraphSplineAddr = addr
+	w.permanentGraphSplineCount = len(w.Splines)
+	return w.permanentGraphTopology
+}
+
 func (w *World) Step(dt float32) {
 	w.RouteVisualsMS = 0
 	w.LaneChangesMS = 0
@@ -728,11 +912,13 @@ func (w *World) Step(dt float32) {
 	w.FollowMS = 0
 	w.UpdateCarsMS = 0
 	w.BrakingProfile = BrakingProfile{}
+	w.FollowingProfile = FollowingProfile{}
 	w.UpdateCarsProfile = UpdateCarsProfile{}
 
 	graphStart := time.Now()
 	vehicleCounts := BuildVehicleCounts(w.Cars)
-	baseGraph := NewRoadGraph(w.Splines, vehicleCounts)
+	permanentTopology := w.permanentRoadGraphTopology()
+	baseGraph := newRoadGraphFromTopology(permanentTopology, vehicleCounts)
 	w.GraphBuildMS += sinceMS(graphStart)
 
 	w.RouteVisualsTimer -= dt
@@ -748,7 +934,7 @@ func (w *World) Step(dt float32) {
 	w.LaneChangesMS = sinceMS(laneChangesStart)
 
 	graphStart = time.Now()
-	allGraph := newRoadGraphFromSlices(w.Splines, w.LaneChangeSplines, vehicleCounts)
+	allGraph := buildMergedRoadGraphFromTopology(permanentTopology, w.LaneChangeSplines, vehicleCounts)
 	w.GraphBuildMS += sinceMS(graphStart)
 
 	debugSelectedCar := findCarIndexByID(w.Cars, w.DebugSelectedCarID)
@@ -756,6 +942,7 @@ func (w *World) Step(dt float32) {
 	var debugBlameLinks, holdBlameLinks, candidateLinks []DebugBlameLink
 	var brakingProfile BrakingProfile
 	var followCaps []float32
+	var followingProfile FollowingProfile
 	var brakingMS, followMS float64
 
 	var wgBrakeFollow sync.WaitGroup
@@ -769,13 +956,14 @@ func (w *World) Step(dt float32) {
 	go func() {
 		defer wgBrakeFollow.Done()
 		followStart := time.Now()
-		followCaps = computeFollowingSpeedCaps(w.Cars, allGraph)
+		followCaps, followingProfile = computeFollowingSpeedCaps(w.Cars, allGraph)
 		followMS = sinceMS(followStart)
 	}()
 	wgBrakeFollow.Wait()
 	w.BrakingMS = brakingMS
 	w.BrakingProfile = brakingProfile
 	w.FollowMS = followMS
+	w.FollowingProfile = followingProfile
 
 	updateCarsStart := time.Now()
 	var indexRemap []int
@@ -2656,13 +2844,15 @@ func carHitboxTouchesSpline(car Car, targetSpline *Spline, graph *RoadGraph) boo
 	return false
 }
 
-func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
+func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) ([]float32, FollowingProfile) {
 	caps := make([]float32, len(cars))
+	profile := FollowingProfile{Cars: len(cars)}
 	for i := range caps {
 		caps[i] = math.MaxFloat32
 	}
 
 	poses := make([]carPose, len(cars))
+	poseStart := time.Now()
 	parallelFor(len(cars), func(start, end int) {
 		for i := start; i < end; i++ {
 			car := cars[i]
@@ -2674,17 +2864,18 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
 			poses[i] = carPose{p, h}
 		}
 	})
+	profile.PoseMS = sinceMS(poseStart)
 
-	// Inverted index: spline ID -> car indices sitting on that spline.
+	indexStart := time.Now()
 	carsBySpline := make(map[int][]int, len(graph.splines))
 	for i := range cars {
 		sid := cars[i].CurrentSplineID
 		carsBySpline[sid] = append(carsBySpline[sid], i)
 	}
+	profile.IndexMS = sinceMS(indexStart)
 
-	// For each car, walk its lookahead splines and collect candidate
-	// car indices directly, replacing the per-car map[int]bool allocation.
 	lookaheadCandidates := make([][]int, len(cars))
+	candidateStart := time.Now()
 	parallelFor(len(cars), func(start, end int) {
 		for i := start; i < end; i++ {
 			car := cars[i]
@@ -2713,9 +2904,14 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
 			lookaheadCandidates[i] = candidates
 		}
 	})
+	for i := range lookaheadCandidates {
+		profile.CandidateRefs += len(lookaheadCandidates[i])
+	}
+	profile.CandidateMS = sinceMS(candidateStart)
 
 	followLookaheadSq := followLookaheadM * followLookaheadM
 
+	scanStart := time.Now()
 	parallelFor(len(cars), func(start, end int) {
 		for i := start; i < end; i++ {
 			car := cars[i]
@@ -2761,7 +2957,8 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
 			caps[i] = bestSpeed
 		}
 	})
-	return caps
+	profile.ScanMS = sinceMS(scanStart)
+	return caps, profile
 }
 
 type pendingTransitionCar struct {
@@ -3921,6 +4118,15 @@ func buildStartsByNodeRefs(splines []*Spline) map[NodeKey][]int {
 		startsByNode[key] = append(startsByNode[key], i)
 	}
 	return startsByNode
+}
+
+func buildEndsByNodeRefs(splines []*Spline) map[NodeKey][]int {
+	endsByNode := make(map[NodeKey][]int, len(splines))
+	for i := range splines {
+		key := nodeKeyFromVec2(splines[i].P3)
+		endsByNode[key] = append(endsByNode[key], i)
+	}
+	return endsByNode
 }
 
 func BuildStartsByNode(splines []Spline) map[NodeKey][]int {

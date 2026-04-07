@@ -440,6 +440,7 @@ type Car = simpkg.Car
 type TrajectorySample = simpkg.TrajectorySample
 type CollisionPrediction = simpkg.CollisionPrediction
 type BrakingProfile = simpkg.BrakingProfile
+type FollowingProfile = simpkg.FollowingProfile
 type UpdateCarsProfile = simpkg.UpdateCarsProfile
 
 type RoadGraph = simpkg.RoadGraph
@@ -459,6 +460,7 @@ type frameProfile struct {
 	allPathHits      int
 	allPathMisses    int
 	brakingDetail    BrakingProfile
+	followDetail     FollowingProfile
 	updateCarsDetail UpdateCarsProfile
 }
 
@@ -514,6 +516,12 @@ func (p *profiler) endFrame(sample frameProfile) {
 	p.smooth.brakingDetail.InitiallyBlamedCars = sample.brakingDetail.InitiallyBlamedCars
 	p.smooth.brakingDetail.BrakingCars = sample.brakingDetail.BrakingCars
 	p.smooth.brakingDetail.HoldCars = sample.brakingDetail.HoldCars
+	p.smooth.followDetail.Cars = sample.followDetail.Cars
+	p.smooth.followDetail.PoseMS = blendMetric(p.smooth.followDetail.PoseMS, sample.followDetail.PoseMS, alpha)
+	p.smooth.followDetail.IndexMS = blendMetric(p.smooth.followDetail.IndexMS, sample.followDetail.IndexMS, alpha)
+	p.smooth.followDetail.CandidateMS = blendMetric(p.smooth.followDetail.CandidateMS, sample.followDetail.CandidateMS, alpha)
+	p.smooth.followDetail.ScanMS = blendMetric(p.smooth.followDetail.ScanMS, sample.followDetail.ScanMS, alpha)
+	p.smooth.followDetail.CandidateRefs = sample.followDetail.CandidateRefs
 	p.smooth.updateCarsDetail.Cars = sample.updateCarsDetail.Cars
 	p.smooth.updateCarsDetail.SetupMS = blendMetric(p.smooth.updateCarsDetail.SetupMS, sample.updateCarsDetail.SetupMS, alpha)
 	p.smooth.updateCarsDetail.FastPathMS = blendMetric(p.smooth.updateCarsDetail.FastPathMS, sample.updateCarsDetail.FastPathMS, alpha)
@@ -991,6 +999,7 @@ func main() {
 		frameProf.followMS = world.FollowMS
 		frameProf.updateCarsMS = world.UpdateCarsMS
 		frameProf.brakingDetail = world.BrakingProfile
+		frameProf.followDetail = world.FollowingProfile
 		frameProf.updateCarsDetail = world.UpdateCarsProfile
 
 		if debugMode && rl.IsMouseButtonPressed(rl.MouseButtonMiddle) && !mouseOnToolbar {
@@ -4574,6 +4583,11 @@ func drawProfilerOverlay(prof profiler) {
 		fmt.Sprintf("GraphBuild %6.2f ms   avg %6.2f", cur.graphBuildMS, avg.graphBuildMS),
 		fmt.Sprintf("Braking    %6.2f ms   avg %6.2f", cur.brakingMS, avg.brakingMS),
 		fmt.Sprintf("Following  %6.2f ms   avg %6.2f", cur.followMS, avg.followMS),
+		fmt.Sprintf("FolPose    %6.2f ms   avg %6.2f", cur.followDetail.PoseMS, avg.followDetail.PoseMS),
+		fmt.Sprintf("FolIndex   %6.2f ms   avg %6.2f", cur.followDetail.IndexMS, avg.followDetail.IndexMS),
+		fmt.Sprintf("FolCand    %6.2f ms   avg %6.2f", cur.followDetail.CandidateMS, avg.followDetail.CandidateMS),
+		fmt.Sprintf("FolScan    %6.2f ms   avg %6.2f", cur.followDetail.ScanMS, avg.followDetail.ScanMS),
+		fmt.Sprintf("FolRefs    %d", cur.followDetail.CandidateRefs),
 		fmt.Sprintf("UpdateCars %6.2f ms   avg %6.2f", cur.updateCarsMS, avg.updateCarsMS),
 		fmt.Sprintf("UpdSetup   %6.2f ms   avg %6.2f", cur.updateCarsDetail.SetupMS, avg.updateCarsDetail.SetupMS),
 		fmt.Sprintf("UpdFast    %6.2f ms   avg %6.2f", cur.updateCarsDetail.FastPathMS, avg.updateCarsDetail.FastPathMS),
