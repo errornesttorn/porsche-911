@@ -440,24 +440,26 @@ type Car = simpkg.Car
 type TrajectorySample = simpkg.TrajectorySample
 type CollisionPrediction = simpkg.CollisionPrediction
 type BrakingProfile = simpkg.BrakingProfile
+type UpdateCarsProfile = simpkg.UpdateCarsProfile
 
 type RoadGraph = simpkg.RoadGraph
 
 type frameProfile struct {
-	frameMS        float64
-	inputMS        float64
-	routeVisualsMS float64
-	laneChangesMS  float64
-	graphBuildMS   float64
-	brakingMS      float64
-	followMS       float64
-	updateCarsMS   float64
-	drawMS         float64
-	basePathHits   int
-	basePathMisses int
-	allPathHits    int
-	allPathMisses  int
-	brakingDetail  BrakingProfile
+	frameMS          float64
+	inputMS          float64
+	routeVisualsMS   float64
+	laneChangesMS    float64
+	graphBuildMS     float64
+	brakingMS        float64
+	followMS         float64
+	updateCarsMS     float64
+	drawMS           float64
+	basePathHits     int
+	basePathMisses   int
+	allPathHits      int
+	allPathMisses    int
+	brakingDetail    BrakingProfile
+	updateCarsDetail UpdateCarsProfile
 }
 
 type profiler struct {
@@ -512,6 +514,14 @@ func (p *profiler) endFrame(sample frameProfile) {
 	p.smooth.brakingDetail.InitiallyBlamedCars = sample.brakingDetail.InitiallyBlamedCars
 	p.smooth.brakingDetail.BrakingCars = sample.brakingDetail.BrakingCars
 	p.smooth.brakingDetail.HoldCars = sample.brakingDetail.HoldCars
+	p.smooth.updateCarsDetail.Cars = sample.updateCarsDetail.Cars
+	p.smooth.updateCarsDetail.SetupMS = blendMetric(p.smooth.updateCarsDetail.SetupMS, sample.updateCarsDetail.SetupMS, alpha)
+	p.smooth.updateCarsDetail.FastPathMS = blendMetric(p.smooth.updateCarsDetail.FastPathMS, sample.updateCarsDetail.FastPathMS, alpha)
+	p.smooth.updateCarsDetail.TransitionMS = blendMetric(p.smooth.updateCarsDetail.TransitionMS, sample.updateCarsDetail.TransitionMS, alpha)
+	p.smooth.updateCarsDetail.DwellCars = sample.updateCarsDetail.DwellCars
+	p.smooth.updateCarsDetail.FastPathCars = sample.updateCarsDetail.FastPathCars
+	p.smooth.updateCarsDetail.TransitionCars = sample.updateCarsDetail.TransitionCars
+	p.smooth.updateCarsDetail.RemovedCars = sample.updateCarsDetail.RemovedCars
 }
 
 func blendMetric(prev, current, alpha float64) float64 {
@@ -981,6 +991,7 @@ func main() {
 		frameProf.followMS = world.FollowMS
 		frameProf.updateCarsMS = world.UpdateCarsMS
 		frameProf.brakingDetail = world.BrakingProfile
+		frameProf.updateCarsDetail = world.UpdateCarsProfile
 
 		if debugMode && rl.IsMouseButtonPressed(rl.MouseButtonMiddle) && !mouseOnToolbar {
 			clicked := findClickedCar(cars, allSplines, simpkg.BuildSplineIndexByID(allSplines), mouseWorld)
@@ -4553,13 +4564,6 @@ func drawProfilerOverlay(prof profiler) {
 	text := NewColor(206, 214, 228, 255)
 	muted := NewColor(150, 162, 184, 255)
 
-	rect := rl.NewRectangle(float32(rl.GetScreenWidth())-420, 42, 400, 336)
-	rl.DrawRectangleRec(rect, bg)
-	rl.DrawRectangleLinesEx(rect, 1, border)
-
-	drawText("Profiler", int32(rect.X)+12, int32(rect.Y)+10, 18, title)
-	drawText("F3 to toggle", int32(rect.X)+190, int32(rect.Y)+13, 12, muted)
-
 	cur := prof.current
 	avg := prof.smooth
 	lines := []string{
@@ -4571,6 +4575,10 @@ func drawProfilerOverlay(prof profiler) {
 		fmt.Sprintf("Braking    %6.2f ms   avg %6.2f", cur.brakingMS, avg.brakingMS),
 		fmt.Sprintf("Following  %6.2f ms   avg %6.2f", cur.followMS, avg.followMS),
 		fmt.Sprintf("UpdateCars %6.2f ms   avg %6.2f", cur.updateCarsMS, avg.updateCarsMS),
+		fmt.Sprintf("UpdSetup   %6.2f ms   avg %6.2f", cur.updateCarsDetail.SetupMS, avg.updateCarsDetail.SetupMS),
+		fmt.Sprintf("UpdFast    %6.2f ms   avg %6.2f", cur.updateCarsDetail.FastPathMS, avg.updateCarsDetail.FastPathMS),
+		fmt.Sprintf("UpdTrans   %6.2f ms   avg %6.2f", cur.updateCarsDetail.TransitionMS, avg.updateCarsDetail.TransitionMS),
+		fmt.Sprintf("UpdMix     dwell %d  fast %d  trans %d  rm %d", cur.updateCarsDetail.DwellCars, cur.updateCarsDetail.FastPathCars, cur.updateCarsDetail.TransitionCars, cur.updateCarsDetail.RemovedCars),
 		fmt.Sprintf("Draw       %6.2f ms   avg %6.2f", cur.drawMS, avg.drawMS),
 		fmt.Sprintf("Cars       %4d", cur.brakingDetail.Cars),
 		fmt.Sprintf("BrkBase    %6.2f ms   avg %6.2f", cur.brakingDetail.BasePredictMS, avg.brakingDetail.BasePredictMS),
@@ -4587,6 +4595,15 @@ func drawProfilerOverlay(prof profiler) {
 		fmt.Sprintf("Base path cache  hits %d  miss %d", cur.basePathHits, cur.basePathMisses),
 		fmt.Sprintf("All  path cache  hits %d  miss %d", cur.allPathHits, cur.allPathMisses),
 	}
+
+	rectHeight := float32(54 + len(lines)*15)
+	rect := rl.NewRectangle(float32(rl.GetScreenWidth())-420, 42, 400, rectHeight)
+	rl.DrawRectangleRec(rect, bg)
+	rl.DrawRectangleLinesEx(rect, 1, border)
+
+	drawText("Profiler", int32(rect.X)+12, int32(rect.Y)+10, 18, title)
+	drawText("F3 to toggle", int32(rect.X)+190, int32(rect.Y)+13, 12, muted)
+
 	for i, line := range lines {
 		drawText(line, int32(rect.X)+12, int32(rect.Y)+38+int32(i*15), 12, text)
 	}

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -246,6 +247,19 @@ type BrakingProfile struct {
 	HoldCars            int
 }
 
+type UpdateCarsProfile struct {
+	Cars int
+
+	SetupMS      float64
+	FastPathMS   float64
+	TransitionMS float64
+
+	DwellCars      int
+	FastPathCars   int
+	TransitionCars int
+	RemovedCars    int
+}
+
 type holdProbeCarResult struct {
 	shouldHold                bool
 	holdLink                  DebugBlameLink
@@ -326,8 +340,8 @@ type RoadGraph struct {
 	segmentCosts     []float32
 	routeCacheMu     sync.RWMutex
 	routeCache       map[routeTreeKey]routeTreeEntry
-	pathCacheHits    int
-	pathCacheMisses  int
+	pathCacheHits    atomic.Int64
+	pathCacheMisses  atomic.Int64
 }
 
 func NewRoadGraph(splines []Spline, vehicleCounts map[int]int) *RoadGraph {
@@ -465,6 +479,7 @@ type RuntimeState struct {
 	AllPathHits          int
 	AllPathMisses        int
 	BrakingProfile       BrakingProfile
+	UpdateCarsProfile    UpdateCarsProfile
 
 	RouteVisualsMS float64
 	LaneChangesMS  float64
@@ -713,6 +728,7 @@ func (w *World) Step(dt float32) {
 	w.FollowMS = 0
 	w.UpdateCarsMS = 0
 	w.BrakingProfile = BrakingProfile{}
+	w.UpdateCarsProfile = UpdateCarsProfile{}
 
 	graphStart := time.Now()
 	vehicleCounts := BuildVehicleCounts(w.Cars)
@@ -763,7 +779,7 @@ func (w *World) Step(dt float32) {
 
 	updateCarsStart := time.Now()
 	var indexRemap []int
-	w.Cars, indexRemap = updateCars(w.Cars, w.Routes, allGraph, brakingDecisions, holdSpeedDecisions, followCaps, w.TrafficLights, w.TrafficCycles, dt)
+	w.Cars, indexRemap, w.UpdateCarsProfile = updateCars(w.Cars, w.Routes, allGraph, brakingDecisions, holdSpeedDecisions, followCaps, w.TrafficLights, w.TrafficCycles, dt)
 	w.LaneChangeSplines = gcLaneChangeSplines(w.LaneChangeSplines, w.Cars)
 	w.Routes, w.Cars = updateRouteSpawning(w.Routes, w.Cars, w.Splines, &w.NextCarID, dt)
 	w.TrafficCycles = UpdateTrafficCycles(w.TrafficCycles, dt)
@@ -776,10 +792,10 @@ func (w *World) Step(dt float32) {
 		w.DebugSelectedCarID = -1
 		w.DebugSelectedCarMode = 0
 	}
-	w.BasePathHits = baseGraph.pathCacheHits
-	w.BasePathMisses = baseGraph.pathCacheMisses
-	w.AllPathHits = allGraph.pathCacheHits
-	w.AllPathMisses = allGraph.pathCacheMisses
+	w.BasePathHits = int(baseGraph.pathCacheHits.Load())
+	w.BasePathMisses = int(baseGraph.pathCacheMisses.Load())
+	w.AllPathHits = int(allGraph.pathCacheHits.Load())
+	w.AllPathMisses = int(allGraph.pathCacheMisses.Load())
 }
 
 type SavedSplineFile struct {
@@ -2748,242 +2764,372 @@ func computeFollowingSpeedCaps(cars []Car, graph *RoadGraph) []float32 {
 	return caps
 }
 
-func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions []bool, holdSpeedDecisions []bool, followCaps []float32, lights []TrafficLight, cycles []TrafficCycle, dt float32) ([]Car, []int) {
-	if len(cars) == 0 {
-		return cars, nil
+type pendingTransitionCar struct {
+	originalIndex   int
+	car             Car
+	route           Route
+	followCap       float32
+	shouldHoldSpeed bool
+}
+
+type updateCarsFastStatus uint8
+
+const (
+	updateCarsFastRemove updateCarsFastStatus = iota
+	updateCarsFastDwellParked
+	updateCarsFastDwellBegin
+	updateCarsFastAlive
+	updateCarsFastTransition
+)
+
+type updateCarsFastResult struct {
+	status          updateCarsFastStatus
+	car             Car
+	route           Route
+	followCap       float32
+	shouldHoldSpeed bool
+	beginDwellAfter bool
+}
+
+func appendUpdatedCar(alive []Car, indexRemap []int, originalIndex int, car Car) []Car {
+	indexRemap[originalIndex] = len(alive)
+	return append(alive, car)
+}
+
+func applyCurrentSplineSpeedUpdate(car *Car, route Route, currentSpline *Spline, graph *RoadGraph, stoppingLightsBySpline map[int][]TrafficLight, followCap float32, shouldHoldSpeed bool, dt float32) {
+	targetSpeed := car.MaxSpeed * currentSpline.SpeedFactor
+	if currentSpline.SpeedLimitKmh > 0 {
+		if limitMPS := currentSpline.SpeedLimitKmh / 3.6; limitMPS < targetSpeed {
+			targetSpeed = limitMPS
+		}
+	}
+	if cs := lookupCurveSpeed(currentSpline, car.DistanceOnSpline) * car.CurveSpeedMultiplier; cs < targetSpeed {
+		targetSpeed = cs
+	}
+	if at := computeAnticipatoryTargetSpeed(*car, currentSpline, graph); at < targetSpeed {
+		targetSpeed = at
+	}
+	if tl := computeTrafficLightSpeedCap(*car, currentSpline, graph, stoppingLightsBySpline); tl < targetSpeed {
+		targetSpeed = tl
+	}
+	if bs := computeBusStopSpeedCap(*car, route, currentSpline, graph); bs < targetSpeed {
+		targetSpeed = bs
+	}
+	if car.DesiredLaneSplineID >= 0 {
+		remaining := car.DesiredLaneDeadline - car.DistanceOnSpline
+		if remaining >= 0 && car.Speed > laneChangeForcedSpeedMPS {
+			normalDecel := car.Accel * 1.5 * 0.9
+			brakingDist := (car.Speed*car.Speed - laneChangeForcedSpeedMPS*laneChangeForcedSpeedMPS) / (2 * normalDecel)
+			if remaining <= brakingDist && targetSpeed > laneChangeForcedSpeedMPS {
+				targetSpeed = laneChangeForcedSpeedMPS
+			}
+		}
+	}
+	if car.Braking {
+		targetSpeed = 0
+	} else if followCap < targetSpeed {
+		targetSpeed = followCap
+	}
+	if shouldHoldSpeed && targetSpeed > car.Speed {
+		targetSpeed = car.Speed
 	}
 
+	if car.Speed < targetSpeed {
+		car.Speed += car.Accel * dt
+		if car.Speed > targetSpeed {
+			car.Speed = targetSpeed
+		}
+	} else {
+		decel := car.Accel * 1.5
+		if car.Braking {
+			decel = car.Accel * brakeDecelMultiplier
+		}
+		car.Speed -= decel * dt
+		if car.Speed < targetSpeed {
+			car.Speed = targetSpeed
+		}
+		if car.Speed < 0 {
+			car.Speed = 0
+		}
+	}
+
+	car.DistanceOnSpline += car.Speed * dt
+}
+
+func settleCarOnCurrentSpline(car Car, currentSpline *Spline, dt float32, sampleCursor *splineSampleCursor) Car {
+	splinePos, tangent, κ := sampleSplineStateAtDistance(currentSpline, car.DistanceOnSpline, sampleCursor)
+	wb := car.Length * wheelbaseFrac
+	targetOffset := κ * wb * wb / 6
+	if car.Trailer.HasTrailer {
+		trailerWb := car.Trailer.Length * wheelbaseFrac
+		targetOffset = κ * (wb*wb + trailerWb*trailerWb) / 6
+	}
+	lerpRate := car.Speed / (2 * (wb + 0.01))
+	car.LateralOffset += (targetOffset - car.LateralOffset) * clampf(lerpRate*dt, 0, 1)
+
+	rightNormal := Vec2{X: tangent.Y, Y: -tangent.X}
+	frontPos := vecAdd(splinePos, vecScale(rightNormal, car.LateralOffset))
+	rearToFront := vecSub(frontPos, car.RearPosition)
+	if vectorLengthSq(rearToFront) > 1e-9 {
+		car.RearPosition = vecSub(frontPos, vecScale(normalize(rearToFront), car.Length*wheelbaseFrac))
+	}
+	if car.Trailer.HasTrailer {
+		hitchPos := car.RearPosition
+		trailerRearToHitch := vecSub(hitchPos, car.Trailer.RearPosition)
+		if vectorLengthSq(trailerRearToHitch) > 1e-9 {
+			car.Trailer.RearPosition = vecSub(hitchPos, vecScale(normalize(trailerRearToHitch), car.Trailer.Length*wheelbaseFrac))
+		}
+	}
+	return car
+}
+
+func transitionCarToNextSpline(car *Car, route Route, graph *RoadGraph) bool {
+	if car.CurrentSplineID == car.DestinationSplineID {
+		return false
+	}
+	if car.LaneChanging && car.CurrentSplineID == car.LaneChangeSplineID {
+		car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
+		car.PrevSplineIDs[0] = car.CurrentSplineID
+		car.CurrentSplineID = car.AfterSplineID
+		car.DistanceOnSpline = car.AfterSplineDist + car.DistanceOnSpline
+		car.LaneChanging = false
+		car.LaneChangeSplineID = -1
+		if car.CurrentSplineID == car.DesiredLaneSplineID {
+			car.DesiredLaneSplineID = -1
+			car.DesiredLaneDeadline = 0
+		}
+		return true
+	}
+
+	nextSplineID, ok := ChooseNextSplineOnBestPathWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
+	if ok {
+		if car.DesiredLaneSplineID >= 0 {
+			car.DesiredLaneSplineID = -1
+			car.DesiredLaneDeadline = 0
+		}
+	} else {
+		forcedNext, desiredLane, forcedOK := FindForcedLaneChangePathWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
+		if !forcedOK {
+			return false
+		}
+		nextSplineID = forcedNext
+		car.DesiredLaneSplineID = desiredLane
+		if src, srcOK := graph.splinePtrByID(forcedNext); srcOK {
+			car.DesiredLaneDeadline = maxf(src.Length-laneChangeForcedDistEnd, 0)
+		}
+	}
+
+	car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
+	car.PrevSplineIDs[0] = car.CurrentSplineID
+	car.CurrentSplineID = nextSplineID
+	resumeBusRouteAfterStop(route, car)
+
+	if car.DesiredLaneSplineID < 0 && car.CurrentSplineID != car.DestinationSplineID {
+		if newSpline, ok := graph.splinePtrByID(car.CurrentSplineID); ok && len(newSpline.HardCoupledIDs) > 0 {
+			curTime, curOK := PathCostToDestinationWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
+			if curOK {
+				for _, cid := range newSpline.HardCoupledIDs {
+					coupledTime, coupledOK := PathCostToDestinationWithGraph(graph, cid, car.DestinationSplineID, car.VehicleKind)
+					if coupledOK && curTime-coupledTime >= 20.0 {
+						car.DesiredLaneSplineID = cid
+						car.DesiredLaneDeadline = maxf(newSpline.Length-laneChangeForcedDistEnd, 0)
+						break
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+func resolveTransitionCar(pending pendingTransitionCar, graph *RoadGraph, stoppingLightsBySpline map[int][]TrafficLight, dt float32, alive []Car, indexRemap []int) ([]Car, bool) {
+	car := pending.car
+	var sampleCursor splineSampleCursor
+	sampleCursor.splineID = -1
+	for {
+		currentSpline, ok := graph.splinePtrByID(car.CurrentSplineID)
+		if !ok {
+			return alive, false
+		}
+
+		car.DistanceOnSpline -= currentSpline.Length
+		if !transitionCarToNextSpline(&car, pending.route, graph) {
+			return alive, false
+		}
+
+		currentSpline, ok = graph.splinePtrByID(car.CurrentSplineID)
+		if !ok {
+			return alive, false
+		}
+		if shouldBeginBusStopDwell(car, pending.route, currentSpline, graph) {
+			beginBusStopDwell(pending.route, &car)
+			return appendUpdatedCar(alive, indexRemap, pending.originalIndex, car), true
+		}
+
+		applyCurrentSplineSpeedUpdate(&car, pending.route, currentSpline, graph, stoppingLightsBySpline, pending.followCap, pending.shouldHoldSpeed, dt)
+		if car.DistanceOnSpline <= currentSpline.Length {
+			car = settleCarOnCurrentSpline(car, currentSpline, dt, &sampleCursor)
+			if shouldBeginBusStopDwell(car, pending.route, currentSpline, graph) {
+				beginBusStopDwell(pending.route, &car)
+			}
+			return appendUpdatedCar(alive, indexRemap, pending.originalIndex, car), true
+		}
+	}
+}
+
+func updateCars(cars []Car, routes []Route, graph *RoadGraph, brakingDecisions []bool, holdSpeedDecisions []bool, followCaps []float32, lights []TrafficLight, cycles []TrafficCycle, dt float32) ([]Car, []int, UpdateCarsProfile) {
+	profile := UpdateCarsProfile{Cars: len(cars)}
+	if len(cars) == 0 {
+		return cars, nil, profile
+	}
+
+	setupStart := time.Now()
 	routeIndexByID := map[int]int{}
 	for i, route := range routes {
 		routeIndexByID[route.ID] = i
 	}
 	stoppingLightsBySpline := buildStoppingTrafficLightsBySpline(lights, cycles)
+	profile.SetupMS = sinceMS(setupStart)
 
 	indexRemap := make([]int, len(cars))
 	for i := range indexRemap {
 		indexRemap[i] = -1
 	}
 	alive := cars[:0]
-	for i, car := range cars {
-		var sampleCursor splineSampleCursor
-		sampleCursor.splineID = -1
-		routeIdx, ok := routeIndexByID[car.RouteID]
-		if !ok || !routes[routeIdx].Valid {
-			continue
-		}
-		route := routes[routeIdx]
-		if route.VehicleKind == VehicleBus && car.DestinationSplineID <= 0 {
-			car.DestinationSplineID = CurrentRouteTarget(route, car.NextBusStopIndex)
-		}
+	fastResults := make([]updateCarsFastResult, len(cars))
 
-		if route.VehicleKind == VehicleBus && car.BusStopTimer > 0 {
-			car.BusStopTimer -= dt
-			if car.BusStopTimer < 0 {
-				car.BusStopTimer = 0
+	fastPathStart := time.Now()
+	parallelFor(len(cars), func(start, end int) {
+		for i := start; i < end; i++ {
+			result := &fastResults[i]
+			car := cars[i]
+			routeIdx, ok := routeIndexByID[car.RouteID]
+			if !ok || !routes[routeIdx].Valid {
+				result.status = updateCarsFastRemove
+				continue
 			}
-			car.Speed = 0
-			car.Braking = false
-			car.SoftSlowing = false
-			indexRemap[i] = len(alive)
-			alive = append(alive, car)
-			continue
-		}
-
-		shouldBrake := i < len(brakingDecisions) && brakingDecisions[i]
-		shouldHoldSpeed := !shouldBrake && i < len(holdSpeedDecisions) && holdSpeedDecisions[i]
-		car.Braking = shouldBrake
-
-		followCap := float32(math.MaxFloat32)
-		if i < len(followCaps) {
-			followCap = followCaps[i]
-		}
-		car.SoftSlowing = !shouldBrake && followCap < float32(math.MaxFloat32)
-
-		const frustrateThreshMPS = 10.0 / 3.6
-		if !shouldBrake && followCap < float32(math.MaxFloat32) {
-			frustrated := false
-			if spline, ok := graph.splinePtrByID(car.CurrentSplineID); ok {
-				preferredSpeed := car.MaxSpeed * spline.SpeedFactor
-				if spline.SpeedLimitKmh > 0 {
-					if limitMPS := spline.SpeedLimitKmh / 3.6; limitMPS < preferredSpeed {
-						preferredSpeed = limitMPS
-					}
-				}
-				if cs := lookupCurveSpeed(spline, car.DistanceOnSpline) * car.CurveSpeedMultiplier; cs < preferredSpeed {
-					preferredSpeed = cs
-				}
-				frustrated = preferredSpeed-car.Speed >= frustrateThreshMPS
-			}
-			if frustrated {
-				car.SlowedTimer += dt
-			} else {
-				car.SlowedTimer = 0
-			}
-		} else {
-			car.SlowedTimer = 0
-		}
-
-		for {
-			currentSpline, ok := graph.splinePtrByID(car.CurrentSplineID)
-			if !ok {
-				break
-			}
-			if shouldBeginBusStopDwell(car, route, currentSpline, graph) {
-				beginBusStopDwell(route, &car)
-				indexRemap[i] = len(alive)
-				alive = append(alive, car)
-				break
+			route := routes[routeIdx]
+			result.route = route
+			if route.VehicleKind == VehicleBus && car.DestinationSplineID <= 0 {
+				car.DestinationSplineID = CurrentRouteTarget(route, car.NextBusStopIndex)
 			}
 
-			targetSpeed := car.MaxSpeed * currentSpline.SpeedFactor
-			if currentSpline.SpeedLimitKmh > 0 {
-				if limitMPS := currentSpline.SpeedLimitKmh / 3.6; limitMPS < targetSpeed {
-					targetSpeed = limitMPS
+			if route.VehicleKind == VehicleBus && car.BusStopTimer > 0 {
+				car.BusStopTimer -= dt
+				if car.BusStopTimer < 0 {
+					car.BusStopTimer = 0
 				}
-			}
-			if cs := lookupCurveSpeed(currentSpline, car.DistanceOnSpline) * car.CurveSpeedMultiplier; cs < targetSpeed {
-				targetSpeed = cs
-			}
-			if at := computeAnticipatoryTargetSpeed(car, currentSpline, graph); at < targetSpeed {
-				targetSpeed = at
-			}
-			if tl := computeTrafficLightSpeedCap(car, currentSpline, graph, stoppingLightsBySpline); tl < targetSpeed {
-				targetSpeed = tl
-			}
-			if bs := computeBusStopSpeedCap(car, route, currentSpline, graph); bs < targetSpeed {
-				targetSpeed = bs
-			}
-			if car.DesiredLaneSplineID >= 0 {
-				remaining := car.DesiredLaneDeadline - car.DistanceOnSpline
-				if remaining >= 0 && car.Speed > laneChangeForcedSpeedMPS {
-					normalDecel := car.Accel * 1.5 * 0.9
-					brakingDist := (car.Speed*car.Speed - laneChangeForcedSpeedMPS*laneChangeForcedSpeedMPS) / (2 * normalDecel)
-					if remaining <= brakingDist && targetSpeed > laneChangeForcedSpeedMPS {
-						targetSpeed = laneChangeForcedSpeedMPS
-					}
-				}
-			}
-			if car.Braking {
-				targetSpeed = 0
-			} else if followCap < targetSpeed {
-				targetSpeed = followCap
-			}
-			if shouldHoldSpeed && targetSpeed > car.Speed {
-				targetSpeed = car.Speed
-			}
-
-			if car.Speed < targetSpeed {
-				car.Speed += car.Accel * dt
-				if car.Speed > targetSpeed {
-					car.Speed = targetSpeed
-				}
-			} else {
-				decel := car.Accel * 1.5
-				if car.Braking {
-					decel = car.Accel * brakeDecelMultiplier
-				}
-				car.Speed -= decel * dt
-				if car.Speed < targetSpeed {
-					car.Speed = targetSpeed
-				}
-				if car.Speed < 0 {
-					car.Speed = 0
-				}
-			}
-
-			car.DistanceOnSpline += car.Speed * dt
-			if car.DistanceOnSpline <= currentSpline.Length {
-				splinePos, tangent, κ := sampleSplineStateAtDistance(currentSpline, car.DistanceOnSpline, &sampleCursor)
-				wb := car.Length * wheelbaseFrac
-				targetOffset := κ * wb * wb / 6
-				if car.Trailer.HasTrailer {
-					trailerWb := car.Trailer.Length * wheelbaseFrac
-					targetOffset = κ * (wb*wb + trailerWb*trailerWb) / 6
-				}
-				lerpRate := car.Speed / (2 * (wb + 0.01))
-				car.LateralOffset += (targetOffset - car.LateralOffset) * clampf(lerpRate*dt, 0, 1)
-
-				rightNormal := Vec2{X: tangent.Y, Y: -tangent.X}
-				frontPos := vecAdd(splinePos, vecScale(rightNormal, car.LateralOffset))
-				rearToFront := vecSub(frontPos, car.RearPosition)
-				if vectorLengthSq(rearToFront) > 1e-9 {
-					car.RearPosition = vecSub(frontPos, vecScale(normalize(rearToFront), car.Length*wheelbaseFrac))
-				}
-				if car.Trailer.HasTrailer {
-					hitchPos := car.RearPosition
-					trailerRearToHitch := vecSub(hitchPos, car.Trailer.RearPosition)
-					if vectorLengthSq(trailerRearToHitch) > 1e-9 {
-						car.Trailer.RearPosition = vecSub(hitchPos, vecScale(normalize(trailerRearToHitch), car.Trailer.Length*wheelbaseFrac))
-					}
-				}
-				if shouldBeginBusStopDwell(car, route, currentSpline, graph) {
-					beginBusStopDwell(route, &car)
-				}
-				indexRemap[i] = len(alive)
-				alive = append(alive, car)
-				break
-			}
-
-			overshoot := car.DistanceOnSpline - currentSpline.Length
-			car.DistanceOnSpline = overshoot
-			if car.CurrentSplineID == car.DestinationSplineID {
-				break
-			}
-
-			if car.LaneChanging && car.CurrentSplineID == car.LaneChangeSplineID {
-				car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
-				car.PrevSplineIDs[0] = car.CurrentSplineID
-				car.CurrentSplineID = car.AfterSplineID
-				car.DistanceOnSpline = car.AfterSplineDist + overshoot
-				car.LaneChanging = false
-				car.LaneChangeSplineID = -1
-				if car.CurrentSplineID == car.DesiredLaneSplineID {
-					car.DesiredLaneSplineID = -1
-					car.DesiredLaneDeadline = 0
-				}
+				car.Speed = 0
+				car.Braking = false
+				car.SoftSlowing = false
+				result.status = updateCarsFastDwellParked
+				result.car = car
 				continue
 			}
 
-			nextSplineID, ok := ChooseNextSplineOnBestPathWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
-			if ok {
-				if car.DesiredLaneSplineID >= 0 {
-					car.DesiredLaneSplineID = -1
-					car.DesiredLaneDeadline = 0
-				}
-			} else {
-				forcedNext, desiredLane, forcedOk := FindForcedLaneChangePathWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
-				if !forcedOk {
-					break
-				}
-				nextSplineID = forcedNext
-				car.DesiredLaneSplineID = desiredLane
-				if src, srcOk := graph.splinePtrByID(forcedNext); srcOk {
-					car.DesiredLaneDeadline = maxf(src.Length-laneChangeForcedDistEnd, 0)
-				}
-			}
-			car.PrevSplineIDs[1] = car.PrevSplineIDs[0]
-			car.PrevSplineIDs[0] = car.CurrentSplineID
-			car.CurrentSplineID = nextSplineID
-			resumeBusRouteAfterStop(route, &car)
+			shouldBrake := i < len(brakingDecisions) && brakingDecisions[i]
+			shouldHoldSpeed := !shouldBrake && i < len(holdSpeedDecisions) && holdSpeedDecisions[i]
+			car.Braking = shouldBrake
 
-			if car.DesiredLaneSplineID < 0 && car.CurrentSplineID != car.DestinationSplineID {
-				if newSpline, scOk := graph.splinePtrByID(car.CurrentSplineID); scOk && len(newSpline.HardCoupledIDs) > 0 {
-					curTime, curOk := PathCostToDestinationWithGraph(graph, car.CurrentSplineID, car.DestinationSplineID, car.VehicleKind)
-					if curOk {
-						for _, cid := range newSpline.HardCoupledIDs {
-							coupledTime, coupledOk := PathCostToDestinationWithGraph(graph, cid, car.DestinationSplineID, car.VehicleKind)
-							if coupledOk && curTime-coupledTime >= 20.0 {
-								car.DesiredLaneSplineID = cid
-								car.DesiredLaneDeadline = maxf(newSpline.Length-laneChangeForcedDistEnd, 0)
-								break
-							}
-						}
+			followCap := float32(math.MaxFloat32)
+			if i < len(followCaps) {
+				followCap = followCaps[i]
+			}
+			car.SoftSlowing = !shouldBrake && followCap < float32(math.MaxFloat32)
+
+			currentSpline, ok := graph.splinePtrByID(car.CurrentSplineID)
+			if !ok {
+				result.status = updateCarsFastRemove
+				continue
+			}
+
+			const frustrateThreshMPS = 10.0 / 3.6
+			if !shouldBrake && followCap < float32(math.MaxFloat32) {
+				preferredSpeed := car.MaxSpeed * currentSpline.SpeedFactor
+				if currentSpline.SpeedLimitKmh > 0 {
+					if limitMPS := currentSpline.SpeedLimitKmh / 3.6; limitMPS < preferredSpeed {
+						preferredSpeed = limitMPS
 					}
 				}
+				if cs := lookupCurveSpeed(currentSpline, car.DistanceOnSpline) * car.CurveSpeedMultiplier; cs < preferredSpeed {
+					preferredSpeed = cs
+				}
+				if preferredSpeed-car.Speed >= frustrateThreshMPS {
+					car.SlowedTimer += dt
+				} else {
+					car.SlowedTimer = 0
+				}
+			} else {
+				car.SlowedTimer = 0
 			}
+
+			if shouldBeginBusStopDwell(car, route, currentSpline, graph) {
+				result.status = updateCarsFastDwellBegin
+				result.car = car
+				continue
+			}
+
+			applyCurrentSplineSpeedUpdate(&car, route, currentSpline, graph, stoppingLightsBySpline, followCap, shouldHoldSpeed, dt)
+			if car.DistanceOnSpline <= currentSpline.Length {
+				var sampleCursor splineSampleCursor
+				sampleCursor.splineID = -1
+				car = settleCarOnCurrentSpline(car, currentSpline, dt, &sampleCursor)
+				result.status = updateCarsFastAlive
+				result.car = car
+				result.beginDwellAfter = shouldBeginBusStopDwell(car, route, currentSpline, graph)
+				continue
+			}
+
+			result.status = updateCarsFastTransition
+			result.car = car
+			result.followCap = followCap
+			result.shouldHoldSpeed = shouldHoldSpeed
+		}
+	})
+	pendingTransitions := make([]pendingTransitionCar, 0, len(cars)/8)
+	for i, result := range fastResults {
+		switch result.status {
+		case updateCarsFastRemove:
+			profile.RemovedCars++
+		case updateCarsFastDwellParked:
+			profile.DwellCars++
+			alive = appendUpdatedCar(alive, indexRemap, i, result.car)
+		case updateCarsFastDwellBegin:
+			car := result.car
+			beginBusStopDwell(result.route, &car)
+			profile.DwellCars++
+			alive = appendUpdatedCar(alive, indexRemap, i, car)
+		case updateCarsFastAlive:
+			car := result.car
+			if result.beginDwellAfter {
+				beginBusStopDwell(result.route, &car)
+			}
+			profile.FastPathCars++
+			alive = appendUpdatedCar(alive, indexRemap, i, car)
+		case updateCarsFastTransition:
+			profile.TransitionCars++
+			pendingTransitions = append(pendingTransitions, pendingTransitionCar{
+				originalIndex:   i,
+				car:             result.car,
+				route:           result.route,
+				followCap:       result.followCap,
+				shouldHoldSpeed: result.shouldHoldSpeed,
+			})
 		}
 	}
-	return alive, indexRemap
+	profile.FastPathMS = sinceMS(fastPathStart)
+
+	transitionStart := time.Now()
+	for _, pending := range pendingTransitions {
+		var survived bool
+		alive, survived = resolveTransitionCar(pending, graph, stoppingLightsBySpline, dt, alive, indexRemap)
+		if !survived {
+			profile.RemovedCars++
+		}
+	}
+	profile.TransitionMS = sinceMS(transitionStart)
+
+	return alive, indexRemap, profile
 }
 
 func laneChangeFeasibleAt(src, dst Spline, distance, speed float32) bool {
@@ -3630,27 +3776,23 @@ func (g *RoadGraph) routeTree(destinationSplineID int, vehicleKind VehicleKind) 
 	entry, ok := g.routeCache[key]
 	g.routeCacheMu.RUnlock()
 	if ok {
-		g.routeCacheMu.Lock()
-		g.pathCacheHits++
-		g.routeCacheMu.Unlock()
+		g.pathCacheHits.Add(1)
 		return entry, true
 	}
 
 	destIdx, ok := g.indexByID[destinationSplineID]
 	if !ok {
-		g.routeCacheMu.Lock()
-		g.pathCacheMisses++
-		g.routeCacheMu.Unlock()
+		g.pathCacheMisses.Add(1)
 		return routeTreeEntry{}, false
 	}
 
 	g.routeCacheMu.Lock()
 	if entry, ok = g.routeCache[key]; ok {
-		g.pathCacheHits++
+		g.pathCacheHits.Add(1)
 		g.routeCacheMu.Unlock()
 		return entry, true
 	}
-	g.pathCacheMisses++
+	g.pathCacheMisses.Add(1)
 	entry = buildRouteTree(g, destIdx, vehicleKind)
 	g.routeCache[key] = entry
 	g.routeCacheMu.Unlock()
