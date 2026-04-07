@@ -747,7 +747,7 @@ func (w *World) Step(dt float32) {
 	go func() {
 		defer wgBrakeFollow.Done()
 		brakingStart := time.Now()
-		brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks, candidateLinks, brakingProfile = computeBrakingDecisions(w.Cars, allGraph, debugSelectedCar, w.DebugSelectedCarMode)
+		brakingDecisions, holdSpeedDecisions, debugBlameLinks, holdBlameLinks, candidateLinks, brakingProfile = computeBrakingDecisionsC(w.Cars, allGraph, debugSelectedCar, w.DebugSelectedCarMode)
 		brakingMS = sinceMS(brakingStart)
 	}()
 	go func() {
