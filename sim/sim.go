@@ -194,6 +194,11 @@ type Car struct {
 	RouteID     int
 	ControlMode CarControlMode
 
+	// ModelID identifies which VehicleModel this car was spawned from. The
+	// simulator itself doesn't branch on ModelID — it's a handle for display
+	// code (future textures/meshes) and for round-trip save/load.
+	ModelID string
+
 	CurrentSplineID      int
 	DestinationSplineID  int
 	PrevSplineIDs        [2]int
@@ -2228,6 +2233,7 @@ type SavedRoute struct {
 type SavedCar struct {
 	ID                   int     `json:"id,omitempty"`
 	RouteID              int     `json:"route_id"`
+	ModelID              string  `json:"model_id,omitempty"`
 	CurrentSplineID      int     `json:"current_spline_id"`
 	DestinationSplineID  int     `json:"destination_spline_id"`
 	DistanceOnSpline     float32 `json:"distance_on_spline"`
@@ -2294,6 +2300,7 @@ func (w *World) Save(path string) error {
 		saved.Cars = append(saved.Cars, SavedCar{
 			ID:                   car.ID,
 			RouteID:              car.RouteID,
+			ModelID:              car.ModelID,
 			CurrentSplineID:      car.CurrentSplineID,
 			DestinationSplineID:  car.DestinationSplineID,
 			DistanceOnSpline:     car.DistanceOnSpline,
@@ -2422,6 +2429,7 @@ func LoadWorld(path string) (*World, error) {
 		car := Car{
 			ID:                   carID,
 			RouteID:              entry.RouteID,
+			ModelID:              entry.ModelID,
 			CurrentSplineID:      entry.CurrentSplineID,
 			DestinationSplineID:  entry.DestinationSplineID,
 			PrevSplineIDs:        [2]int{-1, -1},
@@ -2799,39 +2807,24 @@ func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 }
 
 func spawnVehicle(carID int, route Route, splines []Spline) Car {
-	hasTrailer := route.VehicleKind == VehicleCar && rand.Float32() < 0.10
-	length := randRange(4.0, 4.8) / metersPerUnit
-	width := randRange(1.8, 2.0) / metersPerUnit
-	maxSpeed := randRange(22.2, 36.1)
-	accel := randRange(2.5, 4.5)
-	curveSpeedMultiplier := randRange(0.8, 1.2)
-	if route.VehicleKind == VehicleBus {
-		length = randRange(9.5, 13.0) / metersPerUnit
-		width = randRange(2.45, 2.65) / metersPerUnit
-		maxSpeed = randRange(13.9, 20.0)
-		accel = randRange(1.2, 2.0)
-		curveSpeedMultiplier = randRange(0.9, 1.05)
-	} else if hasTrailer {
-		length = randRange(4.8, 6.0) / metersPerUnit
-		width = randRange(2.25, 2.45) / metersPerUnit
-		maxSpeed = randRange(18.0, 25.0)
-		accel = randRange(1.0, 1.8)
-		curveSpeedMultiplier = randRange(0.85, 1.0)
+	model, ok := RandomVehicleModel(route.VehicleKind)
+	if !ok {
+		model = fallbackVehicleModel(route.VehicleKind)
 	}
-
 	car := Car{
 		ID:                   carID,
 		RouteID:              route.ID,
+		ModelID:              model.ID,
 		CurrentSplineID:      route.StartSplineID,
 		DestinationSplineID:  CurrentRouteTarget(route, 0),
 		PrevSplineIDs:        [2]int{-1, -1},
 		DistanceOnSpline:     0,
 		Speed:                randRange(0, 2),
-		MaxSpeed:             maxSpeed,
-		Accel:                accel,
-		Length:               length,
-		Width:                width,
-		CurveSpeedMultiplier: curveSpeedMultiplier,
+		MaxSpeed:             model.MaxSpeedMPS,
+		Accel:                model.Accel,
+		Length:               model.LengthM / metersPerUnit,
+		Width:                model.WidthM / metersPerUnit,
+		CurveSpeedMultiplier: model.CurveSpeedMultiplier,
 		Color:                route.Color,
 		Braking:              false,
 		LaneChangeSplineID:   -1,
@@ -2845,9 +2838,9 @@ func spawnVehicle(carID int, route Route, splines []Spline) Car {
 		frontPos, tangent := sampleSplineAtDistance(spline, 0)
 		car.RearPosition = vecSub(frontPos, vecScale(tangent, car.Length*wheelbaseFrac))
 
-		if hasTrailer {
-			tLen := randRange(11.0, 13.6)
-			tWid := randRange(2.25, 2.45)
+		if model.Trailer != nil {
+			tLen := model.Trailer.LengthM / metersPerUnit
+			tWid := model.Trailer.WidthM / metersPerUnit
 			trailerRear := vecSub(car.RearPosition, vecScale(tangent, tLen*wheelbaseFrac))
 			r, g, b := car.Color.R, car.Color.G, car.Color.B
 			car.Trailer = Trailer{

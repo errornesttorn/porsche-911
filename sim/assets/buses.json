@@ -1,0 +1,26 @@
+{
+  "models": [
+    {
+      "id": "bus_standard",
+      "display_name": "Standard City Bus",
+      "length_m": 12.0,
+      "width_m": 2.55,
+      "max_speed_mps": 18.0,
+      "accel": 1.5,
+      "curve_speed_multiplier": 0.95
+    },
+    {
+      "id": "bus_articulated",
+      "display_name": "Articulated Bus",
+      "length_m": 9.5,
+      "width_m": 2.55,
+      "max_speed_mps": 16.5,
+      "accel": 1.3,
+      "curve_speed_multiplier": 0.90,
+      "trailer": {
+        "length_m": 8.5,
+        "width_m": 2.55
+      }
+    }
+  ]
+}
