@@ -455,6 +455,7 @@ type RoutePanel struct {
 	ColorIndex       int
 	VehicleKind      VehicleKind
 	BusStops         []BusStop
+	BusModelID       string
 	AddingBusStop    bool
 	StopStatusNotice string
 
@@ -2377,11 +2378,17 @@ func handleRouteMode(routeStartSplineID int, routePanel RoutePanel, routes []Rou
 		ColorIndex:      simpkg.PickNextColorIndex(routes),
 		ExistingRouteID: findRouteID(routes, routeStartSplineID, hoveredEnd.SplineID, vehicleKind),
 	}
+	if vehicleKind == VehicleBus {
+		panel.BusModelID = defaultBusModelID()
+	}
 	if panel.ExistingRouteID >= 0 {
 		if idx := findRouteIndexByID(routes, panel.ExistingRouteID); idx >= 0 {
 			panel.SpawnPerMinute = routes[idx].SpawnPerMinute
 			panel.ColorIndex = routes[idx].ColorIndex
 			panel.BusStops = append([]BusStop(nil), routes[idx].BusStops...)
+			if routes[idx].BusModelID != "" {
+				panel.BusModelID = routes[idx].BusModelID
+			}
 		}
 	}
 	panel = syncRoutePanelPath(panel, graph)
@@ -2401,6 +2408,26 @@ func defaultSpawnPerMinute(vehicleKind VehicleKind) float32 {
 		return 4.0
 	}
 	return 15.0
+}
+
+// defaultBusModelID returns the id of the first bus model from the bundled
+// catalogue, or "" if the catalogue failed to load (spawnVehicle will then
+// fall back to a random pick).
+func defaultBusModelID() string {
+	models := simpkg.BusModels()
+	if len(models) == 0 {
+		return ""
+	}
+	return models[0].ID
+}
+
+// busModelDisplayLabel returns the user-facing label for a bus model: its
+// display name if set, otherwise the id.
+func busModelDisplayLabel(m simpkg.VehicleModel) string {
+	if m.DisplayName != "" {
+		return m.DisplayName
+	}
+	return m.ID
 }
 
 func syncRoutePanelPath(panel RoutePanel, graph *RoadGraph) RoutePanel {
@@ -4065,6 +4092,26 @@ func drawCutMode(stage Stage, cd CutDraft, splines []Spline, mouseWorld Vec2, zo
 	}
 }
 
+// Bus panel vertical layout:
+//
+//	[title] [spline info] [spawn slider] [colour picker (2 rows swatches)]
+//	[bus model picker (label + row of buttons)]      ← Y+182..236
+//	[bus stops label + add button + rows]            ← Y+240..
+//	[apply / cancel]
+//
+// These constants are the one-stop-shop for the Y offsets of the bus-only
+// sections; tweaking them here reshuffles the whole panel consistently.
+const (
+	busModelLabelY   = float32(182)
+	busModelRowY     = float32(198)
+	busModelRowH     = float32(26)
+	busStopsLabelY   = float32(246)
+	busStopsAddY     = float32(260)
+	busStopsFirstY   = float32(296)
+	busStopsStrideY  = float32(28)
+	busStopsPanelPad = float32(10)
+)
+
 func routePanelRect(panel RoutePanel) rl.Rectangle {
 	height := float32(234)
 	if panel.VehicleKind == VehicleBus {
@@ -4072,7 +4119,7 @@ func routePanelRect(panel RoutePanel) rl.Rectangle {
 		if rows < 1 {
 			rows = 1
 		}
-		height = 326 + float32(rows)*28
+		height = busStopsFirstY + float32(rows)*busStopsStrideY + 76
 	}
 	return rl.NewRectangle(float32(rl.GetScreenWidth())-360, 18, 340, height)
 }
@@ -4082,14 +4129,25 @@ func routePanelSliderRect(panel RoutePanel) rl.Rectangle {
 	return rl.NewRectangle(pr.X+18, pr.Y+82, pr.Width-36, 22)
 }
 
+func routePanelBusModelRect(panel RoutePanel, idx, count int) rl.Rectangle {
+	pr := routePanelRect(panel)
+	if count < 1 {
+		count = 1
+	}
+	usable := pr.Width - 36
+	btnW := usable / float32(count)
+	x := pr.X + 18 + float32(idx)*btnW
+	return rl.NewRectangle(x+1, pr.Y+busModelRowY, btnW-2, busModelRowH)
+}
+
 func routePanelBusAddRect(panel RoutePanel) rl.Rectangle {
 	pr := routePanelRect(panel)
-	return rl.NewRectangle(pr.X+18, pr.Y+180, pr.Width-36, 28)
+	return rl.NewRectangle(pr.X+18, pr.Y+busStopsAddY, pr.Width-36, 28)
 }
 
 func routePanelBusStopRowRect(panel RoutePanel, idx int) rl.Rectangle {
 	pr := routePanelRect(panel)
-	return rl.NewRectangle(pr.X+18, pr.Y+216+float32(idx)*28, pr.Width-36, 24)
+	return rl.NewRectangle(pr.X+18, pr.Y+busStopsFirstY+float32(idx)*busStopsStrideY, pr.Width-36, 24)
 }
 
 func routePanelApplyRect(panel RoutePanel) rl.Rectangle {
@@ -4141,6 +4199,13 @@ func updateRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID 
 			}
 		}
 		if panel.VehicleKind == VehicleBus {
+			busModels := simpkg.BusModels()
+			for i, m := range busModels {
+				r := routePanelBusModelRect(panel, i, len(busModels))
+				if pointInRect(mouse, r) {
+					panel.BusModelID = m.ID
+				}
+			}
 			addRect := routePanelBusAddRect(panel)
 			if pointInRect(mouse, addRect) {
 				panel.AddingBusStop = !panel.AddingBusStop
@@ -4201,6 +4266,11 @@ func applyRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *
 			routes[idx].Color = simpkg.RoutePaletteColor(panel.ColorIndex)
 			routes[idx].VehicleKind = panel.VehicleKind
 			routes[idx].BusStops = append([]BusStop(nil), panel.BusStops...)
+			if panel.VehicleKind == VehicleBus {
+				routes[idx].BusModelID = panel.BusModelID
+			} else {
+				routes[idx].BusModelID = ""
+			}
 			if routes[idx].NextSpawnIn <= 0 {
 				routes[idx].NextSpawnIn = randomizedSpawnDelay(spawn)
 			}
@@ -4226,6 +4296,9 @@ func applyRoutePanel(panel RoutePanel, routes []Route, cars []Car, nextRouteID *
 		Color:          simpkg.RoutePaletteColor(panel.ColorIndex),
 		VehicleKind:    panel.VehicleKind,
 		BusStops:       append([]BusStop(nil), panel.BusStops...),
+	}
+	if panel.VehicleKind == VehicleBus {
+		route.BusModelID = panel.BusModelID
 	}
 	routes = append(routes, route)
 	return RoutePanel{}, routes, cars
@@ -4790,6 +4863,29 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 	}
 
 	if panel.VehicleKind == VehicleBus {
+		busModels := simpkg.BusModels()
+		drawText("Bus model:", int32(panelRect.X+18), int32(panelRect.Y+busModelLabelY-14), 14, muted)
+		for i, m := range busModels {
+			r := routePanelBusModelRect(panel, i, len(busModels))
+			btnColor := button
+			if m.ID == panel.BusModelID {
+				btnColor = accent
+			}
+			rl.DrawRectangleRec(r, btnColor)
+			rl.DrawRectangleLinesEx(r, 1, outline)
+			label := busModelDisplayLabel(m)
+			labelCol := textCol
+			if m.ID == panel.BusModelID {
+				labelCol = rl.White
+			}
+			w := measureText(label, 13)
+			// Truncate if too wide for the button.
+			for w > int32(r.Width-8) && len(label) > 4 {
+				label = label[:len(label)-2] + "…"
+				w = measureText(label, 13)
+			}
+			drawText(label, int32(r.X)+int32(r.Width)/2-w/2, int32(r.Y)+6, 13, labelCol)
+		}
 		addRect := routePanelBusAddRect(panel)
 		addLabel := "Add bus stop"
 		addColor := NewColor(47, 120, 60, 255)
@@ -4797,14 +4893,14 @@ func drawRoutePanel(panel RoutePanel, routes []Route) {
 			addLabel = "Pick in map..."
 			addColor = NewColor(210, 150, 20, 255)
 		}
-		drawText("Bus stops:", int32(panelRect.X+18), int32(panelRect.Y+166), 14, muted)
+		drawText("Bus stops:", int32(panelRect.X+18), int32(panelRect.Y+busStopsLabelY), 14, muted)
 		rl.DrawRectangleRec(addRect, addColor)
 		rl.DrawRectangleLinesEx(addRect, 1, NewColor(0, 0, 0, 40))
 		addW := measureText(addLabel, 14)
 		drawText(addLabel, int32(addRect.X)+int32(addRect.Width)/2-addW/2, int32(addRect.Y)+7, 14, rl.White)
 
 		if len(panel.BusStops) == 0 {
-			drawText("No stops yet. Add intersections in travel order.", int32(panelRect.X+18), int32(panelRect.Y+220), 13, muted)
+			drawText("No stops yet. Add intersections in travel order.", int32(panelRect.X+18), int32(panelRect.Y+busStopsFirstY), 13, muted)
 		} else {
 			for i, stop := range panel.BusStops {
 				rowRect := routePanelBusStopRowRect(panel, i)

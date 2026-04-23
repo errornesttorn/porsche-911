@@ -6,13 +6,17 @@ from reading the code for the first time.
 
 ## Layout
 
-- `main.go` — single-file Raylib editor / runtime (≈5.6k lines). Build tag
+- `main.go` — single-file Raylib editor / runtime (≈6k lines). Build tag
   `!darwin`. All UI, input, camera, toolbars, saving dialogs, route panels.
 - `main_darwin.go` — stub that exits with an error on macOS. macOS is not
   supported; don't try to make it build there.
 - `sim/` — headless simulation package. Can be consumed without Raylib.
-  - `sim.go` — all Go-side simulation logic (≈4.6k lines). Single package file
-    by design; don't split it unless explicitly asked.
+  - `sim.go` — all Go-side simulation logic. Still the single file for the
+    sim core (don't split it unless explicitly asked).
+  - `vehicle_models.go` — loads `assets/cars.json` + `assets/buses.json` via
+    `go:embed` and exposes `VehicleModel` / `RandomVehicleModel`.
+  - `assets/cars.json`, `assets/buses.json` — authored vehicle catalogues.
+    Bundled at compile time. See "Vehicle models" below.
   - `braking.h` / `braking.c` — C port of the braking/conflict-resolution
     pipeline (OpenMP-parallel). This is the hot path.
   - `braking_cgo.go` — cgo glue. Marshals `RoadGraph` + `[]Car` into C structs
@@ -20,6 +24,8 @@ from reading the code for the first time.
     frames by topology hash (`brakingGraphTopologyKey`); only cars / segment
     costs are re-marshalled each frame.
   - `braking_test.go` — synthetic + stress tests against the C pipeline.
+  - `pedestrian_test.go`, `turn_signal_test.go`, `vehicle_models_test.go` —
+    focused tests for pedestrians, indicators, and the model catalogue.
 - `internal/filepicker/` — platform-specific native file dialog wrappers
   (zenity/kdialog/yad on Linux, PowerShell on Windows).
 - `examples/` — curated example scenarios (loaded via the editor).
@@ -76,6 +82,16 @@ Per frame, `(*World).Step(dt)` does, in order:
    spawn checks.
 9. Merge AI cars + external cars back into `world.Cars`.
 10. `UpdateTrafficCycles` — advances light phases.
+11. Pedestrian pipeline: `computePedestrianCrossings` →
+    `buildStoppingPedestrianLightsByPath` → `buildPedestrianBlockedSplineDists`
+    → `updatePedestrians`. Crossings + blocked map feed step 6's car speed
+    caps (red-light analogue); lights + crossings feed pedestrian movement
+    caps. Cars used for pedestrian yielding are the post-`updateCars`
+    positions (sim + external), so pedestrians react to the frame's actual
+    car state.
+12. `assignCarTurnSignals` — writes `Car.TurnSignal` for AI cars based on
+    lane-change state / desired lane / map-authored turn links. Skips
+    external cars so the player proxy keeps whatever the controller wrote.
 
 Everything else (debug blame links, profile counters) is book-keeping.
 
@@ -212,6 +228,111 @@ that rear point with the same model. This is why the prediction code
 carries `simRearPos` and `simTrailerRearPos` as mutable state separate
 from the spline-distance position.
 
+### Pedestrians
+
+- `PedestrianPath` is a straight segment P0→P1 with fixed
+  `PedestrianPathWidthM` (4 m). Pedestrians walk along it in one of two
+  directions (`Forward` = P0→P1 or P1→P0). `ped.Distance` always increases
+  monotonically as a pedestrian progresses, regardless of direction — the
+  canonical "path-x from P0" is `ped.Distance` for forward walkers and
+  `path.Length - ped.Distance` for backward walkers.
+- Right-of-path preferred lateral offset is computed in
+  `preferredPedestrianOffset`. The path's Normal is CCW rotation of Dir
+  (`(-dir.Y, dir.X)`), which in Y-down screen coords is the *visual right*
+  side. Forward pedestrians get `+preferredOffset`, backward get
+  `-preferredOffset` — both end up on their own right-hand side of travel.
+- `computePedestrianCrossings(paths, splines)` finds every point where a
+  pedestrian path meets a car spline, using each spline's sampled polyline
+  as the geometry. Spline segments are treated as half-open
+  (`splineT ∈ [0, 1)`, except the final segment keeps its endpoint) so
+  intersections exactly on a shared sample don't duplicate.
+- Pedestrian-car interaction has two *independent* channels:
+  - **`buildPedestrianBlockedSplineDists`** — per-spline list of distances
+    where an approaching pedestrian forces cars to yield (red-light
+    analogue, reusing `computePedestrianCrossingSpeedCap` which mirrors the
+    traffic-light speed cap). Pedestrians waiting at a red pedestrian light
+    that sits between them and the crossing are *excluded* here so cars
+    don't stop for someone who isn't coming.
+  - **`computePedestrianMovementCaps`** — per-pedestrian max `ped.Distance`
+    this step. Populated by (a) crossings currently occupied by a moving
+    car (stopped cars are treated as yielding to break deadlocks), and
+    (b) red pedestrian-path lights matching the ped's direction. A final
+    spacing pass (`propagatePedestrianQueueSpacing`) sorts
+    same-path-same-direction groups by progress and steps each follower's
+    cap down by `pedestrianQueueSpacingM` so a waiting queue doesn't clip
+    into itself.
+- Pedestrian spawn/despawn lives at the dead-ends of the pedestrian graph.
+  `pedestrianSpawnIntervalS = 32 s`. Junction routing uses a quadratic
+  Bézier turn connector (`buildPedestrianTurn`).
+
+### Pedestrian-path traffic lights
+
+Same `TrafficLight` struct as for cars, discriminated by `SplineID <= 0`
+(spline IDs always start at 1). When `IsPedestrianLight()` is true:
+
+- `PedestrianPathIndex` is the path's index in `World.PedestrianPaths`.
+- `DistOnPath` is arc length from P0.
+- `PedestrianForward` picks which walking direction is affected. Placing
+  the light on the right side of the path (in the editor) yields
+  `PedestrianForward = true` (stops P0→P1 walkers).
+
+A single cycle can mix car-side and ped-side lights — they're filtered
+apart by `IsPedestrianLight()` in `buildStoppingTrafficLightsBySpline` vs
+`buildStoppingPedestrianLightsByPath`. When a pedestrian path is deleted,
+`removePedestrianLightsForPath` in `main.go` drops the lights that point at
+it and decrements higher indices so references stay valid.
+
+### Turn signals
+
+`Car.TurnSignal` (`TurnSignalNone | TurnSignalLeft | TurnSignalRight`) is
+written by `computeCarTurnSignal` each step, with trigger precedence:
+
+1. **Active lane change** — project `bridge.P3 − bridge.P0` onto the bridge
+   start-tangent right-normal.
+2. **Desired lane** (`DesiredLaneSplineID >= 0`) — project the nearest
+   point on the desired spline relative to the car's current pose.
+3. **Map-authored turn links** — `Spline.LeftTurnLinkIDs` /
+   `RightTurnLinkIDs` on the car's current spline. If the routed
+   next-spline-on-best-path matches one of the lists, indicate that way.
+
+`turnSignalDeadbandM = 0.15` on the geometric triggers suppresses flicker
+on straight sibling splines. External-controlled cars are skipped by
+`assignCarTurnSignals` so the player's controller owns its indicators.
+
+**Blink ticking is display-side.** `main.go#turnSignalBlinkOnForCar`
+derives a per-car half-period and phase offset from `car.ID` using two
+coprime-ish moduli so adjacent IDs don't lock into the same rhythm; the
+phase uses `rl.GetTime()` so indicators keep blinking while the sim is
+paused. Don't move this into the sim — it's not deterministic-dependent
+and the renderer already has a clock.
+
+### Turn-link authoring tool
+
+In Rules mode, `ToolTurnLink` (hotkey **N**) implements a couple-tool-like
+two-click flow. First click picks the source spline, second click on the
+target: left mouse → right-turn link, right mouse → left-turn link. The
+same button again toggles the link off; switching directions replaces the
+opposite one. `handleTurnLinkMode` + `toggleTurnLink` in `main.go`.
+`drawTurnLinkMode` renders arrows from the source 3/4-point to the target
+start (amber = right, blue = left). `reverseSpline` clears turn-link lists
+because a reversed spline inverts the flow they describe.
+
+### Vehicle models
+
+Spawning copies physical parameters from an authored `VehicleModel`
+instead of rolling new random numbers. Catalogues live in
+`sim/assets/cars.json` and `sim/assets/buses.json`, bundled via
+`go:embed`. Each entry has an `id`, display name, dimensions, max speed,
+accel, curve-speed multiplier, and an optional `trailer` sub-object
+(pickup-with-trailer for cars, articulated bus for buses).
+
+`spawnVehicle` calls `RandomVehicleModel(route.VehicleKind)` and writes
+`Car.ModelID` on the resulting car. `SavedCar.ModelID` preserves it
+across save/load. Display code can key textures/meshes off `ModelID` via
+`LookupVehicleModel`. If the embedded JSON fails to parse (reported by
+`VehicleModelsError`), spawning falls back to `fallbackVehicleModel`
+values so the sim still runs.
+
 ### Driving mode / player proxy
 
 The human-driven car in `main.go` is **not** a `sim.Car`. Driving mode keeps a
@@ -240,9 +361,12 @@ The proxy fitter lives in `sim/player_proxy.go`. Important details:
 ## Save format
 
 JSON, defined by `SavedSplineFile` / `SavedSpline` / `SavedRoute` /
-`SavedCar` / `SavedTrafficLight` / `SavedTrafficCycle`. Note: older files
-may omit newer fields (e.g. `bus_only`, `lane_preference`,
-`vehicle_kind`); `LoadWorld` should stay tolerant of missing fields
+`SavedCar` / `SavedTrafficLight` / `SavedTrafficCycle` /
+`SavedPedestrianPath`. Note: older files may omit newer fields (e.g.
+`bus_only`, `lane_preference`, `vehicle_kind`, `model_id`,
+`left_turn_link_ids`, `right_turn_link_ids`, the
+`pedestrian_path_index` / `dist_on_path` / `pedestrian_forward` trio on
+traffic lights); `LoadWorld` should stay tolerant of missing fields
 (`omitempty` on all of them). If you add a field, default it in
 `LoadWorld` — don't require it in existing saves. The example and test
 JSONs under `examples/` and `tests/` are committed and used by humans;

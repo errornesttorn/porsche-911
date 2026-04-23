@@ -96,6 +96,58 @@ func TestSpawnVehicleInheritsFromModel(t *testing.T) {
 	}
 }
 
+func TestSpawnBusHonoursRouteModelID(t *testing.T) {
+	spline := NewSpline(1, NewVec2(0, 0), NewVec2(5, 0), NewVec2(10, 0), NewVec2(15, 0))
+	route := Route{
+		ID:            1,
+		StartSplineID: 1,
+		VehicleKind:   VehicleBus,
+		Color:         NewColor(200, 200, 50, 255),
+		BusModelID:    "bus_articulated",
+	}
+	for i := 0; i < 20; i++ {
+		car := spawnVehicle(i+1, route, []Spline{spline})
+		if car.ModelID != "bus_articulated" {
+			t.Fatalf("pinned bus route should always spawn bus_articulated, got %q", car.ModelID)
+		}
+		if !car.Trailer.HasTrailer {
+			t.Fatal("bus_articulated defines a trailer — spawned car should have one")
+		}
+	}
+}
+
+func TestSpawnCarRouteIgnoresBusModelID(t *testing.T) {
+	// A malformed/legacy car route shouldn't be pinned to a bus model ID.
+	spline := NewSpline(1, NewVec2(0, 0), NewVec2(5, 0), NewVec2(10, 0), NewVec2(15, 0))
+	route := Route{
+		ID:            1,
+		StartSplineID: 1,
+		VehicleKind:   VehicleCar,
+		Color:         NewColor(100, 120, 140, 255),
+		BusModelID:    "bus_articulated", // should be ignored for car routes
+	}
+	for i := 0; i < 20; i++ {
+		car := spawnVehicle(i+1, route, []Spline{spline})
+		if _, ok := carModelByID[car.ModelID]; !ok {
+			t.Fatalf("car route should spawn car models, got %q", car.ModelID)
+		}
+	}
+}
+
+func TestSpawnBusFallsBackWhenModelIDUnknown(t *testing.T) {
+	spline := NewSpline(1, NewVec2(0, 0), NewVec2(5, 0), NewVec2(10, 0), NewVec2(15, 0))
+	route := Route{
+		ID:            1,
+		StartSplineID: 1,
+		VehicleKind:   VehicleBus,
+		BusModelID:    "totally_made_up_model",
+	}
+	car := spawnVehicle(1, route, []Spline{spline})
+	if _, ok := busModelByID[car.ModelID]; !ok {
+		t.Fatalf("unknown bus model ID should fall back to a random bus, got %q", car.ModelID)
+	}
+}
+
 func TestSpawnBusPicksFromBusPool(t *testing.T) {
 	rand.Seed(7)
 	spline := NewSpline(1, NewVec2(0, 0), NewVec2(5, 0), NewVec2(10, 0), NewVec2(15, 0))

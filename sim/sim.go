@@ -199,6 +199,11 @@ type Route struct {
 	Color          Color
 	VehicleKind    VehicleKind
 	BusStops       []BusStop
+	// BusModelID, when non-empty on a bus route, pins every bus spawned on
+	// this route to the named VehicleModel. Car routes keep rolling random
+	// models; an empty string on a bus route falls back to the same random
+	// behaviour (useful as a legacy default).
+	BusModelID string
 }
 
 type Trailer struct {
@@ -2259,6 +2264,7 @@ type SavedRoute struct {
 	ColorIndex     int            `json:"color_index,omitempty"`
 	VehicleKind    string         `json:"vehicle_kind,omitempty"`
 	BusStops       []SavedBusStop `json:"bus_stops,omitempty"`
+	BusModelID     string         `json:"bus_model_id,omitempty"`
 }
 
 type SavedCar struct {
@@ -2324,6 +2330,7 @@ func (w *World) Save(path string) error {
 			ColorIndex:     route.ColorIndex,
 			VehicleKind:    VehicleKindString(route.VehicleKind),
 			BusStops:       savedStops,
+			BusModelID:     route.BusModelID,
 		})
 	}
 	for _, car := range w.Cars {
@@ -2443,6 +2450,7 @@ func LoadWorld(path string) (*World, error) {
 			Color:          RoutePaletteColor(entry.ColorIndex),
 			VehicleKind:    vehicleKind,
 			BusStops:       stops,
+			BusModelID:     entry.BusModelID,
 		}
 		if entry.ID > maxRouteID {
 			maxRouteID = entry.ID
@@ -2842,9 +2850,20 @@ func spawnBlocked(candidate Car, cars []Car, splines []Spline) bool {
 }
 
 func spawnVehicle(carID int, route Route, splines []Spline) Car {
-	model, ok := RandomVehicleModel(route.VehicleKind)
-	if !ok {
-		model = fallbackVehicleModel(route.VehicleKind)
+	var model VehicleModel
+	// Bus lines can pin a specific model so every bus on the route looks
+	// and drives the same; fall back to random if the ID doesn't resolve.
+	if route.VehicleKind == VehicleBus && route.BusModelID != "" {
+		if m, ok := LookupVehicleModel(route.BusModelID); ok {
+			model = m
+		}
+	}
+	if model.ID == "" {
+		picked, ok := RandomVehicleModel(route.VehicleKind)
+		if !ok {
+			picked = fallbackVehicleModel(route.VehicleKind)
+		}
+		model = picked
 	}
 	car := Car{
 		ID:                   carID,
